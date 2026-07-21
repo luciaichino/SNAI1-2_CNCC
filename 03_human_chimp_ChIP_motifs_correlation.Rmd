@@ -1,0 +1,405 @@
+---
+title: "Human vs chimp CNCC: SNAI2 motif change vs H3K27ac/SNAI2 ChIP at ATAC regions"
+output: html_document
+date: "2026-02-13"
+---
+
+<!--
+OVERVIEW
+This notebook tests whether evolutionary changes in the SNAI2 DNA-binding MOTIF
+(scored by FIMO) track with changes in H3K27ac and SNAI2 ChIP-seq signal between
+human (H20961) and chimp (C3649) at ATAC-accessible regions (all coordinates hg38).
+
+Pipeline:
+  1. Load FIMO SNAI2 motif p-values for 4 samples (human hap1/hap2, chimp hap1/hap2).
+  2. Outer-join the 4 tables on region + motif coordinates; fill motifs missing from a
+     sample with p-value = 0.005, following Prescott et al.
+  3. Keep only homozygous motifs (hap1 == hap2 p-value in each species); compute the
+     per-motif human-vs-chimp p-value log-ratio; collapse to one value per region.
+  4. Load per-region ChIP read counts, CPM-normalise by species-specific SNPsplit read depth,
+     and compute input-normalised enrichment, then the human-vs-chimp log2FC ("enrich").
+  5. Restrict to enhancer/distal regions overlapping SNAI2 (and/or H3K27ac) peaks.
+  6. Correlate per-region motif change (x) with H3K27ac and SNAI2 ChIP change (y).
+
+Only FIMO p-values are used (motif scores are not loaded/used anywhere).
+
+Naming convention used below:
+  fimo_*               : the four FIMO motif tables
+  motifs_merged        : per-motif-instance table joined across the four samples
+  region_motif_summary : per-region collapse of the motif metric
+  region_data          : master per-ATAC-region table (motif summary + ChIP counts + log2FC)
+  enh_*                : enhancer/distal subsets of region_data
+
+All files needed
+  -fimo calls at ATAC reference regions
+  -ChIP counts at ATAC reference regions
+  -mapping stats for CPM calculation
+  -SNAI2 ChIP-seq peaks
+  -Annotation file where each ATAC reference regions is labeled as promoter distal or not
+-->
+
+```{r}
+# all libraries for the whole notebook
+library(GenomicRanges)
+library(ggplot2)
+library(data.table)
+library(ggpubr)
+```
+
+
+# H3K27ac and SNAI2 at all ATAC regions (human vs chimp)
+
+To detect motif instances that have changed between species,
+the full outer join of the fimo outputs was performed with missing matches assigned conservatively a p-value of 0.005 (as in Prescott et al).
+The log ratio of the p-values for orthologous motifs was calculated and used in downstream analyses.
+
+
+
+# Import SNAI2 FIMO p-values at ATAC regions
+
+Load the SNAI2 FIMO motif p-values at all ATAC regions, one table per sample
+(human/chimp x haplotype1/haplotype2). In each file V15 is the FIMO p-value;
+V1-V4 are the ATAC region (chr/start/end/name) and V7-V9 are the matched motif
+location (chr/start/end). Regions with no motif hit carry "." in the FIMO columns.
+(The FIMO score in V14 is intentionally not loaded; only p-values are used.)
+
+```{r}
+fimo_human_hap1 <- fread(
+  "/.../fimo_sorted_atATACregionsv3.bed")
+setnames(fimo_human_hap1, c("V15"), c("pvalue.H_hap1_SNAI"))
+fimo_human_hap1 <- fimo_human_hap1[, .(V1,V2,V3,V4,V7,V8,V9, pvalue.H_hap1_SNAI)]
+
+fimo_human_hap2 <- fread(
+  "/.../fimo_sorted_atATACregionsv3.bed")
+setnames(fimo_human_hap2, c("V15"), c("pvalue.H_hap2_SNAI"))
+fimo_human_hap2 <- fimo_human_hap2[, .(V1,V2,V3,V4,V7,V8,V9, pvalue.H_hap2_SNAI)]
+
+
+fimo_chimp_hap1 <- fread(
+  "/.../fimo_sorted_atATACregionsv3.bed")
+setnames(fimo_chimp_hap1, c("V15"), c("pvalue.C_hap1_SNAI"))
+fimo_chimp_hap1 <- fimo_chimp_hap1[, .(V1,V2,V3,V4,V7,V8,V9, pvalue.C_hap1_SNAI)]
+
+
+fimo_chimp_hap2 <- fread(
+  "/.../fimo_sorted_atATACregionsv3.bed")
+setnames(fimo_chimp_hap2, c("V15"), c("pvalue.C_hap2_SNAI"))
+fimo_chimp_hap2 <- fimo_chimp_hap2[, .(V1,V2,V3,V4,V7,V8,V9, pvalue.C_hap2_SNAI)]
+
+# remove the ATAC regions that don't have a mapped motif (FIMO "." in the motif chr column)
+# Using data.table syntax
+fimo_human_hap1 <- fimo_human_hap1[V7 != "." ]
+fimo_human_hap2 <- fimo_human_hap2[V7 != "." ]
+fimo_chimp_hap1 <- fimo_chimp_hap1[V7 != "." ]
+fimo_chimp_hap2 <- fimo_chimp_hap2[V7 != "." ]
+
+# motif-location columns (originally V7,V8,V9) become the join key V5,V6,V7
+colnames(fimo_human_hap1)[5:7]=c("V5","V6","V7")
+colnames(fimo_human_hap2)[5:7]=c("V5","V6","V7")
+colnames(fimo_chimp_hap1)[5:7]=c("V5","V6","V7")
+colnames(fimo_chimp_hap2)[5:7]=c("V5","V6","V7")
+
+```
+
+
+
+Merge the four motif tables, filling in motifs that are missing from a sample
+(full outer join, then impute p-value = 0.005, per Prescott et al.).
+
+```{r}
+# List the 4 motif tables (human/chimp x hap1/hap2)
+fimo_tables <- list(
+  fimo_human_hap1,
+  fimo_human_hap2,
+  fimo_chimp_hap1,
+  fimo_chimp_hap2
+)
+
+# 1. Start with the first dataframe
+# We join on V1, V2, V3 (ATAC region) AND V5, V6, V7 (Motif location)
+motifs_merged <- fimo_tables[[1]]
+
+# 2. Iteratively merge the rest
+for(i in 2:length(fimo_tables)) {
+  motifs_merged <- merge(motifs_merged, fimo_tables[[i]],
+                      by = c("V1", "V2", "V3", "V4", "V5", "V6", "V7"),
+                      all = TRUE)
+}
+
+# 3. Handle the Missing Values (NAs)
+# Ensure p-value columns are numeric, then replace NA (motif missing from a sample) with 0.005
+pval_cols <- grep("pvalue", names(motifs_merged), value = TRUE)
+
+for (col in pval_cols) {
+  # Convert to numeric (this handles cases where "." might still exist)
+  set(motifs_merged, j = col, value = as.numeric(as.character(motifs_merged[[col]])))
+  # Replace NA with 0.005
+  motifs_merged[is.na(get(col)), (col) := 0.005]
+}
+```
+
+Remove the motifs where the p-value differs between hap1 and hap2
+(i.e. keep only motif instances where the two alleles of the same species are consistent).
+
+```{r}
+motifs_merged=motifs_merged[motifs_merged$pvalue.H_hap1_SNAI == motifs_merged$pvalue.H_hap2_SNAI & motifs_merged$pvalue.C_hap1_SNAI == motifs_merged$pvalue.C_hap2_SNAI,]
+```
+
+Calculate the human-vs-chimp p-value log-ratio (per motif, using hap1).
+
+```{r}
+# p-value log-ratio: positive => motif more significant (stronger) in human
+motifs_merged$pval_logratio_h_c_SNAI = -log10( motifs_merged$pvalue.H_hap1_SNAI / motifs_merged$pvalue.C_hap1_SNAI)
+
+```
+
+Collapse the per-motif metric to one value per ATAC region (sum and mean).
+
+```{r}
+# 1. Define the column(s) you want to collapse
+# It's cleaner to list them here in case you want to add more later
+motif_metric_cols <- c("pval_logratio_h_c_SNAI")
+
+# 2. Collapse by ATAC region (V1, V2, V3, V4)
+# We use .SD (Subset of Data) to apply the sum/mean functions to our targets
+region_motif_summary <- motifs_merged[, c(
+    setNames(lapply(.SD, sum,  na.rm = TRUE), paste0("sum_",  motif_metric_cols)),
+    setNames(lapply(.SD, mean, na.rm = TRUE), paste0("mean_", motif_metric_cols))
+  ),
+  by = .(V1, V2, V3, V4),
+  .SDcols = motif_metric_cols]
+```
+
+
+
+
+```{r}
+# keep a copy under a coordinate-keyed name (used in the merge with ChIP counts below)
+region_motif_summary_coord <- region_motif_summary
+
+```
+Note: regions with no SNAI2 motif in ANY sample were dropped above (the V7 != "." filter),
+so they are absent from this table rather than represented as NA. The only imputed values
+are motifs present in some haplotype/sample but absent in another (filled to p-value = 0.005).
+The correlation below is therefore conditioned on motif presence in >=1 sample.
+
+
+# Import ChIP data for these regions
+
+ATAC_region_counts_v3 is folder containing files with ChIP counts per region in this format:
+chr/start/end/region_name/score/V6/COUNTS
+
+
+```{r}
+count_dir <- "/.../ATAC_region_counts_v3"
+
+
+
+# --- read all files into one long table ---
+read_counts <- function(species) {
+  files <- list.files(count_dir,
+                      pattern = paste0("ATAC_regions_v3_", species, "\\.bed$"),
+                      full.names = TRUE)
+  rbindlist(lapply(files, function(f) {
+    dt <- fread(f)
+    setnames(dt, 1:4, c("V1", "V2", "V3", "V4"))      # region key
+    sample_name <- sub("_ATAC_regions_v3_.*", "", basename(f))
+    sample_name <- sub("_counts$", "", sample_name)   # -> s26_ChIPlib8_HL130_inp
+    count_col <- names(dt)[ncol(dt)]                  # <--  count is last col
+    dt[, .(V1, V2, V3, V4,
+           colname = paste0("count_", sample_name, "_", species),
+           count   = as.numeric(get(count_col)))]
+  }))
+}
+
+long_counts <- rbind(read_counts("human"), read_counts("chimp"))
+
+# --- pivot to wide: one column per sample x species ---
+wide_counts <- dcast(long_counts, V1 + V2 + V3 + V4 ~ colname, value.var = "count")
+
+# --- join onto the collapsed ratio table (keep all collapsed regions) ---
+region_data <- merge(region_motif_summary_coord, wide_counts,
+               by = c("V1", "V2", "V3", "V4"), all.x = TRUE)
+
+
+
+```
+
+
+
+
+
+# Input-normalized enrichment (CPM) and human/chimp log2FC
+
+Sample sheet: each ChIP paired to its matched input (same batch + rep + species).
+
+```{r}
+# VERIFY: each ChIP paired to its matched input (same batch + rep + species)
+sample_sheet <- data.frame(
+  id        = c("K27ac_rep1","K27ac_rep2","K27ac_rep3","K27ac_rep4",
+                "SNAI2_rep1","SNAI2_rep2","SNAI2_rep3","SNAI2_rep4",
+                "K27ac_lib8","SNAI2_lib8"),
+  mark      = c(rep("K27ac",4), rep("SNAI2",4), "K27ac","SNAI2"),
+  batch     = c(rep("CNCCP4",8), "ChIPlib8","ChIPlib8"),
+  chip_base = c("s15_CNCCP4_HL130_rep1_aH3K27ac_deeper","s16_CNCCP4_HL130_rep2_aH3K27ac_deeper",
+                "s17_CNCCP4_HL130_rep3_aH3K27ac_deeper","s18_CNCCP4_HL130_rep4_aH3K27ac_deeper",
+                "s19_CNCCP4_HL130_rep1_aSNAI2_deeper","s20_CNCCP4_HL130_rep2_aSNAI2_deeper",
+                "s21_CNCCP4_HL130_rep3_aSNAI2_deeper","s24_CNCCP4_HL130_rep4_aSNAI2_deeper",
+                "s21_ChIPlib8_HL130_aH3K27ac","s20_ChIPlib8_HL130_aSNAI2"),
+  inp_base  = c("inp7_CNCCP4_HL130_rep1","inp8_CNCCP4_HL130_rep2",
+                "inp9_CNCCP4_HL130_rep3","inp10_CNCCP4_HL130_rep4",
+                "inp7_CNCCP4_HL130_rep1","inp8_CNCCP4_HL130_rep2",
+                "inp9_CNCCP4_HL130_rep3","inp10_CNCCP4_HL130_rep4",
+                "s26_ChIPlib8_HL130_inp","s26_ChIPlib8_HL130_inp"),
+  stringsAsFactors = FALSE
+)
+# (one input per CNCCP4 cell prep serves both marks of that rep).
+
+col_for <- function(base, sp) paste0("count_", base, "_", sp)
+
+# sanity: every column the sheet references actually exists in `region_data`
+needed_cols <- c(sapply(c(sample_sheet$chip_base, sample_sheet$inp_base),
+                   function(b) col_for(b, c("human","chimp"))))
+stopifnot(all(unique(needed_cols) %in% names(region_data)))
+```
+CPM normalization using the species-specific SNPsplit read depth (read from the per-allele
+mapping logs), then input-normalized enrichment and the human-vs-chimp log2FC.
+
+```{r}
+# ---- proper CPM normalization using species-specific SNPsplit read depth ----
+# library size = deduplicated, uniquely-mapped read PAIRS assigned to the human (or chimp)
+# allele by SNPsplit, parsed from each sample's species-specific mapping log. The human- and
+# chimp-allele counts of a sample are each divided by their OWN allele's depth.
+mapping_dirs <- list(
+  human = "/.../mapping_human12",
+  chimp = "/.../mapping_chimp12"
+)
+
+read_libsize <- function(base, species) {
+  roots    <- mapping_dirs[[species]]
+  log_file <- file.path(roots, base, paste0(base, "_log.txt"))
+  log_file <- log_file[file.exists(log_file)]
+  if (length(log_file) == 0) stop("mapping log not found for ", species, " sample: ", base)
+  log_lines <- readLines(log_file[1])
+  hit <- grep("mapped uniquely after PCR dedup", log_lines, value = TRUE)
+  if (length(hit) == 0) stop("dedup read count not found in log for: ", base)
+  as.numeric(sub("^[^0-9]*([0-9]+).*", "\\1", hit[1]))   # the count is the first number on that line
+}
+
+# one depth per (sample x species)
+all_bases <- unique(c(sample_sheet$chip_base, sample_sheet$inp_base))
+libsizes  <- list(
+  human = setNames(vapply(all_bases, read_libsize, numeric(1), species = "human"), all_bases),
+  chimp = setNames(vapply(all_bases, read_libsize, numeric(1), species = "chimp"), all_bases)
+)
+print(libsizes)   # sanity-check the depths
+
+cpm_for <- function(base, sp) paste0("cpm_", base, "_", sp)   # companion to col_for()
+
+# CPM = allele count / that allele's SNPsplit depth * 1e6
+for (base in all_bases) {
+  for (sp in c("human", "chimp")) {
+    set(region_data, j = cpm_for(base, sp),
+        value = region_data[[col_for(base, sp)]] / libsizes[[sp]][[base]] * 1e6)
+  }
+}
+
+# per-sample, per-species input-normalized enrichment, then human-minus-chimp log2FC
+for (i in seq_len(nrow(sample_sheet))) {
+  id <- sample_sheet$id[i]
+
+  for (sp in c("human", "chimp")) {
+    chip_cpm <- region_data[[cpm_for(sample_sheet$chip_base[i], sp)]]
+    inp_cpm  <- region_data[[cpm_for(sample_sheet$inp_base[i],  sp)]]
+    set(region_data, j = paste0(id, "_enrich_", sp),
+        value = log2((chip_cpm + 1) / (inp_cpm + 1)))
+  }
+
+  # input-normalized enrichment: difference of log2 enrichments (human minus chimp)
+  set(region_data, j = paste0(id, "_logFC_h_c_enrich"),
+      value = region_data[[paste0(id, "_enrich_human")]] -
+              region_data[[paste0(id, "_enrich_chimp")]])
+}
+
+
+# mean across all reps of a mark
+for (mk in c("K27ac", "SNAI2")) {
+  reps <- sample_sheet$id[sample_sheet$mark == mk ]
+  cols <- paste0(reps, "_logFC_h_c_enrich")
+  set(region_data, j = paste0(mk, "_logFC_h_c_enrich_mean"),
+      value = rowMeans(as.matrix(region_data[, ..cols]), na.rm = TRUE))
+}
+```
+
+
+### Scatterplots
+
+Select enhancers bound by SNAI2 with a change in motif from human to chimp.
+
+### Enhancers
+```{r}
+anno=readRDS("/.../data.rds") ## data with annotations for each region to select only promoter-distal ones
+anno_enh <- anno[anno$classification %in% c("other_distal", "enhancer"), ]
+
+
+# region key is chr_start_end with the 0-based BED start (matches anno$region)
+enh_regions <- region_data[paste(V1, V2, V3, sep = "_") %in% anno_enh$region]
+
+```
+
+
+### Peaks
+```{r}
+snai2_peaks <- fread("/.../SNAI2_peaks_min3reps_deeper.bed") ## SNAI2 ChIP peaks called in at least 3 replicates
+snai2_peaks_gr <- GRanges(seqnames = snai2_peaks$V1, ranges = IRanges(start = snai2_peaks$V2 + 1, end = snai2_peaks$V3))
+
+# GRanges from the enhancer regions (BED start V2 is 0-based -> +1 for 1-based IRanges)
+enh_gr <- GRanges(seqnames = enh_regions$V1, ranges = IRanges(start = enh_regions$V2 + 1, end = enh_regions$V3))
+
+
+# Overlap with both peak sets
+hits_snai2 <- overlapsAny(enh_gr, snai2_peaks_gr)
+
+# Keep regions overlapping SNAI2 peaks
+
+enh_snai2 <- enh_regions[hits_snai2]
+
+message("SNAI2 overlap:      ", sum(hits_snai2))
+
+```
+
+Using enrich: log2(ChIP/input) and then human minus chimp.
+
+Using the regions that overlap SNAI2 peaks.
+```{r}
+plot_df=enh_snai2[enh_snai2$sum_pval_logratio_h_c_SNAI!=0,]
+
+p1=ggplot(plot_df, aes(mean_pval_logratio_h_c_SNAI, K27ac_logFC_h_c_enrich_mean)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "steelblue") +
+  stat_cor(method = "pearson")  +
+  #facet_wrap(~ class_label) +
+  labs(x     = "Mean pval logratio SNAI2 motif (human/chimp)",
+       y     = "H3K27ac log2FC (human/chimp)",
+       title = "Corr H3K27ac change with SNAI2 motif change (human/chimp)") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+p2=ggplot(plot_df, aes(mean_pval_logratio_h_c_SNAI, SNAI2_logFC_h_c_enrich_mean)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", color = "steelblue") +
+  stat_cor(method = "pearson")  +
+  #facet_wrap(~ class_label) +
+  labs(x     = "Mean pval logratio SNAI2 motif (human/chimp)",
+       y     = "SNAI2 log2FC (human/chimp)",
+       title = "Corr SNAI2 change with SNAI2 motif change (human/chimp)") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+ggarrange(p1,p2,ncol=1)
+ggsave("/.../scatter_human_chimp_revised.pdf",
+       height = 7, width = 5)
+
+```
