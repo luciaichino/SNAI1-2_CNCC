@@ -20,11 +20,16 @@ Counts at CNCC regulatory regions were calculated with bedtools coverage
 --- 03_human_chimp_ChIP_motifs_correlation.Rmd
 R markdown of correlation analysis between human and chimpanzee ChIP changes and SNAI2 motif changes
 
+## Figure 2/3: SNAI1/2, H3K27ac, ATAC, analyses
 
+--- 04_Define_proximal_distal_v5.Rmd
+R markdown including processing of data to classify regions as promoter proximal or distal and make panels shown in Figures 2 and 3 and related supplemental figures.
+The data file containing all the processed informaion has been uploaded to this repo (data_v4.rds).
 
+## Figure 4: TWIST1, NR2F1, TFAP2A ChIP analysis (motif distances)
 
-
-
+--- 05_Fig4_analysis_TFs_motifsdist_v5_allpeaks.Rmd
+R markdown including analysis to generate the kernel smoothened plots of TF activators ChIP-seq foldchanges relative to distance between motifs (Figure 4).
 
 
 
