@@ -1,0 +1,935 @@
+---
+title: "Define proximal/distal regulatory regions and annotate SNAI1/2 peaks"
+output: html_document
+date: "2025-09-04"
+---
+
+## Overview
+
+This notebook annotates a reference set of ATAC-seq regulatory regions as
+**promoter-proximal** or **distal** (enhancer / other) and then overlaps them
+with SNAI1/2 ChIP-seq peaks.
+
+Reference regions were defined as those overlapping across all four DMSO-treated
+samples and normalised to a 2 kb window centred on the highest-scoring summit.
+
+Outputs include panels used in **Figures 2 and 3**.
+
+### Required input files (place in the directories configured below)
+
+| File | Expected location |
+|---|---|
+| SNAI2 ChIP peaks (narrowPeak) | `peaks_dir` |
+| Histone/ATAC signals at reference ATAC regions (2 kb window) | `regions_dir` |
+| Histone/ATAC signals at reference ATAC regions (6 kb window) | `regions_dir` |
+| ATAC DMSO signal at reference ATAC regions | `regions_dir` |
+| DEseq2 BED files (H3K27ac and ATAC, UP/DOWN per timepoint) | `regions_dir` |
+| DEseq2 CSV files (log2FC per timepoint/mark) | `regions_dir` |
+| FIMO motif BED file (SNAI2 DBD, Jolma 2013) | `fimo_dir` |
+| MEME motif files | `motif_dir` |
+
+---
+
+```{r setup, include=FALSE}
+# ── Libraries ────────────────────────────────────────────────────────────────
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(purrr)
+
+library(GenomicRanges)
+library(rtracklayer)
+library(ChIPseeker)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(clusterProfiler)
+library(AnnotationHub)
+
+library(ggpubr)
+library(ggrastr)
+library(universalmotif)
+library(patchwork)
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+library(lme4)       # lmer()
+library(lmerTest)   # Satterthwaite df / p-values for fixed effects
+library(emmeans)    # emtrends(): per-timepoint slopes + pairwise contrasts
+
+
+```
+
+```{r paths}
+# ── User-configurable paths ───────────────────────────────────────────────────
+# Set these to the root directories that match your local clone or data mount.
+# All file reads and writes below use these variables; no paths are hard-coded.
+
+peaks_dir   <- ".../peaks"       # directory containing narrowPeak files
+regions_dir <- ".../ATAC_regions" # directory containing signal tables and DEseq2 results
+fimo_dir    <- ".../fimo"         # directory containing FIMO output BED
+motif_dir   <- ".../motifs"       # directory containing MEME motif files
+figures_dir <- ".../figures"           # output directory for saved PDFs
+
+dir.create(figures_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ── Input file names (edit here if filenames differ) ─────────────────────────
+snai2_peak_file   <- "s8_lib1_CNCCp4_SNAI2a3029_DMSO_r2_aSNAI2_reltodTag_peaks_minusINPUT_filtered.narrowPeak"
+histones_2kb_file <- "histones_at_ATACregions_v3.txt"
+histones_6kb_file <- "histones_at_ATACregions_v3_6kb.txt"
+atac_dmso_file    <- "ATACDMSO_at_ATACregions_v3.txt"
+fimo_bed_file     <- "SNAI2_DBD_jolma2013_fimo/fimo_sorted.bed"
+```
+
+---
+
+# 1. Import SNAI2 ChIP-seq peaks
+
+```{r import-snai2-peaks}
+# Import the MACS2 narrowPeak file as a GRanges object.
+# The 'peak' metadata column holds the 0-based offset of the summit from the
+# peak start, which is used later for summit-centred overlap resolution.
+peaks_gr <- import(
+  file.path(peaks_dir, snai2_peak_file),
+  format = "narrowPeak"
+)
+message("Imported ", length(peaks_gr), " SNAI2 peaks")
+```
+
+---
+
+# 2. Import histone mark and ATAC signals at reference ATAC regions
+
+## 2a. Histone signals (2 kb and 6 kb windows)
+
+```{r import-histone-signals}
+# Helper: read a deeptools-style matrix text file that has a comment-line header
+# starting with '#'. Returns a data frame with cleaned column names and a
+# 'region' key column (chr_start_end).
+read_deeptools_table <- function(path) {
+  header_line <- readLines(path, n = 1)
+  col_names   <- strsplit(sub("^#", "", header_line), "\t")[[1]]
+  col_names   <- gsub("'", "", col_names)
+  df          <- read_tsv(path, skip = 1, col_names = col_names,
+                          show_col_types = FALSE)
+  df$region   <- paste(df$chr, df$start, df$end, sep = "_")
+  df
+}
+
+# 2 kb window table – used for histone signal values and as the region key
+data1 <- read_deeptools_table(file.path(regions_dir, histones_2kb_file))
+
+# 6 kb window table – broader context for H3K27me3; regions are in the same
+# order as the 2 kb table, so we reuse the 2 kb region key
+data2 <- read_deeptools_table(file.path(regions_dir, histones_6kb_file))
+data2$region <- data1$region   # align region IDs (same peaks, larger window)
+
+# Drop coordinate columns now that 'region' is the key; rename the duplicate
+# K27me3 column in data1 to avoid clashing with the 6 kb version
+data1 <- data1[, -(1:3)]
+colnames(data1)[colnames(data1) == "H3K27me3_DMSO_merged.bw"] <- "old_k27me3"
+
+# Keep only the additional 6 kb columns (drop the 2 kb redundant ones)
+data2 <- data2[, -(1:8)]
+
+# Merge the two windows into a single data frame keyed by 'region'
+data <- merge(data1, data2, by = "region")
+```
+
+## 2b. Calculate histone mark log2 ratios
+
+```{r calc-log2-ratios}
+# H3K4me1 / H3K4me3 ratio: high values indicate enhancer-like chromatin;
+# low values indicate promoter-like chromatin.
+# A pseudocount of 10 is added to both numerator and denominator to stabilise
+# ratios at low-signal regions and avoid log(0).
+data$K4me1me3_log2ratio <- log2(
+  (((data$H3K4me1_human1_rep1_SRR2096413.bw + data$H3K4me1_human3_rep1_SRR2096414.bw) / 2) + 10) /
+  (((data$H3K4me3_human1_rep1_SRR2096417.bw + data$H3K4me3_human3_rep1_SRR2096419.bw) / 2) + 10)
+)
+
+# H3K27ac / H3K27me3 ratio: high values indicate active chromatin;
+# low values indicate Polycomb-repressed regions.
+data$K27acK27me3_log2ratio <- log2(
+  (data$H3K27ac_DMSO_merged.bw + 10) /
+  (data$H3K27me3_DMSO_merged.bw + 10)
+)
+```
+
+## 2c. ATAC-seq signal (DMSO baseline)
+
+```{r import-atac}
+# Read the ATAC-seq signal table (same structure as the histone tables above).
+# Only the 'region' key and the ATAC signal column are retained.
+atac_df <- read_deeptools_table(file.path(regions_dir, atac_dmso_file))
+atac_df  <- atac_df[, c("region",
+                         setdiff(colnames(atac_df),
+                                 c("chr", "start", "end", "region")))[1:2]]
+data     <- merge(data, atac_df, by = "region")
+```
+
+---
+
+# 3. Annotate regions as TSS-proximal or distal
+
+Uses **Ensembl 111** canonical protein-coding TSSs (AH116291 from AnnotationHub).
+A region is called *proximal* if its centre lies within **1 kb** of a canonical TSS.
+
+```{r tss-annotation}
+# Convert 'region' string keys back to GRanges for overlap operations
+data_parsed <- data %>%
+  separate(region, into = c("chr", "start", "end"),
+           sep = "_", remove = FALSE, convert = TRUE)
+
+data_gr <- GRanges(
+  seqnames = data_parsed$chr,
+  ranges   = IRanges(start = data_parsed$start,
+                     end   = data_parsed$end)
+)
+
+# Retrieve Ensembl 111 EnsDb from AnnotationHub and extract canonical TSS positions
+ah         <- AnnotationHub()
+edb_latest <- ah[["AH116291"]]   # Ensembl 111, Homo sapiens
+
+tx_gr  <- transcripts(edb_latest,
+                       filter = ~ gene_biotype == "protein_coding" &
+                                  tx_is_canonical == TRUE)
+tss_gr <- resize(tx_gr, width = 1, fix = "start")
+
+# Harmonise chromosome naming style (Ensembl → UCSC: e.g. "1" → "chr1")
+seqlevelsStyle(tss_gr) <- "UCSC"
+
+# Compute distance from each reference region to the nearest canonical TSS
+nearest_hits            <- distanceToNearest(data_gr, tss_gr)
+data_gr$dist_to_pc_TSS  <- mcols(nearest_hits)$distance
+data_gr$within_1kb_TSS  <- data_gr$dist_to_pc_TSS <= 1000
+
+message("TSS-proximal regions (≤1 kb): ",
+        sum(data_gr$within_1kb_TSS), " / ", length(data_gr))
+
+# Propagate the TSS-proximity flag back to the data frame
+data <- data %>%
+  mutate(within_1kb_TSS = ifelse(data_gr$within_1kb_TSS,
+                                 "within_1kb_TSS",
+                                 "not_within_1kb_TSS"))
+```
+
+---
+
+# 4. Annotate SNAI1/2 peak overlap
+
+```{r snai-overlap}
+# Binary overlap: does any part of a SNAI2 peak intersect a reference region?
+overlaps_peak <- overlapsAny(data_gr, peaks_gr)
+
+data <- data %>%
+  mutate(SNAI_peaks_all = ifelse(overlaps_peak,
+                                 "SNAI_bound",
+                                 "SNAI_NOT_bound"))
+
+# Cross-tabulate TSS proximity vs SNAI binding as a sanity check
+print(table(TSS_proximity = data$within_1kb_TSS,
+            SNAI_binding  = data$SNAI_peaks_all))
+```
+
+---
+
+# 5. Classify regions as promoter-proximal or distal
+
+Classification logic (applied in this order of priority):
+
+1. **Promoter** – within 1 kb of a canonical TSS.
+2. **Promoter** (distal override) – high H3K4me3 signal (K4me1/me3 ratio ≤ −0.2), regardless of TSS distance.
+3. **H3K27me3-enriched** – strong Polycomb repression (K27ac/K27me3 ratio ≤ −1).
+4. **Enhancer** – distal, H3K4me1-enriched (ratio > −0.2) **and** active (K27ac/K27me3 ≥ 1).
+5. **Other distal** – distal, H3K4me1-enriched but less strongly active (−1 < K27ac/K27me3 < 1).
+
+```{r classify-regions}
+# Step 1: TSS-proximal → promoter
+data$classification <- ifelse(
+  data$within_1kb_TSS == "within_1kb_TSS", "promoter", "other"
+)
+
+# Step 2: Distal but K4me3-high → reclassify as promoter
+data$classification <- ifelse(
+  data$within_1kb_TSS == "not_within_1kb_TSS" &
+    data$K4me1me3_log2ratio <= -0.2 &
+    data$K27acK27me3_log2ratio > -1,
+  "promoter", data$classification
+)
+
+# Step 3: Polycomb-repressed
+data$classification <- ifelse(
+  data$within_1kb_TSS == "not_within_1kb_TSS" &
+    data$K27acK27me3_log2ratio <= -1,
+  "H3K27me3_enriched", data$classification
+)
+
+# Step 4: Active enhancer
+data$classification <- ifelse(
+  data$within_1kb_TSS == "not_within_1kb_TSS" &
+    data$K4me1me3_log2ratio > -0.2 &
+    data$K27acK27me3_log2ratio >= 1,
+  "enhancer", data$classification
+)
+
+# Step 5: Other distal (H3K4me1-enriched but not strongly active)
+data$classification <- ifelse(
+  data$within_1kb_TSS == "not_within_1kb_TSS" &
+    data$K4me1me3_log2ratio > -0.2 &
+    data$K27acK27me3_log2ratio > -1 &
+    data$K27acK27me3_log2ratio < 1,
+  "other_distal", data$classification
+)
+
+print(table(data$classification))
+```
+
+## 5a. Scatter plot – all regions coloured by detailed classification
+
+
+```{r}
+cls_cols <- c(
+  "promoter"          = "#0072B2",
+  "enhancer"          = "#E69F00",
+  "other_distal"      = "#F0E442",
+  "H3K27me3_enriched" = "#009E73"
+)
+
+common_layers <- list(
+  geom_point_rast(size = 0.2, alpha = 0.2),
+  scale_color_manual(values = cls_cols),
+  guides(color = guide_legend(override.aes = list(alpha = 1, size = 2))),
+  theme_bw(),
+  labs(title = "", color = "Region type"),
+  geom_vline(xintercept = -0.2, linetype = "dashed", color = "grey"),
+  geom_hline(yintercept = -1,   linetype = "dashed", color = "grey"),
+  coord_cartesian(xlim = range(data$K4me1me3_log2ratio, na.rm = TRUE),
+                  ylim = range(data$K27acK27me3_log2ratio, na.rm = TRUE))
+)
+
+base_aes <- aes(x = K4me1me3_log2ratio,
+                y = K27acK27me3_log2ratio,
+                color = classification)
+
+p1 <- ggplot(data, base_aes) + common_layers
+
+p2 <- ggplot(data[data$SNAI_peaks_all %in% "SNAI_bound", ], base_aes) + common_layers
+
+ggarrange(p1, p2, 
+          ncol = 2, 
+          common.legend = TRUE, 
+          legend = "right",
+  align = "h")
+
+ggsave(file.path(figures_dir, "ATAC_regions_classification_plot_v4.pdf"),
+       height = 3.5, width = 7.5)
+
+```
+
+
+
+
+---
+
+# 6. Assign each SNAI peak to proximal or distal class and export BED files
+
+Peaks overlapping more than one reference region are resolved by choosing the
+region whose centre is closest to the MACS2 summit position.
+
+These peaks were used for Heatmap in Figure 2 (deeptools computeMatrixand plotHeatmap)
+```{r assign-snai-peaks}
+
+# ── Reconstruct GRanges from the region string keys ──────────────────────────
+# NOTE: BED coordinates are 0-based half-open intervals; GRanges are 1-based
+# closed intervals, so we add 1 to the start.
+region_parts <- do.call(rbind, strsplit(as.character(data$region), "_"))
+data_gr <- GRanges(
+  seqnames       = region_parts[, 1],
+  ranges         = IRanges(start = as.numeric(region_parts[, 2]) + 1,
+                           end   = as.numeric(region_parts[, 3])),
+  classification = data$classification
+)
+data_centers <- start(data_gr) + (width(data_gr) / 2)
+
+# ── Convert MACS2 summit offset to absolute genomic coordinates ───────────────
+# The 'peak' column stores the 0-based offset from the peak start.
+summit_positions <- start(peaks_gr) + peaks_gr$peak
+
+# ── Find all peak–region overlaps (full peak body) ───────────────────────────
+hits    <- findOverlaps(peaks_gr, data_gr)
+hits_df <- data.frame(
+  peak_idx   = queryHits(hits),
+  region_idx = subjectHits(hits)
+)
+
+# Compute summit-to-region-centre distance for tie-breaking
+hits_df$summit_pos    <- summit_positions[hits_df$peak_idx]
+hits_df$region_center <- data_centers[hits_df$region_idx]
+hits_df$distance      <- abs(hits_df$summit_pos - hits_df$region_center)
+
+# Keep the closest region match for each peak
+hits_df       <- hits_df[order(hits_df$distance), ]
+hits_resolved <- hits_df[!duplicated(hits_df$peak_idx), ]
+
+# ── Extract classified peaks ──────────────────────────────────────────────────
+matched_peaks_gr               <- peaks_gr[hits_resolved$peak_idx]
+matched_peaks_gr$matched_class <- data_gr$classification[hits_resolved$region_idx]
+
+promoter_peaks <- matched_peaks_gr[matched_peaks_gr$matched_class == "promoter"]
+distal_peaks   <- matched_peaks_gr[matched_peaks_gr$matched_class %in% c("enhancer", "other_distal")]
+
+# Remove the temporary metadata column before export
+promoter_peaks$matched_class <- NULL
+distal_peaks$matched_class   <- NULL
+
+# ── Export BED files ─────────────────────────────────────────────────────────
+# rtracklayer::export.bed automatically converts back to 0-based BED coordinates.
+export.bed(promoter_peaks, "/Volumes/storage/SNAI_paper/peaks/s8_lib1_CNCCp4_SNAI2a3029_DMSO_r2_aSNAI2_reltodTag_peaks_minusINPUT_filtered_PROXIMALcomb_v7.bed")
+export.bed(distal_peaks,   "/Volumes/storage/SNAI_paper/peaks/s8_lib1_CNCCp4_SNAI2a3029_DMSO_r2_aSNAI2_reltodTag_peaks_minusINPUT_filtered_DISTALcomb_v7.bed")
+
+message("Promoter-assigned peaks: ", length(promoter_peaks))
+message("Distal-assigned peaks:   ", length(distal_peaks))
+
+# ── Export BED files ─────────────────────────────────────────────────────────
+# rtracklayer::export.bed automatically converts back to 0-based BED coordinates.
+export.bed(promoter_peaks,
+           file.path(peaks_dir,
+                     "SNAI2_peaks_PROXIMALcomb_v7.bed"))
+export.bed(distal_peaks,
+           file.path(peaks_dir,
+                     "SNAI2_peaks_DISTALcomb_v7.bed"))
+```
+
+
+
+---
+
+# 7. Annotate regions with DEseq2 differential results (H3K27ac and ATAC)
+
+Reads BED files produced by DEseq2 for significantly UP or DOWN regions at
+3 h, 1 day, and 3 day dTag time points, and flags each reference region
+accordingly (binary 1/0 columns).
+
+```{r import-deseq-bed}
+# Helper: read a DEseq2 BED file and return a vector of 'region' keys
+read_deseq_bed <- function(fname) {
+  df <- read_table(file.path(regions_dir, fname), col_names = FALSE,
+                   show_col_types = FALSE)
+  paste(df$X1, df$X2, df$X3, sep = "_")
+}
+
+# H3K27ac UP regions
+H3K27ac_UP_3h <- read_deseq_bed("DEseq2_3h_vs_ctrl_H3K27ac_UP.bed")
+H3K27ac_UP_1d <- read_deseq_bed("DEseq2_1d_vs_ctrl_H3K27ac_UP.bed")
+H3K27ac_UP_3d <- read_deseq_bed("DEseq2_3d_vs_ctrl_H3K27ac_UP.bed")
+
+# H3K27ac DOWN regions
+H3K27ac_DW_3h <- read_deseq_bed("DEseq2_3h_vs_ctrl_H3K27ac_DOWN.bed")
+H3K27ac_DW_1d <- read_deseq_bed("DEseq2_1d_vs_ctrl_H3K27ac_DOWN.bed")
+H3K27ac_DW_3d <- read_deseq_bed("DEseq2_3d_vs_ctrl_H3K27ac_DOWN.bed")
+
+# ATAC UP regions
+ATAC_UP_3h <- read_deseq_bed("DEseq2_3h_vs_ctrl_ATAC_UP.bed")
+ATAC_UP_1d <- read_deseq_bed("DEseq2_1d_vs_ctrl_ATAC_UP.bed")
+ATAC_UP_3d <- read_deseq_bed("DEseq2_3d_vs_ctrl_ATAC_UP.bed")
+
+# ATAC DOWN regions
+ATAC_DW_3h <- read_deseq_bed("DEseq2_3h_vs_ctrl_ATAC_DOWN.bed")
+ATAC_DW_1d <- read_deseq_bed("DEseq2_1d_vs_ctrl_ATAC_DOWN.bed")
+ATAC_DW_3d <- read_deseq_bed("DEseq2_3d_vs_ctrl_ATAC_DOWN.bed")
+
+# Flag each reference region (binary 1/0 columns)
+flag_regions <- function(df, ref_regions, col_name) {
+  df[[col_name]] <- as.integer(df$region %in% ref_regions)
+  df
+}
+
+data <- data %>%
+  flag_regions(H3K27ac_UP_3h, "H3K27ac_UP_3h") %>%
+  flag_regions(H3K27ac_UP_1d, "H3K27ac_UP_1d") %>%
+  flag_regions(H3K27ac_UP_3d, "H3K27ac_UP_3d") %>%
+  flag_regions(H3K27ac_DW_3h, "H3K27ac_DW_3h") %>%
+  flag_regions(H3K27ac_DW_1d, "H3K27ac_DW_1d") %>%
+  flag_regions(H3K27ac_DW_3d, "H3K27ac_DW_3d") %>%
+  flag_regions(ATAC_UP_3h,    "ATAC_UP_3h")    %>%
+  flag_regions(ATAC_UP_1d,    "ATAC_UP_1d")    %>%
+  flag_regions(ATAC_UP_3d,    "ATAC_UP_3d")    %>%
+  flag_regions(ATAC_DW_3h,    "ATAC_DW_3h")    %>%
+  flag_regions(ATAC_DW_1d,    "ATAC_DW_1d")    %>%
+  flag_regions(ATAC_DW_3d,    "ATAC_DW_3d")
+```
+
+## 7a. Import DEseq2 log2 fold-changes
+
+```{r import-deseq-log2fc}
+# Each CSV contains one row per reference region with a log2FC column.
+# File names encode the comparison (time point) and assay (mark):
+#   DEseq2_<time>_vs_ctrl_<mark>_ATACregionsv3.csv
+# The 'parts' vector is parsed to build a tidy column name: <mark>_<time>_log2FC.
+
+deseq_files <- c(
+  "DEseq2_3h_vs_ctrl_H3K27ac_ATACregionsv3",
+  "DEseq2_1d_vs_ctrl_H3K27ac_ATACregionsv3",
+  "DEseq2_3d_vs_ctrl_H3K27ac_ATACregionsv3",
+  "DEseq2_3h_vs_ctrl_ATACdata_ATACregionsv3",
+  "DEseq2_1d_vs_ctrl_ATACdata_ATACregionsv3",
+  "DEseq2_3d_vs_ctrl_ATACdata_ATACregionsv3"
+)
+
+fc_list <- map(deseq_files, function(f) {
+  parts <- strsplit(f, "_")[[1]]
+  time  <- parts[2]   # "3h", "1d", or "3d"
+  mark  <- parts[5]   # "H3K27ac" or "ATACdata"
+
+  df <- read_csv(file.path(regions_dir, paste0(f, ".csv")),
+                 show_col_types = FALSE)
+  df <- df[, c(1, 3)]   # keep region ID and log2FC columns
+  colnames(df) <- c("region", paste0(mark, "_", time, "_log2FC"))
+  df
+})
+
+# Left-join all log2FC tables onto the main data frame
+data <- purrr::reduce(
+  fc_list,
+  function(x, y) merge(x, y, by = "region", all.x = TRUE),
+  .init = data
+)
+```
+
+## 7b. Save annotated data
+
+```{r save-data}
+saveRDS(data, file = file.path(regions_dir, "data_v4.rds"))
+# To reload: data <- readRDS(file.path(regions_dir, "data_v4.rds"))
+```
+
+---
+
+# 8. Stacked-bar plots: composition of differential regions
+
+## 8a. SNAI-bound UP regions only (detailed classification; Figure 2/3 panel)
+
+```{r barplot-bound-up}
+
+# Removed all the _DW_ columns from this vector
+diff_cols <- c(
+  "H3K27ac_UP_3h", "H3K27ac_UP_1d", "H3K27ac_UP_3d",
+  "ATAC_UP_3h", "ATAC_UP_1d", "ATAC_UP_3d"
+)
+
+data <- data %>%
+  mutate(across(all_of(diff_cols), as.numeric))
+
+long <- data %>%
+  dplyr::filter(SNAI_peaks_all == "SNAI_bound") %>% # take only bound
+  dplyr::select(region, classification, all_of(diff_cols)) %>%
+  pivot_longer(all_of(diff_cols),
+               names_to = "diff_set",
+               values_to = "is_diff") %>%
+  dplyr::filter(is_diff == 1) %>%
+  # Split the set name into mark / direction / time so we can facet
+  separate(diff_set, into = c("mark", "direction", "time"),
+           sep = "_", remove = FALSE) %>%
+  mutate(
+    time            = factor(time, levels = c("3h", "1d", "3d")),
+    direction       = factor(direction, levels = c("UP")), # Removed "DW" here
+    mark            = factor(mark, levels = c("H3K27ac", "ATAC")),
+    classification = factor(classification,
+                             levels = c("promoter",  "enhancer",
+                                        "other_distal","H3K27me3_enriched"))
+  )
+
+totals <- long %>% dplyr::count(direction, mark, time, name = "n")
+
+ggplot(long, aes(x = time, fill = classification)) +
+  geom_bar(position = "fill") +
+  geom_text(aes(label = after_stat(count)),
+            stat = "count",
+            position = position_fill(vjust = 0.5),
+            size = 2.5) +
+  #geom_text(data = totals,
+  #          aes(x = time, y = 1.03, label = paste0("n=", n)),
+  #          inherit.aes = FALSE, size = 2.8) +
+  facet_wrap(~ mark + direction, ncol = 1) +
+  scale_fill_manual(values = c(
+    "promoter"      = "#0072B2",
+    "enhancer"      = "#E69F00",
+    "other_distal"  = "#F0E442",
+    "H3K27me3_enriched" = "#009E73"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "Timepoint", y = "Fraction of differential regions",
+       fill = "Region classification",
+       title = "") + 
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+ggsave(file.path(figures_dir, "ATAC_regions_diff_annotations_noK27me_bound_up.pdf"),
+       height = 5, width = 4.5)
+```
+
+## 8b. All regions, UP and DOWN (full classification; supplementary figure)
+
+```{r barplot-all-diff}
+diff_cols_all <- c(
+  "H3K27ac_UP_3h", "H3K27ac_UP_1d", "H3K27ac_UP_3d",
+  "H3K27ac_DW_3h", "H3K27ac_DW_1d", "H3K27ac_DW_3d",
+  "ATAC_UP_3h",    "ATAC_UP_1d",    "ATAC_UP_3d",
+  "ATAC_DW_3h",    "ATAC_DW_1d",    "ATAC_DW_3d"
+)
+
+long_all <- data %>%
+  dplyr::select(region, classification, all_of(diff_cols_all)) %>%
+  pivot_longer(all_of(diff_cols_all), names_to = "diff_set", values_to = "is_diff") %>%
+  dplyr::filter(is_diff == 1) %>%
+  separate(diff_set, into = c("mark", "direction", "time"),
+           sep = "_", remove = FALSE) %>%
+  mutate(
+    time            = factor(time,            levels = c("3h", "1d", "3d")),
+    direction       = factor(direction,       levels = c("UP", "DW")),
+    mark            = factor(mark,            levels = c("H3K27ac", "ATAC")),
+    classification = factor(classification, levels = c("promoter", "enhancer", "other_distal","H3K27me3_enriched"))
+  )
+
+ggplot(long_all, aes(x = time, fill = classification)) +
+  geom_bar(position = "fill") +
+  geom_text(aes(label = after_stat(count)),
+            stat = "count",
+            position = position_fill(vjust = 0.5),
+            size = 2.5) +
+  facet_wrap(~ mark + direction, ncol = 1) +
+  scale_fill_manual(values = c(
+    "promoter"     = "#0072B2",
+    "enhancer"     = "#E69F00",
+    "other_distal" = "#F0E442"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "Timepoint", y = "Fraction of differential regions",
+       fill = "Region classification") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+ggsave(file.path(figures_dir, "ATAC_regions_diff_annotations_noK27me.pdf"),
+       height = 7, width = 5)
+```
+
+## 8c. SNAI binding composition of differential regions
+
+```{r barplot-snai-binding}
+long_snai <- data %>%
+  dplyr::select(region, SNAI_peaks_all, all_of(diff_cols_all)) %>%
+  pivot_longer(all_of(diff_cols_all), names_to = "diff_set", values_to = "is_diff") %>%
+  dplyr::filter(is_diff == 1) %>%
+  separate(diff_set, into = c("mark", "direction", "time"),
+           sep = "_", remove = FALSE) %>%
+  mutate(
+    time           = factor(time,           levels = c("3h", "1d", "3d")),
+    direction      = factor(direction,      levels = c("UP", "DW")),
+    mark           = factor(mark,           levels = c("H3K27ac", "ATAC")),
+    SNAI_peaks_all = factor(SNAI_peaks_all, levels = c("SNAI_bound", "SNAI_NOT_bound"))
+  )
+
+ggplot(long_snai, aes(x = time, fill = SNAI_peaks_all)) +
+  geom_bar(position = "fill") +
+  geom_text(aes(label = after_stat(count)),
+            stat = "count",
+            position = position_fill(vjust = 0.5),
+            size = 2.8) +
+  facet_wrap(~ mark + direction, ncol = 1) +
+  scale_fill_manual(values = c(
+    "SNAI_bound"     = "#D55E00",
+    "SNAI_NOT_bound" = "grey70"
+  )) +
+  scale_y_continuous(labels = scales::percent_format(),
+                     expand = expansion(mult = c(0, 0.08))) +
+  labs(x = "Timepoint", y = "Fraction of differential regions",
+       fill = "SNAI binding") +
+  theme_bw() +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+ggsave(file.path(figures_dir, "ATAC_regions_diff_SNAI_binding_noK27me.pdf"),
+       height = 7, width = 5)
+```
+
+---
+
+# 9. Extract SNAI2 motif centres at distal peaks
+
+Used as input for aggregate/heatmap plots centred on the SNAI motif.
+
+```{r motif-centres}
+SNAI_enhancer_peaks <- distal_peaks
+
+# Read the FIMO output BED (0-based half-open coordinates)
+fimo_df <- read.table(
+  file.path(fimo_dir, fimo_bed_file),
+  sep = "\t", header = FALSE, stringsAsFactors = FALSE, comment.char = "#"
+)
+
+motifs_gr <- GRanges(
+  seqnames = fimo_df$V1,
+  ranges   = IRanges(start = fimo_df$V2 + 1, end = fimo_df$V3),  # 0-based → 1-based
+  strand   = if (ncol(fimo_df) >= 6) fimo_df$V6 else "*"
+)
+
+# Build ±100 bp windows around each SNAI2 peak summit
+summit_pos     <- start(SNAI_enhancer_peaks) + SNAI_enhancer_peaks$peak
+summit_windows <- GRanges(
+  seqnames = seqnames(SNAI_enhancer_peaks),
+  ranges   = IRanges(start = summit_pos - 100, end = summit_pos + 100)
+)
+
+# Retain only motif instances that fall within summit windows
+motifs_in_peaks <- subsetByOverlaps(motifs_gr, summit_windows)
+message("Motif instances within ±100 bp of SNAI2 summits: ", length(motifs_in_peaks))
+
+# Collapse each motif to its 1 bp centre for downstream meta-peak analysis
+motif_centers <- resize(motifs_in_peaks, width = 1, fix = "center")
+
+export(motif_centers,
+       file.path(peaks_dir, "SNAI2_peaks_DISTAL_v7_motifcenters.bed"),
+       format = "BED")
+```
+
+---
+
+# 10. ATAC vs H3K27ac log2FC at dTag time points
+linear mixed-effects model with region as a random effect
+
+```{r lmm-atac-vs-k27ac}
+
+# ── 1. Select regions and reshape to long format ─────────────────────────────
+# Universe: SNAI-bound distal regions (enhancer or other_distal) that are
+# differentially UP in H3K27ac or ATAC at ANY of the three timepoints.
+# The same region can therefore contribute up to 3 rows, which is exactly why
+# a random intercept per region is needed below.
+sel_alltp <- data %>%
+  dplyr::filter(
+    H3K27ac_UP_3h == 1 | ATAC_UP_3h == 1 |
+    H3K27ac_UP_1d == 1 | ATAC_UP_1d == 1 |
+    H3K27ac_UP_3d == 1 | ATAC_UP_3d == 1,
+    SNAI_peaks_all == "SNAI_bound",
+    classification %in% c("enhancer", "other_distal")
+  )
+
+# H3K27ac log2FCs: one column per timepoint -> one row per region x timepoint
+ac_long <- sel_alltp %>%
+  dplyr::select(region, classification, SNAI_peaks_all,
+                H3K27ac_3h_log2FC, H3K27ac_1d_log2FC, H3K27ac_3d_log2FC) %>%
+  pivot_longer(cols      = starts_with("H3K27ac_"),
+               names_to  = "timepoint",
+               values_to = "ac_l2fc") %>%
+  mutate(timepoint = gsub("H3K27ac_|_log2FC", "", timepoint))
+
+# Same for ATAC
+atac_long <- sel_alltp %>%
+  dplyr::select(region,
+                ATACdata_3h_log2FC, ATACdata_1d_log2FC, ATACdata_3d_log2FC) %>%
+  pivot_longer(cols      = starts_with("ATACdata_"),
+               names_to  = "timepoint",
+               values_to = "atac_l2fc") %>%
+  mutate(timepoint = gsub("ATACdata_|_log2FC", "", timepoint))
+
+# Pair the two marks on region + timepoint. inner_join drops any region missing
+# a value in either assay, so both columns are complete by construction.
+df_long <- inner_join(ac_long, atac_long, by = c("region", "timepoint")) %>%
+  mutate(
+    timepoint = factor(timepoint, levels = c("3h", "1d", "3d")),  # 3h = reference
+    region    = factor(region)
+  )
+
+# ── 2. Fit the two models and test the interaction ───────────────────────────
+# reduced: one common ATAC->H3K27ac slope, each timepoint gets its own intercept
+# full:    the slope itself is allowed to differ by timepoint (interaction term)
+# (1|region) absorbs the baseline responsiveness of each region, so the slopes
+# are not inflated by repeated measurement of the same loci.
+full    <- lmer(ac_l2fc ~ atac_l2fc * timepoint + (1 | region), data = df_long)
+reduced <- lmer(ac_l2fc ~ atac_l2fc + timepoint + (1 | region), data = df_long)
+
+# anova() on two lmer fits refits both with ML (not REML) and runs a likelihood
+# ratio test. A significant result means the coupling strengthens/weakens over time.
+lrt <- anova(reduced, full)
+lrt
+
+# ── 3. Per-timepoint slopes and pairwise comparisons ─────────────────────────
+trends <- emtrends(full, pairwise ~ timepoint, var = "atac_l2fc")
+
+slope_table <- as.data.frame(trends$emtrends) %>%
+  transmute(
+    timepoint = timepoint,
+    slope     = round(atac_l2fc.trend, 3),
+    CI_lower  = round(asymp.LCL, 3),
+    CI_upper  = round(asymp.UCL, 3),
+    `95% CI`  = paste0("[", CI_lower, ", ", CI_upper, "]")
+  ) %>%
+  dplyr::select(timepoint, slope, `95% CI`)
+
+slope_table
+
+# Pairwise slope differences (3h vs 1d, 3h vs 3d, 1d vs 3d), Tukey-adjusted.
+# p is rounded to 3 significant digits, so anything below ~1e-16 prints as 0;
+# p_report rewrites those as the conventional "< 2.2e-16".
+contrast_table <- as.data.frame(trends$contrasts) %>%
+  transmute(
+    contrast           = contrast,
+    `slope difference` = round(estimate, 3),
+    z                  = round(z.ratio, 2),
+    p                  = signif(p.value, 3)
+  ) %>%
+  mutate(
+    p_report = ifelse(p == 0,
+                      paste0("z = ", z, ", p < 2.2e-16"),
+                      paste0("z = ", z, ", p = ", p))
+  ) %>%
+  dplyr::select(-p)
+
+contrast_table
+
+write.csv(slope_table,
+          file.path(figures_dir, "slope_table.csv"),    row.names = FALSE)
+write.csv(contrast_table,
+          file.path(figures_dir, "contrast_table.csv"), row.names = FALSE)
+
+# ── 4. Faceted scatter with the fitted population-level lines ────────────────
+# Build a prediction grid spanning each timepoint's observed ATAC range, then
+# predict with re.form = NA so the line reflects the FIXED effects only
+# (i.e. the average region, not any individual random intercept).
+pred_grid <- df_long %>%
+  group_by(timepoint) %>%
+  summarise(min_x = min(atac_l2fc, na.rm = TRUE),
+            max_x = max(atac_l2fc, na.rm = TRUE),
+            .groups = "drop") %>%
+  rowwise() %>%
+  reframe(timepoint = timepoint,
+          atac_l2fc = seq(min_x, max_x, length.out = 100))
+
+pred_grid$ac_l2fc_pred <- predict(full, newdata = pred_grid, re.form = NA)
+
+# Slope + CI label, one per facet
+annot <- slope_table %>%
+  mutate(label = paste0("slope = ", slope, "\n", `95% CI`))
+
+p_facet <- ggplot(df_long, aes(x = atac_l2fc, y = ac_l2fc)) +
+  geom_point(size = 1, alpha = 0.4, shape = 21, color = "grey40") +
+  geom_line(data = pred_grid, aes(x = atac_l2fc, y = ac_l2fc_pred),
+            color = "firebrick", linewidth = 1) +
+  # NOTE: label position is hard-coded; adjust if the axis ranges change
+  geom_text(data = annot, aes(x = -0.3, y = 2.3, label = label),
+            inherit.aes = FALSE, size = 3, hjust = 0) +
+  facet_wrap(~ timepoint) +
+  labs(x = "ATAC log2FC (dTag/DMSO)",
+       y = "H3K27ac log2FC (dTag/DMSO)",
+       title = "SNAI-bound distal regions - upregulated") +
+  theme_bw() +
+  theme(strip.background = element_blank())
+
+p_facet
+
+ggsave(file.path(figures_dir, "Scatter_ATAC_k27_v4_mixedeffectmodel_comb.pdf"),
+       p_facet, height = 3, width = 8)
+```
+
+
+
+
+---
+
+# 11. Density plots: H3K27ac enrichment across region subsets
+
+Compares baseline H3K27ac levels between all distal regions, SNAI-bound distal
+regions, and those that become UP at each time point (only SNAI-bound).
+
+```{r density-k27ac}
+data_dist <- data[data$classification %in% c("other_distal", "enhancer"), ]
+
+# Build the combined data frame with group labels
+subsets <- list(
+  all_distal = data_dist,
+  bound      = data_dist[data_dist$SNAI_peaks_all == "SNAI_bound", ],
+  UP_3h      = data_dist[data_dist$H3K27ac_UP_3h == 1 & data_dist$SNAI_peaks_all == "SNAI_bound", ],
+  UP_1d      = data_dist[data_dist$H3K27ac_UP_1d == 1 & data_dist$SNAI_peaks_all == "SNAI_bound", ],
+  UP_3d      = data_dist[data_dist$H3K27ac_UP_3d == 1 & data_dist$SNAI_peaks_all == "SNAI_bound", ]
+)
+
+for (nm in names(subsets)) subsets[[nm]]$group_K27ac <- nm
+
+comb <- do.call(rbind, subsets)
+comb$group_K27ac <- factor(comb$group_K27ac,
+                            levels = c("all_distal", "bound", "UP_3h", "UP_1d", "UP_3d"))
+
+# Build legend labels that include group sizes
+counts     <- table(comb$group_K27ac)
+new_labels <- setNames(paste0(names(counts), " (n=", counts, ")"), names(counts))
+
+ggplot(comb, aes(x = log(H3K27ac_DMSO_merged.bw),
+                 color = group_K27ac, fill = group_K27ac)) +
+  geom_density(alpha = 0.2) +
+  scale_color_discrete(labels = new_labels) +
+  scale_fill_discrete(labels  = new_labels) +
+  labs(x = "log(H3K27ac)", y = "Density",
+       title = "H3K27ac baseline at UP regions") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        legend.title = element_blank())
+
+ggsave(file.path(figures_dir, "SNAI_enh_strength_dist_k2only.pdf"),
+       width = 5, height = 2.5)
+```
+
+---
+
+# 12. Motif logos
+
+```{r motif-logos-snai2}
+# SNAI2 DBD motif (Jolma 2013) – used in main figures
+motif_files_snai <- c(
+  "SNAI2_JOLMA2013" = "SNAI2_DBD_jolma2013.meme"
+)
+
+motif_list_snai <- lapply(names(motif_files_snai), function(n) {
+  m         <- read_meme(file.path(motif_dir, motif_files_snai[[n]]))
+  m["name"] <- n
+  m
+})
+
+view_motifs(motif_list_snai)
+ggsave(file.path(figures_dir, "SNAI_motif_logos_jolma2013.pdf"),
+       width = 5, height = 2)
+```
+
+```{r motif-logos-cobinding}
+# Co-binding partner motifs: coordinator, NR2F1 (COUP-TFII), TFAP2A, SNAI
+motif_files_co <- c(
+  "coordinator" = "WAATNRRAAVCABMTGB.meme",
+  "NR2F1"       = "COT2.H14CORE.1.P.B_meme_format.meme",
+  "TFAP2A"      = "AP2A.H14CORE.0.PSM.A_meme_format.meme",
+  "SNAI"        = "SNAI1.H14CORE.0.PSM.A_meme_format.meme"
+)
+
+motif_list_co <- lapply(names(motif_files_co), function(n) {
+  m         <- read_meme(file.path(motif_dir, motif_files_co[[n]]))
+  m["name"] <- n
+  m
+})
+
+# Save each motif logo as a separate PDF
+for (i in seq_along(motif_list_co)) {
+  motif_name <- names(motif_files_co)[i]
+  p          <- view_motifs(motif_list_co[[i]])
+  ggsave(
+    filename = file.path(figures_dir, paste0(motif_name, "_motif_logo.pdf")),
+    plot     = p,
+    width    = 5,
+    height   = 2
+  )
+}
+```
+
+
+
+

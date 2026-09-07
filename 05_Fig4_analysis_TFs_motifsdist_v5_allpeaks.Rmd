@@ -1,0 +1,349 @@
+---
+title: "TF motif distance analysis – kernel-smoothed log2FC"
+output: html_document
+date: "2026-02-25"
+---
+
+## Overview
+
+For each transcription factor (TWIST1, NR2F1, TFAP2A), this notebook:
+
+1. Loads the TF's ChIP-seq peaks and DEseq2 log2 fold-changes (dTag vs DMSO).
+2. Associates each peak summit with the nearest TF-specific FIMO motif (≤ 100 bp).
+3. Computes the signed distance from that source-TF motif to the nearest SNAI2 motif.
+4. Produces a kernel-smoothed log2FC curve along the distance axis, showing whether
+   SNAI2 depletion preferentially affects TF binding at sites close to a SNAI2 motif.
+
+**Final figure choices:**
+- Only **distal** regions (enhancer + other_distal) are plotted.
+- Only **bandwidth = 100 bp** is used.
+
+### Required input files (place in the directories configured below)
+
+| File | Variable |
+|---|---|
+| Annotated ATAC regions RDS (output of Define_proximal_distal script) | `ANNOT_PATH` |
+| SNAI2 FIMO BED | `SNAI2_MOTIF_BED` |
+| Per-TF DEseq2 CSV (log2FC, one row per peak) | `fc_dir` |
+| Per-TF narrowPeak file | `peaks_dir` |
+| Per-TF FIMO BED | `fimo_dir` |
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(GenomicRanges)
+library(RColorBrewer)
+
+# ── User-configurable paths ───────────────────────────────────────────────────
+ANNOT_PATH    <- ".../data_v4.rds"
+SNAI2_MOTIF_BED <- ".../SNAI2_DBD_jolma2013_fimo/fimo_sorted.bed"
+fc_dir        <- ".../DEseq"          # DEseq2 CSV files per TF
+peaks_dir     <- ".../peaks"          # narrowPeak files per TF
+fimo_dir      <- ".../fimo"                # subdirectory per motif set
+OUTPUT_DIR    <- ".../figures"
+
+dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# ── Canonical chromosomes filter ──────────────────────────────────────────────
+canonical_chrs <- paste0("chr", c(1:22, "X", "Y"))
+```
+
+```{r shared-data, message=FALSE, warning=FALSE}
+# ── Load region annotations ───────────────────────────────────────────────────
+# 'annot' is the data frame produced by Define_proximal_distal; it carries the
+# histone-mark-based classification (promoter / enhancer / other_distal / …)
+# and the SNAI binding flag for every reference ATAC region.
+annot <- readRDS(ANNOT_PATH)
+
+# Helper: convert the 'region' string key (chr_start_end) back to GRanges
+annot_to_gr <- function(df) {
+  df |>
+    separate(region, into = c("seqnames", "start", "end"),
+             sep = "_", convert = TRUE, remove = TRUE) |>
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE)
+}
+
+# Only distal regions are used in these figures (see Overview)
+enhancers_gr <- annot_to_gr(
+  annot[annot$classification %in% c("enhancer", "other_distal"), ]
+)
+
+# ── Load SNAI2 FIMO motifs (target TF; shared across all analyses) ────────────
+# FIMO output is 0-based BED; makeGRangesFromDataFrame converts to 1-based.
+snai2_motifs_gr <- read.table(
+  SNAI2_MOTIF_BED,
+  sep = "\t", header = FALSE,
+  col.names = c("chr", "start", "end", "motif", "score_int", "strand",
+                "empty", "score_log", "pvalue", "qvalue", "sequence")
+) |>
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE,
+                           starts.in.df.are.0based = TRUE)
+```
+
+```{r kernel-smooth-function}
+# ── Kernel-smoothed log2FC plot ───────────────────────────────────────────────
+#
+# For each position x0 along the distance axis, we compute a Gaussian-weighted
+# mean of log2FC values, where weights are proportional to the normal density
+# with mean x0 and SD = bw/2. This produces a smooth estimate of how the
+# average log2FC changes as a function of distance to the target (SNAI2) motif.
+#
+# The weighted SE is computed as:
+#   SE = sqrt( sum(w * (y - mean)^2) ) / sqrt(n_eff)
+# where n_eff = 1 / sum(w^2) is the effective sample size (Kish 1965).
+#
+# Arguments:
+#   df            – data frame with columns 'dist_to_target' and 'log2FoldChange'
+#   source_tf     – label for the source TF (used in plot titles)
+#   target_tf     – label for the target TF (SNAI2)
+#   subtitle_suffix – region label shown in the subtitle (e.g. "Distal")
+#   bw            – bandwidth in bp (SD = bw/2)
+#   xlim_range    – x-axis extent in bp (symmetric around 0)
+#   step          – spacing of evaluation grid in bp
+#   ylim          – y-axis limits
+
+make_kernel_smooth <- function(df, source_tf, target_tf, subtitle_suffix,
+                               bw          = 100,
+                               xlim_range  = 1000,
+                               step        = 25,
+                               ylim        = c(-0.12, 0.28)) {
+
+  d  <- df[!is.na(df$dist_to_target) & !is.na(df$log2FoldChange), ]
+  xs <- seq(-xlim_range, xlim_range, by = step)
+
+  est <- sapply(xs, function(x0) {
+    w     <- dnorm(d$dist_to_target, mean = x0, sd = bw / 2)
+    w_sum <- sum(w)
+    if (w_sum == 0) return(c(NA_real_, NA_real_))
+    w     <- w / w_sum
+    n_eff <- 1 / sum(w^2)         # Kish effective sample size
+    m     <- sum(w * d$log2FoldChange)
+    se    <- sqrt(sum(w * (d$log2FoldChange - m)^2)) / sqrt(n_eff)
+    c(m, se)
+  })
+
+  smooth_df <- data.frame(x = xs, y = est[1, ], se = est[2, ]) |>
+    dplyr::filter(!is.na(y), !is.na(se))
+
+  ggplot(smooth_df, aes(x, y)) +
+    geom_ribbon(aes(ymin = y - se, ymax = y + se),
+                fill = "steelblue", alpha = 0.3) +
+    geom_line(color = "steelblue4", linewidth = 1) +
+    # Vertical red line marks distance = 0 (source motif directly at target motif)
+    geom_vline(xintercept = 0,
+               linetype = "dotted", color = "red", alpha = 0.8) +
+    # Purple lines mark ±200 bp, a typical co-binding window of interest
+    geom_vline(xintercept = c(-200, 200),
+               linetype = "dotted", color = "purple", alpha = 0.8) +
+    theme_classic() +
+    labs(
+      title    = paste0(source_tf, " kernel-smoothed log2FC (", target_tf, " depletion)"),
+      subtitle = paste0("Distance to ", target_tf, " motif – ", subtitle_suffix,
+                        " | Bandwidth = ", bw, " bp | Shaded = weighted SE"),
+      x = paste0("Distance to ", target_tf, " motif center (bp)"),
+      y = paste0(source_tf, " smoothed log2FoldChange (mean)")
+    ) +
+    coord_cartesian(xlim = c(-xlim_range, xlim_range), ylim = ylim)
+}
+```
+
+```{r pipeline-function}
+# ── Main analysis pipeline ────────────────────────────────────────────────────
+#
+# For a given source TF, this function:
+#   1. Loads and filters ChIP peaks (bottom 20% by signalValue removed).
+#   2. Attaches DEseq2 log2FC to each peak summit via overlap.
+#   3. Loads FIMO motifs for the source TF; optionally consolidates overlapping
+#      motif hits (keep best p-value per cluster) to avoid double-counting.
+#   4. Associates each summit with the nearest source-TF motif (≤ 100 bp).
+#   5. Computes strand-aware signed distance to the nearest SNAI2 motif:
+#      positive = source motif is downstream of SNAI2 motif on the + strand.
+#   6. Restricts to distal regions and saves the kernel-smooth plot (bw = 100).
+#
+# Arguments:
+#   SOURCE_TF                 – TF label used in filenames and plot titles
+#   SOURCE_FC_PATH            – path to DEseq2 CSV (column 'X' = region key,
+#                               column 3 = log2FoldChange)
+#   SOURCE_PEAK_PATH          – path to narrowPeak file (0-based BED)
+#   SOURCE_MOTIF_BED          – path to FIMO BED for source-TF motif
+#   TARGET_TF                 – target TF label (SNAI2 in all current analyses)
+#   target_motifs_gr          – GRanges of target-TF motifs (pre-loaded)
+#   consolidate_source_motifs – if TRUE, overlapping motif hits are collapsed
+#                               to one per cluster (best p-value kept)
+#   target_suffix             – appended to output filenames for versioning
+
+run_tf_analysis <- function(SOURCE_TF, SOURCE_FC_PATH, SOURCE_PEAK_PATH, SOURCE_MOTIF_BED,
+                            TARGET_TF, target_motifs_gr,
+                            consolidate_source_motifs = TRUE,
+                            target_suffix = "_allTargetMotifs") {
+
+  # 1. Load DEseq2 log2FC table
+  # The 'X' column encodes region coordinates as "chr_start_end"
+  source_fc_df <- read.csv(SOURCE_FC_PATH) |>
+    separate(X, into = c("chr", "start", "end"),
+             sep = "_", extra = "merge") |>
+    mutate(across(c(start, end), as.numeric)) |>
+    dplyr::filter(chr %in% canonical_chrs, !is.na(start), !is.na(end))
+  source_fc_gr <- makeGRangesFromDataFrame(source_fc_df, keep.extra.columns = TRUE)
+
+  # 2. Load ChIP peaks; remove bottom 20% by signalValue (weak/noisy peaks)
+  source_peaks_df <- read.table(
+    SOURCE_PEAK_PATH, sep = "\t", header = FALSE,
+    col.names = c("chr", "start", "end", "name", "score", "strand",
+                  "signalValue", "pvalue", "qvalue", "peak")
+  ) |>
+    dplyr::filter(signalValue >= quantile(signalValue, 0.20))
+
+  source_peaks_gr <- makeGRangesFromDataFrame(
+    source_peaks_df, keep.extra.columns = TRUE,
+    starts.in.df.are.0based = TRUE         # narrowPeak is 0-based
+  )
+  source_peaks_gr <- source_peaks_gr[seqnames(source_peaks_gr) %in% canonical_chrs]
+  seqlevels(source_peaks_gr) <- seqlevelsInUse(source_peaks_gr)
+
+  # 3. Collapse each peak to its MACS2 summit (1-bp point) and attach log2FC
+  # The 'peak' column is a 0-based offset from the peak start.
+  summits_gr <- source_peaks_gr
+  start(summits_gr) <- end(summits_gr) <-
+    start(source_peaks_gr) + mcols(source_peaks_gr)$peak
+
+  fc_idx <- findOverlaps(summits_gr, source_fc_gr, select = "first")
+  mcols(summits_gr)$log2FoldChange <- mcols(source_fc_gr)$log2FoldChange[fc_idx]
+  message(sum(is.na(fc_idx)), " summits had no overlapping DEseq2 region")
+
+  # 4. Load source-TF FIMO motifs
+  source_motifs_gr <- read.table(
+    SOURCE_MOTIF_BED, sep = "\t", header = FALSE,
+    col.names = c("chr", "start", "end", "motif", "score_int", "strand",
+                  "empty", "score_log", "pvalue", "qvalue", "sequence")
+  ) |>
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE,
+                             starts.in.df.are.0based = TRUE)
+
+  # 4a. Optional: collapse overlapping motif hits to avoid double-counting
+  # When a PWM hits the same genomic locus at slightly different positions, we
+  # keep only the hit with the lowest p-value per overlap cluster.
+  if (consolidate_source_motifs) {
+    clusters <- GenomicRanges::reduce(source_motifs_gr, ignore.strand = TRUE)
+    hits     <- findOverlaps(source_motifs_gr, clusters, ignore.strand = TRUE)
+    mcols(source_motifs_gr)$cluster_id <- subjectHits(hits)
+    mcols(source_motifs_gr)$pvalue     <- as.numeric(mcols(source_motifs_gr)$pvalue)
+
+    keep_idx <- as.data.frame(mcols(source_motifs_gr)) |>
+      mutate(idx = seq_along(cluster_id)) |>
+      group_by(cluster_id) |>
+      slice_min(pvalue, n = 1, with_ties = FALSE) |>
+      pull(idx)
+
+    message("Motifs before consolidation: ", length(source_motifs_gr))
+    source_motifs_gr <- source_motifs_gr[sort(keep_idx)]
+    message("Motifs after consolidation:  ", length(source_motifs_gr))
+    mcols(source_motifs_gr)$cluster_id <- NULL
+  }
+
+  # 5. For each summit, find the nearest source-TF motif within 100 bp
+  # The 100 bp threshold ensures the motif is plausibly within the peak
+  # (typical ChIP resolution), not just the genome-wide nearest.
+  near_idx <- nearest(summits_gr, source_motifs_gr, ignore.strand = TRUE)
+  valid    <- !is.na(near_idx)
+
+  SOURCE_TF_motifs <- source_motifs_gr[near_idx[valid]]
+  mcols(SOURCE_TF_motifs)$peak_name      <- mcols(summits_gr)$name[valid]
+  mcols(SOURCE_TF_motifs)$log2FoldChange <- mcols(summits_gr)$log2FoldChange[valid]
+  mcols(SOURCE_TF_motifs)$dist_to_summit <- distance(SOURCE_TF_motifs, summits_gr[valid])
+  SOURCE_TF_motifs <- SOURCE_TF_motifs[mcols(SOURCE_TF_motifs)$dist_to_summit <= 100]
+
+  # 6. Compute strand-aware signed distance to the nearest SNAI2 motif
+  # Sign convention: positive distance = source motif is downstream of the
+  # SNAI2 motif on the strand of the SNAI2 motif.
+  target_idx     <- nearest(SOURCE_TF_motifs, target_motifs_gr, ignore.strand = TRUE)
+  source_centers <- (start(SOURCE_TF_motifs) + end(SOURCE_TF_motifs)) / 2
+  target_match   <- target_motifs_gr[target_idx]
+  target_centers <- (start(target_match) + end(target_match)) / 2
+  raw_dist       <- source_centers - target_centers
+  mcols(SOURCE_TF_motifs)$dist_to_target <- round(
+    ifelse(as.character(strand(target_match)) == "-", -raw_dist, raw_dist)
+  )
+
+  # Drop motifs without an FC value
+  final_gr <- SOURCE_TF_motifs[!is.na(mcols(SOURCE_TF_motifs)$log2FoldChange)]
+
+  # 7. Restrict to distal regions and generate the kernel-smooth plot (bw = 100)
+  final_gr_distal <- final_gr[queryHits(findOverlaps(final_gr, enhancers_gr))]
+  plot_df_distal  <- as.data.frame(mcols(final_gr_distal))
+
+  message(SOURCE_TF, ": total motif-summit pairs = ", length(final_gr),
+          "  |  distal = ", nrow(plot_df_distal))
+
+  fname <- file.path(OUTPUT_DIR,
+                     paste0("KernelSmooth_bw100_", SOURCE_TF,
+                            "_distTo_", TARGET_TF, target_suffix,
+                            "_distal.pdf"))
+  ggsave(fname,
+         make_kernel_smooth(plot_df_distal, SOURCE_TF, TARGET_TF,
+                            "Distal", bw = 100),
+         width = 7, height = 4.5)
+
+  invisible(list(distal = final_gr_distal))
+}
+```
+
+---
+
+# TWIST1 – distance to SNAI2 motifs
+
+TWIST1 uses the **coordinator motif** (a composite E-box variant; no motif
+consolidation needed as the motif set is already non-redundant).
+
+```{r twist1, message=FALSE, warning=FALSE}
+twist1_res <- run_tf_analysis(
+  SOURCE_TF        = "TWIST1",
+  SOURCE_FC_PATH   = file.path(fc_dir,    "DEseq2_allcomb_peaks_TWIST1.csv"),
+  SOURCE_PEAK_PATH = file.path(peaks_dir, "lib11_TWIST1_peaks_DMSOintersect_minusINPUT.narrowPeak"),
+  SOURCE_MOTIF_BED = file.path(fimo_dir,  "coordinator_fimo/fimo_sorted.bed"),
+  TARGET_TF        = "SNAI2",
+  target_motifs_gr = snai2_motifs_gr,
+  consolidate_source_motifs = FALSE,   # coordinator hits are already non-redundant
+  target_suffix    = "_v5"
+)
+```
+
+---
+
+# NR2F1 – distance to SNAI2 motifs
+
+NR2F1 uses the Jolma 2013 NR2F1 motif. Consolidation is enabled because
+the direct-repeat half-site architecture of the NR2F1 PWM produces
+overlapping hits at a single binding event.
+
+```{r nr2f1, message=FALSE, warning=FALSE}
+nr2f1_res <- run_tf_analysis(
+  SOURCE_TF        = "NR2F1",
+  SOURCE_FC_PATH   = file.path(fc_dir,    "DEseq2_allcomb_peaks_NR2F1.csv"),
+  SOURCE_PEAK_PATH = file.path(peaks_dir, "lib11_NR2F1_peaks_DMSOintersect_minusINPUT.narrowPeak"),
+  SOURCE_MOTIF_BED = file.path(fimo_dir,  "jolma2013_NR2F1/fimo_sorted.bed"),
+  TARGET_TF        = "SNAI2",
+  target_motifs_gr = snai2_motifs_gr,
+  consolidate_source_motifs = TRUE,
+  target_suffix    = "_v5"
+)
+```
+
+---
+
+# TFAP2A – distance to SNAI2 motifs
+
+Uses the **AP2A/AP2C joint motif** (TFAP2A_ACmotifs), which captures binding
+by both TFAP2A and TFAP2C and is the motif set used in the final figures.
+
+```{r tfap2a, message=FALSE, warning=FALSE}
+tfap2a_res <- run_tf_analysis(
+  SOURCE_TF        = "TFAP2A_ACmotifs",
+  SOURCE_FC_PATH   = file.path(fc_dir,    "DEseq2_allcomb_peaks_AP2A.csv"),
+  SOURCE_PEAK_PATH = file.path(peaks_dir, "lib11_AP2A_peaks_DMSOintersect_minusINPUT.narrowPeak"),
+  SOURCE_MOTIF_BED = file.path(fimo_dir,  "jolma2013_TFAP2AC/fimo_sorted.bed"),
+  TARGET_TF        = "SNAI2",
+  target_motifs_gr = snai2_motifs_gr,
+  consolidate_source_motifs = TRUE,
+  target_suffix    = "_v5"
+)
+```
