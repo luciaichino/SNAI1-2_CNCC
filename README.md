@@ -31,6 +31,7 @@ The data file containing all the processed information has been uploaded to this
 
 --- 05_Fig4_analysis_TFs_motifsdist_v5_allpeaks.Rmd
 R markdown including analysis to generate the kernel smoothened plots of TF activators ChIP-seq foldchanges relative to distance between activator motif and SNAI1/2 motif (Figure 4).
+
 --- 06_Fig4_linear_model_v2.Rmd
 R markdown for linear model analysis to H3K27ac change based on TF binding changes (DMSO vs dTag)
 
