@@ -27,16 +27,18 @@ R markdown including processing of data to classify regions as promoter proximal
 This includes the linear mixed effect model of ATAC vs H3K27ac log2FC.
 The data file containing all the processed information has been uploaded to this repo (data_v4.rds).
 
-## Figure 4: TWIST1, NR2F1, TFAP2A ChIP analysis (motif distances)
+## Figure 4: TWIST1, NR2F1, TFAP2A ChIP analysis
 
 --- 05_Fig4_analysis_TFs_motifsdist_v5_allpeaks.Rmd
 R markdown including analysis to generate the kernel smoothened plots of TF activators ChIP-seq foldchanges relative to distance between activator motif and SNAI1/2 motif (Figure 4).
 
 --- 06_Fig4_linear_model_v2.Rmd
-R markdown for linear model analysis to H3K27ac change based on TF binding changes (DMSO vs dTag)
+R markdown for linear model predicting H3K27ac change based on TF binding changes (DMSO vs dTag)
 
 ## Figure 5 and 7: Fiber-seq and DAF-seq analyses
 
+
 ## Figure 6: DAF-seq codependency analysis
+
 
 
