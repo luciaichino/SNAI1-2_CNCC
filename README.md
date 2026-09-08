@@ -7,27 +7,34 @@ All new sequencing data have been deposited to GEO ** and SRA **
 ## Figure 1: human / chimp tetraployd hybrid analysis
 
 --- 01_snpsplit_genome_prep.sh
+
 Builds the SNP VCFs and N-masked,bowtie2-indexed dual-hybrid genomes needed for read splitting.
 
 After this, ChIP-seq reads were mapped to the two bowtie2 indices H20961.hap1.C3649.hap1 (masked for human and chimp hap1 SNPs) and H20961.hap2.C3649.hap2 (masked for human and chimp hap2 SNPs)
 
 --- 02_snpsplit_run_and_merge.sh
+
 This script splits each sample's BAM into human and chimp reads, merges them by species, removes duplicates, converts to fastq.
 
 After this, reads were mapped to the two bowtie2 indices H20961.hap1.H20961.hap2 (masked for all human SNPs) and C3649.hap1.C3649.hap2 (masked for all chimp SNPs)
 Counts at CNCC regulatory regions were calculated with bedtools coverage
 
 --- 03_human_chimp_ChIP_motifs_correlation.Rmd
+
 R markdown of correlation analysis between human and chimpanzee ChIP changes and SNAI2 motif changes
 
 ## Figure 2/3: SNAI1/2, H3K27ac, ATAC, analyses
+
 --- 04_SNAI_RNAseq_DESeq2_and_downstream_nopaths.Rmd
+
 R markdown with processing of RNA-seq data 
 
 --- 05_DESeq2_ChIP_ATAC.Rmd
+
 R markdown with DEseq of H3K27ac and ATAC data, and MA plots
 
 --- 06_Define_proximal_distal_v6.Rmd
+
 R markdown including processing of data to classify regions as promoter proximal or distal and make panels shown in Figures 2 and 3 and related supplemental figures.
 This includes the linear mixed effect model of ATAC vs H3K27ac log2FC.
 The data file containing all the processed information has been uploaded to this repo (data_v4.rds).
@@ -35,9 +42,11 @@ The data file containing all the processed information has been uploaded to this
 ## Figure 4: TWIST1, NR2F1, TFAP2A ChIP analysis
 
 --- 07_Fig4_analysis_TFs_motifsdist_v5_allpeaks.Rmd
+
 R markdown including analysis to generate the kernel smoothened plots of TF activators ChIP-seq foldchanges relative to distance between activator motif and SNAI1/2 motif (Figure 4).
 
 --- 08_Fig4_linear_model_v2.Rmd
+
 R markdown for linear model predicting H3K27ac change based on TF binding changes (DMSO vs dTag)
 
 ## Figure 5 and 7: Fiber-seq and DAF-seq analyses
