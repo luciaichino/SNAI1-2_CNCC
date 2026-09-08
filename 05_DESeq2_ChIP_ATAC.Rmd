@@ -1,0 +1,569 @@
+---
+title: "SNAI1/SNAI2 dTag: differential H3K27ac and ATAC signal over consensus ATAC regions"
+author: "Lucia Ichino"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = FALSE
+)
+```
+
+# Overview
+
+Differential analysis of two chromatin datasets from the SNAI1-FNV SNAI2-KO
+dTag time course, both quantified over the same consensus ATAC peak set (2kb regins)
+("ATAC regions v3"):
+
+| Section | Assay | Counts directory | Samples |
+|---|---|---|---|
+| 1 | H3K27ac ChIP-seq (lib4) | `ChIP/lib4/ATAC_region_counts_v3` | 2 clones × 2 replicates × 4 timepoints = 16 |
+| 2 | ATAC-seq (lib1)          | `ATAC/lib1ATAC/ATAC_region_counts_v3` | 2 clones × 2 replicates × 4 timepoints = 16 |
+
+Both follow an identical workflow:
+
+1. Read per-sample `bedtools coverage -counts` output and assemble a
+   region × sample count matrix.
+2. Fit `DESeq2` with `~ clone + replicate + condition` and test each dTag
+   timepoint (3h, 1d, 3d) against DMSO.
+3. Restrict the results to canonical chromosomes (chr1–22, chrX, chrY),
+   dropping unplaced scaffolds, alt contigs and chrM.
+4. Export results tables (CSV), MA plots (PDF), and the significant regions as
+   UP/DOWN BED files for downstream genomic overlap.
+
+
+
+### Dependencies
+
+```{r dependencies, eval=FALSE}
+BiocManager::install("DESeq2")
+install.packages(c("tidyverse", "ggrastr", "ggpubr", "conflicted"))
+```
+
+```{r libraries}
+library(tidyverse)   # dplyr, tidyr, purrr, readr, stringr, ggplot2
+library(DESeq2)
+library(ggrastr)     # geom_point_rast(): keeps dense MA plots small as PDF
+library(ggpubr)      # ggarrange()
+
+# Several packages here mask dplyr verbs (notably DESeq2/BiocGenerics).
+# Fix the winners once, explicitly, rather than relying on attach order.
+library(conflicted)
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("rename", "dplyr")
+conflict_prefer("count",  "dplyr")
+conflict_prefer("setdiff", "base")
+```
+
+# Configuration
+
+All paths live here; nothing below this chunk should need editing.
+
+```{r config}
+# ---- Input: per-sample count files (bedtools coverage -counts output) -------
+counts_dir_k27ac <- ".../ATAC_region_counts_v3"
+counts_dir_atac  <- ".../ATAC_region_counts_v3"
+
+# Both directories use the same filename convention.
+counts_pattern <- "_counts_ATAC_regions_v3\\.bed$"
+
+# ---- Output -----------------------------------------------------------------
+out_dir <- ".../out"                    # CSV + BED
+fig_dir <- ".../figures"                   # PDF figures
+
+for (d in c(out_dir, fig_dir)) dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+# ---- Analysis parameters ----------------------------------------------------
+padj_cut    <- 0.05
+min_count   <- 5   # a region needs >= min_count reads ...
+min_samples <- 4   # ... in at least min_samples samples (= n per condition group)
+
+# Canonical chromosomes. Everything else (unplaced/unlocalized scaffolds,
+# alt haplotypes, chrEBV, ...) is dropped from the results before export.
+# chrM is deliberately excluded: mitochondrial signal is an ATAC artefact and
+# not meaningful for differential chromatin analysis. Add "chrM" here if you
+# want to keep it.
+canonical_chroms <- paste0("chr", c(1:22, "X", "Y"))
+
+# Timepoints tested against DMSO. Names are the tags used in output filenames.
+contrast_levels <- c("3h" = "3h", "1d" = "1d", "3d" = "3d")
+```
+
+# Helper functions
+
+The two assays are processed identically, so the shared logic lives here. The
+original script repeated the same ~120 lines per assay, with `dataPeaks`,
+`dds`, `res_3h`, ... silently overwritten between sections — which made it easy
+for one section's edits to drift away from another's.
+
+## Reading counts
+
+```{r helper-counts}
+#' Read one `bedtools coverage -counts` BED file
+#'
+#' The count is always the LAST column; the first three are chrom/start/end.
+#' The sample name is taken from the filename, up to "_counts".
+read_coverage_bed <- function(path) {
+  df <- readr::read_tsv(path, col_names = FALSE, show_col_types = FALSE)
+  tibble(
+    region = paste(df[[1]], df[[2]], df[[3]], sep = "_"),
+    sample = sub("_counts.*", "", basename(path)),
+    count  = df[[ncol(df)]]
+  )
+}
+
+#' Build a region x sample count matrix from a directory of coverage files
+#'
+#' @return data.frame of integer counts, rownames = "chr_start_end"
+load_region_counts <- function(counts_dir, pattern) {
+  files <- list.files(counts_dir, pattern = pattern, full.names = TRUE)
+  if (length(files) == 0) stop("No count files matching ", pattern, " in ", counts_dir)
+  message("Found ", length(files), " count files in ", counts_dir)
+
+  long_df <- purrr::map_dfr(files, read_coverage_bed)
+
+  # Guard: duplicated regions within a sample would make pivot_wider produce
+  # list-columns instead of numbers. Collapse exact duplicate rows first.
+  long_df <- dplyr::distinct(long_df)
+  stopifnot(!any(duplicated(long_df[c("region", "sample")])))
+
+  wide <- tidyr::pivot_wider(long_df, names_from = sample, values_from = count)
+
+  mat <- as.data.frame(wide[, setdiff(names(wide), "region"), drop = FALSE])
+  rownames(mat) <- wide$region
+  mat
+}
+```
+
+## Sample metadata
+
+```{r helper-metadata}
+#' Derive condition / clone / replicate from sample names
+#'
+#' Sample names look like
+#'   H3K27ac_c5946b16_DMSO_rep1
+#'   ATAC_SNAI12_c5946b16_DMSO_rep1
+#' so all three factors can be pulled out by pattern instead of being typed as
+#' positional vectors.
+#'
+#' This matters: the original script reused one hard-coded sampleTable for both
+#' assays, but the two assays' columns are ordered differently (H3K27ac is
+#' clone-major, ATAC is replicate-major). In the ATAC section that swapped the
+#' `clone` and `replicate` labels. Parsing the names removes that whole class
+#' of error. (See the note in the ATAC section for why the swap did not change
+#' the reported statistics.)
+parse_sample_metadata <- function(sample_names) {
+  meta <- data.frame(
+    clone     = stringr::str_extract(sample_names, "c5946b[0-9]+"),
+    condition = stringr::str_extract(sample_names, "(?<=_)(DMSO|3h|1d|3d)(?=_)"),
+    replicate = stringr::str_extract(sample_names, "rep[0-9]+"),
+    row.names = sample_names,
+    stringsAsFactors = FALSE
+  )
+
+  if (anyNA(meta)) {
+    stop("Could not parse metadata for: ",
+         paste(rownames(meta)[!complete.cases(meta)], collapse = ", "))
+  }
+
+  meta$condition <- factor(meta$condition, levels = c("DMSO", "3h", "1d", "3d"))
+  meta$clone     <- factor(meta$clone)
+  meta$replicate <- factor(meta$replicate)
+  meta
+}
+```
+
+## Canonical chromosome filter
+
+Region IDs are `chr_start_end`, so the chromosome is everything before the last
+two underscores. Scaffolds, alt contigs and chrM are removed here — before any
+region ID is split into BED coordinates — so that the exported tables, the MA
+plots and the BED files all describe the same set of regions.
+
+```{r helper-canonical}
+#' Extract the chromosome from a "chr_start_end" region ID
+#'
+#' Strips the last two underscore-separated fields only, so contig names that
+#' themselves contain underscores (chr1_KI270706v1_random) survive intact and
+#' can be recognised as non-canonical.
+region_chrom <- function(regions) {
+  sub("^(.*)_[0-9]+_[0-9]+$", "\\1", regions)
+}
+
+#' Keep only regions on canonical chromosomes
+#'
+#' Reports what was dropped, so a naming mismatch (e.g. "1" vs "chr1") shows up
+#' immediately rather than silently emptying the table.
+keep_canonical_regions <- function(df, chroms = canonical_chroms, region_col = "region") {
+  chrom <- region_chrom(df[[region_col]])
+  keep  <- chrom %in% chroms
+
+  if (!any(keep)) {
+    stop("No regions on canonical chromosomes. Seqname style mismatch? ",
+         "Found e.g.: ", paste(head(unique(chrom), 3), collapse = ", "),
+         " but expected e.g.: ", paste(head(chroms, 3), collapse = ", "))
+  }
+
+  dropped <- sort(unique(chrom[!keep]))
+  message(sprintf(
+    "Canonical filter: kept %d / %d regions (%d dropped across %d non-canonical seqnames%s)",
+    sum(keep), length(keep), sum(!keep), length(dropped),
+    if (length(dropped)) paste0(": ", paste(head(dropped, 5), collapse = ", "),
+                                if (length(dropped) > 5) ", ..." else "") else ""
+  ))
+
+  df[keep, , drop = FALSE]
+}
+```
+
+## DESeq2
+
+```{r helper-deseq}
+#' Fit DESeq2 over regions and extract each timepoint vs DMSO
+#'
+#' @param counts_mat  region x sample integer counts
+#' @param meta        colData; rownames must match colnames(counts_mat) in order
+#' @param contrasts   named vector: names = output tags, values = condition levels
+#'
+#' `design = ~ clone + replicate + condition` puts the variable of interest last
+#' and absorbs clone and replicate/batch effects as additive nuisance terms.
+run_deseq_regions <- function(counts_mat,
+                              meta,
+                              contrasts,
+                              ref_level   = "DMSO",
+                              design      = ~ clone + replicate + condition,
+                              min_count   = 5,
+                              min_samples = 4) {
+
+  stopifnot(identical(rownames(meta), colnames(counts_mat)))
+
+  dds <- DESeqDataSetFromMatrix(
+    countData = counts_mat,
+    colData   = meta,
+    design    = design
+  )
+
+  # Pre-filter weakly covered regions.
+  keep <- rowSums(counts(dds) >= min_count) >= min_samples
+  message(sprintf("Pre-filter: keeping %d / %d regions", sum(keep), length(keep)))
+  dds <- dds[keep, ]
+
+  dds$condition <- relevel(dds$condition, ref = ref_level)
+  dds <- DESeq(dds)
+
+  res <- lapply(contrasts, function(lvl) {
+    r <- results(dds, contrast = c("condition", lvl, ref_level))
+    r[order(r$padj), ]
+  })
+
+  list(dds = dds, res = res)
+}
+
+#' DESeqResults -> data.frame with an explicit `region` column
+#'
+#' The original wrote the tables with write.csv() and immediately read them back
+#' so that the region IDs became a column ("X"). Doing the conversion in memory
+#' is equivalent and avoids the round trip. NOTE: the CSVs written below now
+#' have a named first column `region` instead of an empty header.
+res_to_df <- function(res) {
+  as.data.frame(res) %>%
+    tibble::rownames_to_column("region") %>%
+    mutate(sig = !is.na(padj) & padj < padj_cut)
+}
+
+#' Count significant regions per contrast
+deg_summary <- function(res_dfs, padj_cut = 0.05) {
+  data.frame(
+    contrast = names(res_dfs),
+    up       = vapply(res_dfs, function(d) sum(d$padj < padj_cut & d$log2FoldChange > 0, na.rm = TRUE), integer(1)),
+    down     = vapply(res_dfs, function(d) sum(d$padj < padj_cut & d$log2FoldChange < 0, na.rm = TRUE), integer(1)),
+    row.names = NULL
+  )
+}
+```
+
+## Plotting and export
+
+```{r helper-plot-export}
+#' MA plot: log2 mean signal vs log2 fold change, significant regions in red
+ma_plot <- function(df, title_text, ylim = c(-3, 3)) {
+  ggplot(df, aes(x = log2(baseMean), y = log2FoldChange, color = sig)) +
+    geom_point_rast(size = 0.5, alpha = 0.2, raster.dpi = 300) +
+    scale_color_manual(
+      name   = paste0("padj < ", padj_cut),
+      values = c("FALSE" = "grey20", "TRUE" = "red")
+    ) +
+    # coord_cartesian() clips the view without dropping points from the fit
+    coord_cartesian(ylim = ylim) +
+    theme_bw() +
+    xlab("log2 BaseMean") +
+    ylab("log2FoldChange (dTag/DMSO)") +
+    ggtitle(title_text)
+}
+
+#' Write a vector of "chr_start_end" region IDs as a 3-column BED
+#'
+#' Expects regions that have already passed keep_canonical_regions().
+#' Split on the LAST two underscores only: naive strsplit(x, "_") breaks on
+#' contigs whose names themselves contain underscores
+#' (e.g. chr1_KI270706v1_random).
+write_regions_bed <- function(regions, file, chroms = canonical_chroms) {
+  if (length(regions) == 0) {
+    message("No regions to write for ", file)
+    return(invisible(NULL))
+  }
+
+  m <- regmatches(regions, regexec("^(.*)_([0-9]+)_([0-9]+)$", regions))
+  bad <- lengths(m) == 0
+  if (any(bad)) stop("Unparseable region IDs, e.g.: ", regions[which(bad)[1]])
+
+  bed <- data.frame(
+    chr   = vapply(m, `[`, character(1), 2),
+    start = as.integer(vapply(m, `[`, character(1), 3)),
+    end   = as.integer(vapply(m, `[`, character(1), 4))
+  )
+
+  # Belt and braces: the canonical filter should already have removed these.
+  if (!all(bed$chr %in% chroms)) {
+    stop("Non-canonical seqnames reached write_regions_bed(): ",
+         paste(unique(setdiff(bed$chr, chroms)), collapse = ", "))
+  }
+
+  # Sort in chromosome order (chr1, chr2, ... chr10, ...), not alphabetically.
+  bed <- bed[order(factor(bed$chr, levels = chroms), bed$start), ]
+
+  write.table(bed, file = file, sep = "\t",
+              quote = FALSE, row.names = FALSE, col.names = FALSE)
+  message("Wrote ", nrow(bed), " regions to ", file)
+}
+
+#' Write results CSVs plus UP/DOWN BEDs for every contrast
+#'
+#' @param label  goes into the filenames, e.g. "H3K27ac" or "ATAC"
+#' @param csv_suffix  trailing part of the CSV name (kept for backwards
+#'                    compatibility with the original filenames)
+export_results <- function(res_dfs, out_dir, label, csv_suffix, padj_cut = 0.05) {
+  for (tag in names(res_dfs)) {
+    d <- res_dfs[[tag]]
+
+    write.csv(
+      d,
+      file      = file.path(out_dir, sprintf("DEseq2_%s_vs_ctrl_%s.csv", tag, csv_suffix)),
+      quote     = FALSE,
+      row.names = FALSE
+    )
+
+    write_regions_bed(
+      d$region[which(d$padj < padj_cut & d$log2FoldChange > 0)],
+      file.path(out_dir, sprintf("DEseq2_%s_vs_ctrl_%s_UP.bed", tag, label))
+    )
+    write_regions_bed(
+      d$region[which(d$padj < padj_cut & d$log2FoldChange < 0)],
+      file.path(out_dir, sprintf("DEseq2_%s_vs_ctrl_%s_DOWN.bed", tag, label))
+    )
+  }
+  invisible(NULL)
+}
+```
+
+# 1. H3K27ac ChIP-seq (lib4)
+
+## Load counts
+
+```{r k27ac-load}
+counts_k27ac_all <- load_region_counts(counts_dir_k27ac, counts_pattern)
+
+# Explicit column order: clone-major, then replicate, then timepoint.
+# Listing the samples by name (rather than trusting list.files() order) makes
+# the matrix reproducible and fails loudly if a sample is missing.
+samples_k27ac <- c(
+  "H3K27ac_c5946b16_DMSO_rep1", "H3K27ac_c5946b16_3h_rep1", "H3K27ac_c5946b16_1d_rep1", "H3K27ac_c5946b16_3d_rep1",
+  "H3K27ac_c5946b16_DMSO_rep2", "H3K27ac_c5946b16_3h_rep2", "H3K27ac_c5946b16_1d_rep2", "H3K27ac_c5946b16_3d_rep2",
+  "H3K27ac_c5946b27_DMSO_rep1", "H3K27ac_c5946b27_3h_rep1", "H3K27ac_c5946b27_1d_rep1", "H3K27ac_c5946b27_3d_rep1",
+  "H3K27ac_c5946b27_DMSO_rep2", "H3K27ac_c5946b27_3h_rep2", "H3K27ac_c5946b27_1d_rep2", "H3K27ac_c5946b27_3d_rep2"
+)
+
+setdiff(samples_k27ac, colnames(counts_k27ac_all))   # should be character(0)
+counts_k27ac <- counts_k27ac_all[, samples_k27ac]
+
+dim(counts_k27ac)
+head(counts_k27ac)
+```
+
+## Sample table
+
+```{r k27ac-meta}
+meta_k27ac <- parse_sample_metadata(colnames(counts_k27ac))
+
+# Always eyeball this: every sample must sit next to the right condition.
+meta_k27ac
+table(meta_k27ac$condition, meta_k27ac$clone)
+```
+
+## DESeq2
+
+```{r k27ac-deseq}
+fit_k27ac <- run_deseq_regions(
+  counts_mat  = counts_k27ac,
+  meta        = meta_k27ac,
+  contrasts   = contrast_levels,
+  ref_level   = "DMSO",
+  min_count   = min_count,
+  min_samples = min_samples
+)
+
+resultsNames(fit_k27ac$dds)
+
+res_k27ac <- lapply(fit_k27ac$res, res_to_df)
+
+# Drop scaffolds / alt contigs / chrM before anything downstream uses the
+# region coordinates.
+res_k27ac <- lapply(res_k27ac, keep_canonical_regions)
+
+deg_summary(res_k27ac, padj_cut)
+```
+
+## MA plots
+
+```{r k27ac-ma, fig.width=10, fig.height=3}
+p_k27ac <- ggarrange(
+  ma_plot(res_k27ac$`3h`, "H3K27ac: 3h dTag vs mock"),
+  ma_plot(res_k27ac$`1d`, "H3K27ac: 1 day dTag vs mock"),
+  ma_plot(res_k27ac$`3d`, "H3K27ac: 3 days dTag vs mock"),
+  nrow = 1, common.legend = TRUE, legend = "right"
+)
+
+p_k27ac
+ggsave(file.path(fig_dir, "MAplots_k27ac.pdf"), plot = p_k27ac, height = 3, width = 10)
+```
+
+## Export tables and BED files
+
+```{r k27ac-export}
+export_results(
+  res_k27ac,
+  out_dir    = out_dir,
+  label      = "H3K27ac",                        # -> ..._H3K27ac_UP.bed / _DOWN.bed
+  csv_suffix = "H3K27ac_ATACregionsv3",          # -> DEseq2_3h_vs_ctrl_H3K27ac_ATACregionsv3.csv
+  padj_cut   = padj_cut
+)
+```
+
+# 2. ATAC-seq (lib1)
+
+Same consensus regions, same design, same contrasts as the H3K27ac section.
+
+**Note on the sample table.** In the original script the ATAC columns were
+ordered replicate-major (`b16 rep1`, `b27 rep1`, `b16 rep2`, `b27 rep2`) while
+the hard-coded `sampleTable` assumed the clone-major order used for H3K27ac.
+The effect was that the `clone` and `replicate` labels were exactly swapped.
+It did not change any reported statistic — the two factors are additive
+nuisance terms, and swapping them spans the same two columns of the model
+matrix, so the `condition` estimates are identical — but the labels were wrong.
+Parsing metadata from the sample names fixes this.
+
+## Load counts
+
+```{r atac-load}
+counts_atac_all <- load_region_counts(counts_dir_atac, counts_pattern)
+
+# Replicate-major order, as the files come.
+samples_atac <- c(
+  "ATAC_SNAI12_c5946b16_DMSO_rep1", "ATAC_SNAI12_c5946b16_3h_rep1", "ATAC_SNAI12_c5946b16_1d_rep1", "ATAC_SNAI12_c5946b16_3d_rep1",
+  "ATAC_SNAI12_c5946b27_DMSO_rep1", "ATAC_SNAI12_c5946b27_3h_rep1", "ATAC_SNAI12_c5946b27_1d_rep1", "ATAC_SNAI12_c5946b27_3d_rep1",
+  "ATAC_SNAI12_c5946b16_DMSO_rep2", "ATAC_SNAI12_c5946b16_3h_rep2", "ATAC_SNAI12_c5946b16_1d_rep2", "ATAC_SNAI12_c5946b16_3d_rep2",
+  "ATAC_SNAI12_c5946b27_DMSO_rep2", "ATAC_SNAI12_c5946b27_3h_rep2", "ATAC_SNAI12_c5946b27_1d_rep2", "ATAC_SNAI12_c5946b27_3d_rep2"
+)
+
+setdiff(samples_atac, colnames(counts_atac_all))   # should be character(0)
+counts_atac <- counts_atac_all[, samples_atac]
+
+dim(counts_atac)
+head(counts_atac)
+```
+
+## Sample table
+
+```{r atac-meta}
+meta_atac <- parse_sample_metadata(colnames(counts_atac))
+
+meta_atac
+table(meta_atac$condition, meta_atac$clone)
+```
+
+## DESeq2
+
+```{r atac-deseq}
+fit_atac <- run_deseq_regions(
+  counts_mat  = counts_atac,
+  meta        = meta_atac,
+  contrasts   = contrast_levels,
+  ref_level   = "DMSO",
+  min_count   = min_count,
+  min_samples = min_samples
+)
+
+resultsNames(fit_atac$dds)
+
+res_atac <- lapply(fit_atac$res, res_to_df)
+
+# Drop scaffolds / alt contigs / chrM before anything downstream uses the
+# region coordinates.
+res_atac <- lapply(res_atac, keep_canonical_regions)
+
+deg_summary(res_atac, padj_cut)
+```
+
+## MA plots
+
+```{r atac-ma, fig.width=10, fig.height=3}
+p_atac <- ggarrange(
+  ma_plot(res_atac$`3h`, "ATAC: 3h dTag vs mock"),
+  ma_plot(res_atac$`1d`, "ATAC: 1 day dTag vs mock"),
+  ma_plot(res_atac$`3d`, "ATAC: 3 days dTag vs mock"),
+  nrow = 1, common.legend = TRUE, legend = "right"
+)
+
+p_atac
+ggsave(file.path(fig_dir, "MAplots_ATACdata.pdf"), plot = p_atac, height = 3, width = 10)
+```
+
+## Export tables and BED files
+
+```{r atac-export}
+export_results(
+  res_atac,
+  out_dir    = out_dir,
+  label      = "ATAC",                           # -> ..._ATAC_UP.bed / _DOWN.bed
+  csv_suffix = "ATACdata_ATACregionsv3",         # -> DEseq2_3h_vs_ctrl_ATACdata_ATACregionsv3.csv
+  padj_cut   = padj_cut
+)
+```
+
+# Combined summary
+
+```{r summary}
+bind_rows(
+  deg_summary(res_k27ac, padj_cut) %>% mutate(assay = "H3K27ac"),
+  deg_summary(res_atac,  padj_cut) %>% mutate(assay = "ATAC")
+) %>%
+  select(assay, contrast, up, down)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,743 @@
+---
+title: "SNAI1/SNAI2 dTag RNA-seq: DESeq2 quantification and downstream analysis"
+author: "Lucia Ichino"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache   = FALSE
+)
+```
+
+# Overview
+
+This document combines the two halves of the SNAI RNA-seq analysis into a single
+reproducible workflow:
+
+* **Part 1 — Quantification and differential expression.** Salmon transcript
+  quantifications are imported with `tximport` and tested with `DESeq2` for three
+  independent dTag time-course experiments. Results tables (raw and
+  LFC-shrunken) are written to `data_dir`.
+* **Part 2 — Downstream analysis and figures.** The results tables written in
+  Part 1 are read back in, DEGs are counted and bar-plotted, genes are annotated
+  by their distance to SNAI2 ChIP-seq peaks, and volcano / MA plots coloured by
+  peak proximity are produced.
+
+### Datasets
+
+| Label in code | Library | Cell line / genotype | Timepoints (dTag) | Control | Replicates |
+|---|---|---|---|---|---|
+| `dbl`   | lib4 | SNAI1-FNV; SNAI2-KO (double perturbation) | 3h, 1 day, 3 days | DMSO | 2 clones × 2 reps |
+| `snai1` | lib3 | SNAI1-FNV                                 | 3h, 1 day, 4 days | ctrl | 2 reps |
+| `snai2` | lib2 | SNAI2-FNV                                 | 3h, 1 day, 4 days | ctrl | 3 reps |
+
+Note on timepoints: the double-perturbation experiment ends at **3 days** while
+the two single-degron experiments end at **4 days**. This is intentional (it
+reflects how the experiments were performed). It is handled in the
+bar plot by labelling the shared axis level `3-4days`.
+
+
+Note on shrinkage: **apeglm** is used as the `lfcShrink()` estimator for all
+three datasets, and the shrunken tables are the ones used for every downstream
+figure (DEG counts, volcano, MA). 
+
+### How to run
+
+1. Edit the paths in the **Configuration** chunk below.
+2. If you only have the processed DESeq2 tables (not the raw Salmon output),
+   set `run_quantification <- FALSE` in that chunk. Part 1 will then be skipped
+   and Part 2 will run off the tables already present in `data_dir`.
+3. Knit, or run chunk by chunk.
+
+### Dependencies
+
+```{r dependencies, eval=FALSE}
+# Bioconductor
+BiocManager::install(c(
+  "tximport", "DESeq2", "apeglm", "GenomicRanges",
+  "AnnotationHub", "ensembldb", "ggrastr"
+))
+
+# CRAN
+install.packages(c("tidyverse", "data.table", "ggplot2", "ggpubr", "reshape2"))
+```
+
+```{r libraries}
+# --- Quantification / DE -----------------------------------------------------
+library(tximport)
+library(DESeq2)
+
+# --- Data handling -----------------------------------------------------------
+library(tidyverse)     # dplyr, readr, ggplot2, ...
+library(data.table)
+
+# --- Genomic annotation ------------------------------------------------------
+library(GenomicRanges)
+library(AnnotationHub)
+library(ensembldb)
+
+# --- Plotting ----------------------------------------------------------------
+library(ggplot2)
+library(ggpubr)        # ggarrange()
+library(ggrastr)       # geom_point_rast(): keeps PDFs small for dense scatters
+```
+
+# Configuration
+
+
+```{r config}
+# ---- Master switch ----------------------------------------------------------
+# TRUE  : run Part 1 (needs the raw Salmon quant.sf files and the tx2gene table)
+# FALSE : skip Part 1 and use the DESeq2 tables already present in `data_dir`
+run_quantification <- TRUE
+
+# ---- Input: Salmon quantification directories -------------------------------
+# Each directory is expected to contain one sub-directory per sample, each with
+# a single quant.sf file.
+salmon_dir_dbl   <- ".../"
+salmon_dir_snai1 <- ".../"
+salmon_dir_snai2 <- ".../"
+
+# ---- Input: transcript-to-gene map used to build the Salmon index -----------
+tx2gene_file <- file.path(
+  "...",
+  "Homo_sapiens.GRCh38.cdna.all.tx2gene.txt"
+)
+
+# ---- Input: SNAI2 ChIP-seq peaks (DMSO, relative to dTag, INPUT-subtracted) --
+peak_file <- ".../peaks/s8_lib1_CNCCp4_SNAI2a3029_DMSO_r2_aSNAI2_reltodTag_peaks_minusINPUT_filtered.narrowPeak"
+
+# ---- Output directories -----------------------------------------------------
+data_dir <- ".../RNA_seq_processed_data"  # DESeq2 tables
+fig_dir  <- ".../figures"                 # PDF figures
+rda_dir  <- ".../SNAI_paper_Rproject"     # saved txi objects
+
+for (d in c(data_dir, fig_dir, rda_dir)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+# ---- Analysis parameters ----------------------------------------------------
+padj_cut    <- 0.05   # adjusted p-value threshold used throughout
+min_count   <- 5      # pre-filter: a gene must have >= min_count reads ...
+min_samples <- 3      # ... in at least min_samples samples to be kept
+```
+
+# Part 1 — Salmon import and DESeq2
+
+## Helper functions
+
+The three experiments are analysed identically apart from their sample tables,
+reference level and shrinkage estimator, so the shared logic is wrapped in
+functions. This keeps the three blocks below short and guarantees they stay in
+sync (the original script repeated the same ~40 lines three times, with objects
+such as `ddsTxi`, `res_3h`, ... silently overwritten between blocks).
+
+```{r part1-helpers}
+#' List Salmon quant.sf files in a directory, named by sample
+#'
+#' Assumes the layout <salmon_dir>/<sample_name>/quant.sf. The sample name is
+#' taken from the first path component, so it is robust to deeper nesting.
+salmon_quant_files <- function(salmon_dir) {
+  rel <- list.files(salmon_dir, pattern = "\\.sf$", recursive = TRUE)
+  if (length(rel) == 0) stop("No *.sf files found under: ", salmon_dir)
+
+  files        <- file.path(salmon_dir, rel)
+  names(files) <- sub("/.*$", "", rel)
+
+  stopifnot(all(file.exists(files)))
+  files
+}
+
+#' Import Salmon quantifications, summarised to gene level
+#'
+#' countsFromAbundance = "lengthScaledTPM" gives length-corrected counts that
+#' can be handed straight to DESeq2 (no separate offset needed).
+import_salmon <- function(files, tx2gene) {
+  tximport(
+    files,
+    type                = "salmon",
+    tx2gene             = tx2gene,
+    countsFromAbundance = "lengthScaledTPM"
+  )
+}
+
+#' Fit a DESeq2 model to a dTag time course and extract all contrasts vs control
+#'
+#' @param txi          tximport object
+#' @param sample_table data.frame with columns `condition` and `replicate`;
+#'                     rownames MUST equal colnames(txi$counts), in that order
+#' @param ref_level    level of `condition` used as the control (e.g. "DMSO")
+#' @param contrasts    named character vector; names are the short tags used in
+#'                     output filenames ("3h", "1d", "3d"/"4d"), values are the
+#'                     corresponding `condition` levels ("3h", "1day", "3days")
+#' @param shrink_type  LFC shrinkage estimator passed to lfcShrink()
+#'
+#' @return list(dds, res, res_shrunk); `res` and `res_shrunk` are named lists of
+#'         DESeqResults ordered by padj, one per contrast.
+run_deseq_timecourse <- function(txi,
+                                 sample_table,
+                                 ref_level,
+                                 contrasts,
+                                 shrink_type = c("apeglm", "normal"),
+                                 design      = ~ condition + replicate,
+                                 min_count   = 5,
+                                 min_samples = 3) {
+
+  shrink_type <- match.arg(shrink_type)
+
+  # Guard against the classic silent bug: a sample table whose row order does
+  # not match the column order of the count matrix.
+  stopifnot(identical(rownames(sample_table), colnames(txi$counts)))
+
+  dds <- DESeqDataSetFromTximport(txi, colData = sample_table, design = design)
+
+  # Pre-filter low-count genes (>= min_count reads in >= min_samples samples).
+  keep <- rowSums(counts(dds) >= min_count) >= min_samples
+  message(sprintf("Pre-filter: keeping %d / %d genes", sum(keep), length(keep)))
+  dds <- dds[keep, ]
+
+  dds$condition <- relevel(dds$condition, ref = ref_level)
+  dds <- DESeq(dds)
+
+  # Unshrunken results: Wald test log2FC, p-value and padj.
+  res <- lapply(contrasts, function(lvl) {
+    r <- results(dds, contrast = c("condition", lvl, ref_level))
+    r[order(r$padj), ]
+  })
+
+  # Shrunken results: lfcShrink() replaces log2FoldChange (and its SE) only —
+  # pvalue/padj are carried over unchanged from the Wald test above.
+  res_shrunk <- lapply(contrasts, function(lvl) {
+    coef_name <- paste0("condition_", lvl, "_vs_", ref_level)
+    stopifnot(coef_name %in% resultsNames(dds))
+    r <- lfcShrink(dds, coef = coef_name, type = shrink_type)
+    r[order(r$padj), ]
+  })
+
+  list(dds = dds, res = res, res_shrunk = res_shrunk)
+}
+
+#' Count significant up/down genes per contrast
+#'
+#' NOTE: the original script computed these counts by combining the padj of one
+#' timepoint with the log2FoldChange of another (e.g. `res_3h$padj` with
+#' `res_3d$log2FoldChange`). That was a copy-paste slip; here each contrast is
+#' summarised against itself.
+deg_summary <- function(res_list, padj_cut = 0.05) {
+  data.frame(
+    contrast = names(res_list),
+    up       = vapply(res_list, function(r) sum(r$padj < padj_cut & r$log2FoldChange > 0, na.rm = TRUE), integer(1)),
+    down     = vapply(res_list, function(r) sum(r$padj < padj_cut & r$log2FoldChange < 0, na.rm = TRUE), integer(1)),
+    row.names = NULL
+  )
+}
+
+#' Write raw and shrunken results tables with the naming convention used by Part 2
+#'
+#' Produces, for each contrast tag:
+#'   DEseq2_<tag>_vs_ctrl_<suffix>.txt          (unshrunken)
+#'   DEseq2_<tag>_vs_ctrl_<suffix>_shrunk.txt   (shrunken LFC)
+write_deseq_tables <- function(fit, out_dir, suffix) {
+  for (tag in names(fit$res)) {
+    write.table(
+      fit$res[[tag]],
+      file  = file.path(out_dir, sprintf("DEseq2_%s_vs_ctrl_%s.txt", tag, suffix)),
+      quote = FALSE, sep = "\t"
+    )
+    write.table(
+      fit$res_shrunk[[tag]],
+      file  = file.path(out_dir, sprintf("DEseq2_%s_vs_ctrl_%s_shrunk.txt", tag, suffix)),
+      quote = FALSE, sep = "\t"
+    )
+  }
+  invisible(NULL)
+}
+```
+
+## Transcript-to-gene map
+
+```{r tx2gene, eval=run_quantification}
+tx2gene <- read_table(tx2gene_file, col_names = FALSE)
+head(tx2gene)
+```
+
+## Dataset 1 — SNAI1-FNV; SNAI2-KO (lib4)
+
+Design: 4 conditions (DMSO, 3h, 1day, 3days) × 2 clones (c5946b16, c5946b27) ×
+2 replicates = 16 samples. Clone and replicate are combined into a single
+4-level `replicate` factor, which is included in the design to absorb
+clone/batch effects: `~ condition + replicate`.
+
+Shrinkage uses **apeglm**, as for all three datasets in this document (see the
+note on shrinkage estimators above).
+
+```{r dbl-import, eval=run_quantification}
+files_dbl <- salmon_quant_files(salmon_dir_dbl)
+txi_dbl   <- import_salmon(files_dbl, tx2gene)
+
+names(txi_dbl)
+head(txi_dbl$counts)
+```
+
+```{r dbl-sampletable, eval=run_quantification}
+# The condition/replicate vectors are positional: they assume the samples come
+# back from list.files() in alphabetical order, i.e. 8 samples of clone
+# c5946b16 followed by 8 of clone c5946b27, each block ordered
+# 1day, 1day, 3days, 3days, 3h, 3h, DMSO, DMSO.
+sampleTable_dbl <- data.frame(
+  condition = factor(rep(rep(c("1day", "3days", "3h", "DMSO"), each = 2), 2)),
+  replicate = factor(c(
+    rep(c("c5946b16_rep1", "c5946b16_rep2"), 4),
+    rep(c("c5946b27_rep1", "c5946b27_rep2"), 4)
+  ))
+)
+rownames(sampleTable_dbl) <- colnames(txi_dbl$counts)
+
+# ALWAYS eyeball this table: every sample name must sit next to the right
+# condition. This is the single most common source of silent errors here.
+sampleTable_dbl
+```
+
+```{r dbl-deseq, eval=run_quantification}
+deseq_dbl <- run_deseq_timecourse(
+  txi          = txi_dbl,
+  sample_table = sampleTable_dbl,
+  ref_level    = "DMSO",
+  # names = output file tags; values = levels of `condition`
+  contrasts    = c("3h" = "3h", "1d" = "1day", "3d" = "3days"),
+  shrink_type  = "apeglm",
+  min_count    = min_count,
+  min_samples  = min_samples
+)
+
+resultsNames(deseq_dbl$dds)
+```
+
+```{r dbl-degs, eval=run_quantification}
+# Summarised from the shrunken results so these numbers match the bar plot in
+# Part 2 (padj is unaffected by shrinkage; only the sign of near-zero LFCs can
+# differ from the unshrunken table).
+deg_summary(deseq_dbl$res_shrunk, padj_cut)
+```
+
+```{r dbl-plotcounts, eval=run_quantification, fig.width=5, fig.height=4}
+# Sanity check on a single gene (normalised counts per condition).
+plotCounts(deseq_dbl$dds, gene = "UACA", intgroup = "condition")
+```
+
+```{r dbl-save, eval=run_quantification}
+# The tximport object is saved so downstream analyses (e.g. TPM-level plots)
+# don't have to re-import the Salmon files.
+save(txi_dbl, file = file.path(rda_dir, "txi_SNAI1FNVSNAI2KO.rda"))
+
+write_deseq_tables(deseq_dbl, data_dir, suffix = "SNAI1FNVSNAI2KO_ONLY_CNCC")
+```
+
+## Dataset 2 — SNAI1-FNV single degron (lib3)
+
+Design: 4 conditions (ctrl, 3h, 1d, 4d) × 2 replicates = 8 samples.
+
+```{r snai1-import, eval=run_quantification}
+files_snai1 <- salmon_quant_files(salmon_dir_snai1)
+txi_snai1   <- import_salmon(files_snai1, tx2gene)
+
+head(txi_snai1$counts)
+head(txi_snai1$abundance)
+```
+
+```{r snai1-sampletable, eval=run_quantification}
+# Positional again: alphabetical order gives rep1 block (1d, 3h, 4d, ctrl)
+# followed by rep2 block (1d, 3h, 4d, ctrl).
+sampleTable_snai1 <- data.frame(
+  condition = factor(rep(c("1d", "3h", "4d", "ctrl"), 2)),
+  replicate = factor(rep(c("rep1", "rep2"), each = 4))
+)
+rownames(sampleTable_snai1) <- colnames(txi_snai1$counts)
+sampleTable_snai1
+```
+
+```{r snai1-deseq, eval=run_quantification}
+deseq_snai1 <- run_deseq_timecourse(
+  txi          = txi_snai1,
+  sample_table = sampleTable_snai1,
+  ref_level    = "ctrl",
+  contrasts    = c("3h" = "3h", "1d" = "1d", "4d" = "4d"),
+  shrink_type  = "apeglm",
+  min_count    = min_count,
+  min_samples  = min_samples
+)
+
+resultsNames(deseq_snai1$dds)
+deg_summary(deseq_snai1$res_shrunk, padj_cut)
+```
+
+```{r snai1-save, eval=run_quantification}
+write_deseq_tables(deseq_snai1, data_dir, suffix = "SNAI1_CNCC")
+```
+
+## Dataset 3 — SNAI2-FNV single degron (lib2)
+
+This Salmon directory holds **both** the SNAI2-FNV and the ZEB1-FNV libraries.
+Only the first 12 samples (SNAI2-FNV: 4 conditions × 3 replicates) are used
+here.
+
+```{r snai2-import, eval=run_quantification}
+files_snai2_all <- salmon_quant_files(salmon_dir_snai2)
+
+# Inspect before subsetting — confirm that entries 1:12 really are the SNAI2
+# samples and that none of the ZEB1 samples sneak in.
+names(files_snai2_all)
+
+files_snai2 <- files_snai2_all[1:12]
+txi_snai2   <- import_salmon(files_snai2, tx2gene)
+
+head(txi_snai2$counts)
+```
+
+```{r snai2-sampletable, eval=run_quantification}
+# 3 replicates per condition, conditions in blocks of 3.
+sampleTable_snai2 <- data.frame(
+  condition = factor(rep(c("1d", "3h", "4d", "ctrl"), each = 3)),
+  replicate = factor(rep(c("rep1", "rep2", "rep3"), 4))
+)
+rownames(sampleTable_snai2) <- colnames(txi_snai2$counts)
+sampleTable_snai2
+```
+
+```{r snai2-deseq, eval=run_quantification}
+deseq_snai2 <- run_deseq_timecourse(
+  txi          = txi_snai2,
+  sample_table = sampleTable_snai2,
+  ref_level    = "ctrl",
+  contrasts    = c("3h" = "3h", "1d" = "1d", "4d" = "4d"),
+  shrink_type  = "apeglm",
+  min_count    = min_count,
+  min_samples  = min_samples
+)
+
+resultsNames(deseq_snai2$dds)
+deg_summary(deseq_snai2$res_shrunk, padj_cut)
+```
+
+```{r snai2-save, eval=run_quantification}
+write_deseq_tables(deseq_snai2, data_dir, suffix = "SNAI2_CNCC")
+```
+
+# Part 2 — Downstream analysis and figures
+
+Part 2 reads the tables written above from `data_dir` rather than using the
+in-memory objects, so it can be run on its own (`run_quantification <- FALSE`)
+from the deposited processed data.
+
+All three datasets are read from their `_shrunk` tables, so every figure below
+is based on the same quantity: an apeglm-shrunken `log2FoldChange` paired with
+the `pvalue`/`padj` from the unshrunken Wald test (`lfcShrink()` replaces the
+LFC and its standard error but does not recompute p-values). The consequences
+of that pairing are discussed under the volcano plots.
+
+## Helper
+
+```{r degs-helper}
+#' Extract up- or down-regulated gene names from a DESeq2 results data.frame
+get_degs <- function(df, direction = c("up", "down"), padj_cut = 0.05) {
+  direction <- match.arg(direction)
+  if (direction == "up") {
+    rownames(df)[which(df$padj < padj_cut & df$log2FoldChange > 0)]
+  } else {
+    rownames(df)[which(df$padj < padj_cut & df$log2FoldChange < 0)]
+  }
+}
+```
+
+## Load log2FC tables — SNAI1-FNV; SNAI2-KO
+
+```{r load-combined}
+res_3h_dbl <- read.table(file.path(data_dir, "DEseq2_3h_vs_ctrl_SNAI1FNVSNAI2KO_ONLY_CNCC_shrunk.txt"))
+res_1d_dbl <- read.table(file.path(data_dir, "DEseq2_1d_vs_ctrl_SNAI1FNVSNAI2KO_ONLY_CNCC_shrunk.txt"))
+res_3d_dbl <- read.table(file.path(data_dir, "DEseq2_3d_vs_ctrl_SNAI1FNVSNAI2KO_ONLY_CNCC_shrunk.txt"))
+
+DEGs_3h_up_comb <- get_degs(res_3h_dbl, "up", padj_cut)
+DEGs_1d_up_comb <- get_degs(res_1d_dbl, "up", padj_cut)
+DEGs_3d_up_comb <- get_degs(res_3d_dbl, "up", padj_cut)
+
+DEGs_3h_dw_comb <- get_degs(res_3h_dbl, "down", padj_cut)
+DEGs_1d_dw_comb <- get_degs(res_1d_dbl, "down", padj_cut)
+DEGs_3d_dw_comb <- get_degs(res_3d_dbl, "down", padj_cut)
+```
+
+## Load log2FC tables — single degrons
+
+These are the `_shrunk` tables, matching the double-perturbation dataset above.
+The unshrunken tables (same names without the `_shrunk` suffix) are also written
+by Part 1 if you need the raw Wald-test log2FC.
+
+```{r load-individual}
+res_3h_SNAI1 <- read.table(file.path(data_dir, "DEseq2_3h_vs_ctrl_SNAI1_CNCC_shrunk.txt"))
+res_1d_SNAI1 <- read.table(file.path(data_dir, "DEseq2_1d_vs_ctrl_SNAI1_CNCC_shrunk.txt"))
+res_4d_SNAI1 <- read.table(file.path(data_dir, "DEseq2_4d_vs_ctrl_SNAI1_CNCC_shrunk.txt"))
+
+DEGs_3h_SNAI1_up_comb <- get_degs(res_3h_SNAI1, "up", padj_cut)
+DEGs_1d_SNAI1_up_comb <- get_degs(res_1d_SNAI1, "up", padj_cut)
+DEGs_4d_SNAI1_up_comb <- get_degs(res_4d_SNAI1, "up", padj_cut)
+
+DEGs_3h_SNAI1_dw_comb <- get_degs(res_3h_SNAI1, "down", padj_cut)
+DEGs_1d_SNAI1_dw_comb <- get_degs(res_1d_SNAI1, "down", padj_cut)
+DEGs_4d_SNAI1_dw_comb <- get_degs(res_4d_SNAI1, "down", padj_cut)
+
+res_3h_SNAI2 <- read.table(file.path(data_dir, "DEseq2_3h_vs_ctrl_SNAI2_CNCC_shrunk.txt"))
+res_1d_SNAI2 <- read.table(file.path(data_dir, "DEseq2_1d_vs_ctrl_SNAI2_CNCC_shrunk.txt"))
+res_4d_SNAI2 <- read.table(file.path(data_dir, "DEseq2_4d_vs_ctrl_SNAI2_CNCC_shrunk.txt"))
+
+DEGs_3h_SNAI2_up_comb <- get_degs(res_3h_SNAI2, "up", padj_cut)
+DEGs_1d_SNAI2_up_comb <- get_degs(res_1d_SNAI2, "up", padj_cut)
+DEGs_4d_SNAI2_up_comb <- get_degs(res_4d_SNAI2, "up", padj_cut)
+
+DEGs_3h_SNAI2_dw_comb <- get_degs(res_3h_SNAI2, "down", padj_cut)
+DEGs_1d_SNAI2_dw_comb <- get_degs(res_1d_SNAI2, "down", padj_cut)
+DEGs_4d_SNAI2_dw_comb <- get_degs(res_4d_SNAI2, "down", padj_cut)
+```
+
+## Bar plot of DEG numbers
+
+A gene counts as a DEG if `padj < padj_cut`; the up/down split follows the sign
+of the shrunken log2FC. Since shrinkage does not change `padj`, the totals per
+bar are identical to the unshrunken ones — only the up/down assignment of a
+small number of genes whose shrunken LFC crosses zero can differ.
+
+The plotting `data.frame` is built from a **named** list, so each count stays
+tied to its own label. (The original built four parallel vectors that had to
+stay in sync by position — easy to silently misalign when edited.)
+
+Names follow the pattern `<sample>_<UP|DW>_<timepoint>` and are split on `_` to
+generate the three factor columns.
+
+```{r barplot-data}
+deg_lists <- list(
+  SNAI1_UP_3h          = DEGs_3h_SNAI1_up_comb,
+  SNAI1_UP_1day        = DEGs_1d_SNAI1_up_comb,
+  `SNAI1_UP_3-4days`   = DEGs_4d_SNAI1_up_comb,
+  SNAI2_UP_3h          = DEGs_3h_SNAI2_up_comb,
+  SNAI2_UP_1day        = DEGs_1d_SNAI2_up_comb,
+  `SNAI2_UP_3-4days`   = DEGs_4d_SNAI2_up_comb,
+  `SNAI1/2_UP_3h`      = DEGs_3h_up_comb,
+  `SNAI1/2_UP_1day`    = DEGs_1d_up_comb,
+  `SNAI1/2_UP_3-4days` = DEGs_3d_up_comb,
+  SNAI1_DW_3h          = DEGs_3h_SNAI1_dw_comb,
+  SNAI1_DW_1day        = DEGs_1d_SNAI1_dw_comb,
+  `SNAI1_DW_3-4days`   = DEGs_4d_SNAI1_dw_comb,
+  SNAI2_DW_3h          = DEGs_3h_SNAI2_dw_comb,
+  SNAI2_DW_1day        = DEGs_1d_SNAI2_dw_comb,
+  `SNAI2_DW_3-4days`   = DEGs_4d_SNAI2_dw_comb,
+  `SNAI1/2_DW_3h`      = DEGs_3h_dw_comb,
+  `SNAI1/2_DW_1day`    = DEGs_1d_dw_comb,
+  `SNAI1/2_DW_3-4days` = DEGs_3d_dw_comb
+)
+
+deg_counts <- do.call(rbind, lapply(names(deg_lists), function(nm) {
+  parts <- strsplit(nm, "_")[[1]]
+  data.frame(
+    sample    = parts[1],
+    DEG_type  = parts[2],
+    dTag_time = parts[3],
+    DEG_n     = length(deg_lists[[nm]])
+  )
+}))
+
+deg_counts$dTag_time <- factor(deg_counts$dTag_time, levels = c("3h", "1day", "3-4days"))
+deg_counts$sample    <- factor(deg_counts$sample,    levels = c("SNAI1", "SNAI2", "SNAI1/2"))
+
+deg_counts
+```
+
+```{r barplot-plot, fig.width=4.5, fig.height=2.5}
+p_bar <- ggplot(deg_counts, aes(x = sample, y = DEG_n, fill = dTag_time)) +
+  geom_vline(xintercept = c(1.5, 2.5), linetype = "dashed", color = "grey75", linewidth = 0.6) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~DEG_type) +
+  theme_classic() +
+  scale_fill_manual(values = c("#D8BFD8", "#9932CC", "#4B0082")) +
+  ylab("Differentially expressed genes n.") +
+  xlab("") +
+  labs(fill = "Timepoint") +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 11, color = "black"),
+    axis.text.y     = element_text(color = "black"),
+    strip.text      = element_text(size = 12, face = "bold"),
+    legend.position = "right"
+  )
+
+p_bar
+ggsave(file.path(fig_dir, "Barplot_DEGs_V3.pdf"), plot = p_bar, height = 2.5, width = 4.5)
+```
+
+## Peak-proximity annotation
+
+Each gene is assigned to one of three mutually exclusive categories based on
+the distance from its canonical TSS to the nearest SNAI2 ChIP-seq peak:
+
+| Category | Definition | Colour |
+|---|---|---|
+| `peak <=1kb`     | peak within 1 kb of the TSS **and** no peak in the 1–50 kb ring | blue |
+| `peak 1kb-50kb`  | at least one peak in the 1–50 kb ring (regardless of a promoter peak) | yellow |
+| `no peak <=50kb` | no peak within 50 kb | grey/red |
+
+### Canonical protein-coding TSSs
+
+```{r peak-annotation-tss}
+ah        <- AnnotationHub()
+human_ens <- query(ah, c("EnsDb", "Homo sapiens"))
+
+# Pinned to a specific EnsDb snapshot for reproducibility: AH116291 = Ensembl 111.
+edb_latest <- ah[["AH116291"]]
+
+tx_gr <- transcripts(
+  edb_latest,
+  filter = ~ gene_biotype == "protein_coding" & tx_is_canonical == TRUE
+)
+
+gene_map        <- genes(edb_latest, columns = c("gene_id", "gene_name"))
+tx_gr$gene_name <- gene_map$gene_name[match(tx_gr$gene_id, gene_map$gene_id)]
+
+# Collapse each transcript to its TSS (single bp, strand-aware).
+tss_gr <- resize(tx_gr, width = 1, fix = "start")
+seqlevelsStyle(tss_gr) <- "Ensembl"   # match the peak naming style used below
+
+length(tss_gr)
+```
+
+### Overlap TSS windows with peaks
+
+```{r peak-annotation-overlap}
+proximal_bp <- 1000
+distal_bp   <- 50000
+
+peaks_np <- fread(peak_file, header = FALSE)
+setnames(peaks_np, 1:3, c("chrom", "start", "end"))
+
+# narrowPeak is BED-like: 0-based, half-open. +1 on the start converts to the
+# 1-based, closed convention used by GRanges.
+peaks_np_gr <- GRanges(
+  seqnames = sub("^chr", "", peaks_np$chrom),
+  ranges   = IRanges(peaks_np$start + 1, peaks_np$end)
+)
+seqlevelsStyle(peaks_np_gr) <- "Ensembl"
+
+# Drop contigs that are absent from the annotation (scaffolds, chrM naming, ...)
+peaks_np_gr <- keepSeqlevels(
+  peaks_np_gr,
+  intersect(seqlevels(peaks_np_gr), seqlevels(tss_gr)),
+  pruning.mode = "coarse"
+)
+
+tss_distal_windows   <- GRanges(seqnames(tss_gr), IRanges(pmax(1L, start(tss_gr) - distal_bp),   start(tss_gr) + distal_bp))
+tss_proximal_windows <- GRanges(seqnames(tss_gr), IRanges(pmax(1L, start(tss_gr) - proximal_bp), start(tss_gr) + proximal_bp))
+
+ov_distal   <- findOverlaps(tss_distal_windows,   peaks_np_gr, ignore.strand = TRUE)
+ov_proximal <- findOverlaps(tss_proximal_windows, peaks_np_gr, ignore.strand = TRUE)
+
+pairs_distal_all <- data.frame(tss_idx = queryHits(ov_distal),   peak_idx = subjectHits(ov_distal))
+pairs_proximal   <- data.frame(tss_idx = queryHits(ov_proximal), peak_idx = subjectHits(ov_proximal))
+
+# Distal pairs: the peak overlaps the 50 kb window but NOT the 1 kb window.
+pairs_distal <- dplyr::anti_join(pairs_distal_all, pairs_proximal, by = c("tss_idx", "peak_idx"))
+
+# Genes with >= 1 peak in the 1kb-50kb ring (yellow), regardless of promoter peak
+genes_has_distal    <- unique(tss_gr$gene_name[pairs_distal$tss_idx])
+# Genes with a promoter peak (<= 1kb) but NO distal peak (blue)
+genes_proximal_all  <- unique(tss_gr$gene_name[queryHits(ov_proximal)])
+genes_only_promoter <- setdiff(genes_proximal_all, genes_has_distal)
+
+message("Genes with peak <=1kb only (blue):    ", length(genes_only_promoter))
+message("Genes with peak in 1kb-50kb (yellow): ", length(genes_has_distal))
+```
+
+### Flag the results tables
+
+```{r peak-annotation-flag}
+# Mutually exclusive proximity categories; matched on gene symbol (rownames).
+flag_proximity <- function(df) {
+  df$proximity <- "no peak <=50kb"
+  df$proximity[rownames(df) %in% genes_has_distal]    <- "peak 1kb-50kb"  # yellow
+  df$proximity[rownames(df) %in% genes_only_promoter] <- "peak <=1kb"     # blue
+  df
+}
+
+res_3h_dbl <- flag_proximity(res_3h_dbl)
+res_1d_dbl <- flag_proximity(res_1d_dbl)
+res_3d_dbl <- flag_proximity(res_3d_dbl)
+
+table(res_3d_dbl$proximity)
+```
+
+
+
+
+
+## MA plots
+
+
+
+```{r ma-setup}
+all_res <- list(res_3h_dbl, res_1d_dbl, res_3d_dbl)
+
+
+xr_ma <- range(sapply(all_res, function(d) range(log10(d$baseMean + 1), na.rm = TRUE)))
+yr_ma <- range(sapply(all_res, function(d) range(d$log2FoldChange,      na.rm = TRUE)))
+
+make_snai_MA <- function(df, title_text) {
+  df$plot_group <- "ns"
+  df$plot_group[df$padj < padj_cut & df$proximity == "no peak <=50kb"] <- "sign_nopeak"
+  df$plot_group[df$padj < padj_cut & df$proximity == "peak 1kb-50kb"]  <- "sign_50kb"
+  df$plot_group[df$padj < padj_cut & df$proximity == "peak <=1kb"]     <- "sign_1kb"
+  df <- df[order(df$plot_group == "ns", decreasing = TRUE), ]
+
+  ggplot(df, aes(log10(baseMean + 1), log2FoldChange, color = plot_group, size = plot_group)) +
+    geom_point_rast(alpha = 0.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    scale_color_manual(
+      name   = "Peak proximity",
+      values = c(ns = "grey70", sign_nopeak = "#0072B2", sign_50kb = "#E69F00", sign_1kb = "darkred"),
+      labels = c(ns = "ns", sign_nopeak = "sig, no peak <=50kb", sign_50kb = "sig, peak <50kb", sign_1kb = "sig, peak <=1kb")
+    ) +
+    scale_size_manual(
+      name   = "Peak proximity",
+      values = c(ns = 0.5, sign_nopeak = 1.2, sign_50kb = 1.2, sign_1kb = 1.2),
+      labels = c(ns = "ns", sign_nopeak = "sig, no peak <=50kb", sign_50kb = "sig, peak <50kb", sign_1kb = "sig, peak <=1kb")
+    ) +
+    scale_x_continuous(limits = xr_ma) +
+    scale_y_continuous(limits = yr_ma) +
+    coord_cartesian(ylim = c(-3.5, 3.5)) +
+    guides(color = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+    theme_classic() +
+    xlab("log10(baseMean + 1)") +
+    ylab("Shrunk log2FoldChange (dTag/DMSO)") +
+    ggtitle(title_text)
+}
+```
+
+```{r ma-plot, fig.width=11, fig.height=3}
+p1_ma <- make_snai_MA(res_3h_dbl, "SNAI1-FNV SNAI2-KO: 3h dTag vs DMSO")
+p2_ma <- make_snai_MA(res_1d_dbl, "SNAI1-FNV SNAI2-KO: 1 day dTag vs DMSO")
+p3_ma <- make_snai_MA(res_3d_dbl, "SNAI1-FNV SNAI2-KO: 3 days dTag vs DMSO")
+
+p_ma <- ggarrange(p1_ma, p2_ma, p3_ma, nrow = 1, common.legend = TRUE, legend = "right")
+p_ma
+ggsave(file.path(fig_dir, "MA_alltimepoints_proximity_V1_shrunk.pdf"), plot = p_ma, height = 3, width = 11)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
