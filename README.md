@@ -50,7 +50,9 @@ R markdown including analysis to generate the kernel smoothened plots of TF acti
 R markdown for linear model predicting H3K27ac change based on TF binding changes (DMSO vs dTag)
 
 ## Figure 5 and 7: Fiber-seq and DAF-seq analyses
+--- 09_Fiber_seq_plots.Rmd
 
+Code for plotting Fiber-seq data (metaplot and heatmap)
 
 ## Figure 6: DAF-seq codependency analysis
 
