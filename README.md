@@ -25,7 +25,7 @@ R markdown of correlation analysis between human and chimpanzee ChIP changes and
 
 ## Figure 2/3: SNAI1/2, H3K27ac, ATAC, analyses
 
---- 04_SNAI_RNAseq_DESeq2_and_downstream_nopaths.Rmd
+--- 04_SNAI_RNAseq_DESeq2_and_downstream.Rmd
 
 R markdown with processing of RNA-seq data 
 
