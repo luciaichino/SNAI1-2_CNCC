@@ -1,0 +1,522 @@
+---
+title: "ATAC vs H3K27ac log2FC across dTAG time points — linear mixed-effects model"
+subtitle: "Supplementary Table S2 source code"
+output: html_document
+date: "2026-08-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# 0. Purpose
+
+Test whether the relationship between the SNAI1/2-depletion-induced change in
+chromatin accessibility (ATAC log2FC, dTAG/DMSO) and the change in H3K27ac
+(ChIP log2FC, dTAG/DMSO) differs across depletion time points (3h, 1d, 3d), at
+distal SNAI1/2-bound regions that gain signal upon depletion.
+
+Each genomic region contributes up to three observations (one per time point),
+so observations are not independent. We therefore use a linear mixed-effects
+model with a random intercept for region.
+
+
+```{r libs}
+library(lme4)        # lmer()
+library(lmerTest)    # adds Satterthwaite df / p-values to the fixed-effect table
+library(emmeans)     # emtrends(): estimated marginal slopes + contrasts
+library(broom.mixed) # tidy() for lmer objects
+library(ggplot2)
+library(tidyr)
+library(dplyr)       
+library(conflicted)
+conflicts_prefer(
+  base::unname,
+  lmerTest::lmer,
+  dplyr::filter,
+  dplyr::select,
+  dplyr::mutate,
+  dplyr::summarise,
+  dplyr::rename,
+  dplyr::count,
+  .quiet = TRUE
+)
+
+
+# Several Bioconductor / plyr-style packages export functions named count(),
+# mutate(), summarise(), rename() etc. If any of those are attached (e.g. from
+# the session that produced data_v4.rds), they can mask the dplyr versions and
+# produce cryptic errors such as
+#   "Argument 'x' is not a vector: list".
+# Every dplyr verb below is therefore namespace-qualified. Run this to see what
+# is masking what in your session:
+find("count"); find("mutate"); find("summarise")
+
+# Output directory for the paper tables / figures
+tab_dir <- "..."
+fig_dir <- "..."
+
+set.seed(1)  
+```
+
+# 1. Data
+
+```{r load}
+data <- readRDS(".../data_v4.rds")
+```
+
+## 1.1 Region selection
+
+Inclusion criteria (all must hold):
+
+* the region is called UP in **at least one** assay at **at least one** time
+  point (H3K27ac or ATAC, 3h / 1d / 3d) — i.e. the region responds to SNAI1/2
+  depletion in at least one readout;
+* the region overlaps a SNAI1/2 peak (`SNAI_peaks_all == "SNAI_bound"`);
+* the region is **distal** (`classification %in% c("enhancer","other_distal")`),
+  i.e. promoters are excluded.
+
+Note this is a *union* selection across assays and time points, so the same
+region set is used at all three time points — which is what makes the
+repeated-measures / random-intercept structure appropriate.
+
+```{r select}
+sel_alltp <- data %>%
+  dplyr::filter(
+    H3K27ac_UP_3d == 1 | ATAC_UP_3d == 1 |
+    H3K27ac_UP_1d == 1 | ATAC_UP_1d == 1 |
+    H3K27ac_UP_3h == 1 | ATAC_UP_3h == 1,
+    SNAI_peaks_all == "SNAI_bound",
+    classification %in% c("enhancer", "other_distal")
+  )
+
+n_regions_selected <- dplyr::n_distinct(sel_alltp$region)
+n_regions_selected
+```
+
+## 1.2 Reshape to long format
+
+One row per region x time point, with the matched ATAC and H3K27ac log2FC.
+
+```{r reshape}
+# H3K27ac log2FCs -> long
+ac_long <- sel_alltp %>%
+  dplyr::select(region, classification, SNAI_peaks_all,
+                H3K27ac_3h_log2FC, H3K27ac_1d_log2FC, H3K27ac_3d_log2FC) %>%
+  tidyr::pivot_longer(cols = tidyr::starts_with("H3K27ac_"),
+                      names_to = "timepoint", values_to = "ac_l2fc") %>%
+  dplyr::mutate(timepoint = gsub("H3K27ac_|_log2FC", "", timepoint))
+
+# ATAC log2FCs -> long
+atac_long <- sel_alltp %>%
+  dplyr::select(region,
+                ATACdata_3h_log2FC, ATACdata_1d_log2FC, ATACdata_3d_log2FC) %>%
+  tidyr::pivot_longer(cols = tidyr::starts_with("ATACdata_"),
+                      names_to = "timepoint", values_to = "atac_l2fc") %>%
+  dplyr::mutate(timepoint = gsub("ATACdata_|_log2FC", "", timepoint))
+
+# Match ATAC and H3K27ac on the SAME region and the SAME time point
+df_long <- dplyr::inner_join(ac_long, atac_long, by = c("region", "timepoint"))
+
+# 3h is the reference level (earliest time point)
+df_long$timepoint <- factor(df_long$timepoint, levels = c("3h", "1d", "3d"))
+df_long$region    <- factor(df_long$region)
+
+# Drop incomplete rows explicitly, so that reported n matches what lmer used
+# (lmer would silently drop them via na.omit otherwise).
+df_long <- df_long %>% dplyr::filter(!is.na(ac_l2fc), !is.na(atac_l2fc))
+df_long$region <- droplevels(df_long$region)
+```
+
+## 1.3 Sample sizes — needed for the table and the Methods
+
+```{r n}
+n_obs      <- nrow(df_long)
+n_regions  <- dplyr::n_distinct(df_long$region)
+
+# Regions contributing an observation at each time point
+n_per_tp <- df_long %>%
+  dplyr::group_by(timepoint) %>%
+  dplyr::summarise(n_regions = dplyr::n(), .groups = "drop")
+
+# How many regions have 1, 2 or 3 time points of data (should be mostly 3)
+obs_per_reg <- df_long %>%
+  dplyr::group_by(region) %>%
+  dplyr::summarise(k = dplyr::n(), .groups = "drop") %>%
+  dplyr::group_by(k) %>%
+  dplyr::summarise(n_regions = dplyr::n(), .groups = "drop")
+
+n_obs; n_regions; n_per_tp; obs_per_reg
+```
+
+# 2. Models
+
+Two nested models, both fit with a random intercept for `region`:
+
+* **reduced** — one common ATAC->H3K27ac slope shared by all time points; each
+  time point gets its own intercept (main effect of `timepoint` only).
+* **full** — the slope is allowed to differ by time point
+  (`atac_l2fc * timepoint` = both main effects + their interaction).
+
+A random *slope* per region (`(1 + atac_l2fc | region)`) is not estimable here:
+with at most three observations per region there is no within-region
+information to identify a region-specific slope. This is worth stating in the
+Methods pre-emptively.
+
+```{r fit}
+full    <- lmerTest::lmer(ac_l2fc ~ atac_l2fc * timepoint + (1 | region), data = df_long)
+reduced <- lmerTest::lmer(ac_l2fc ~ atac_l2fc + timepoint + (1 | region), data = df_long)
+
+summary(full)
+```
+
+## 2.1 Likelihood-ratio test for the interaction
+
+`anova()` on two `merMod` objects automatically refits both models by maximum
+likelihood (REML likelihoods of models with different fixed effects are not
+comparable) and returns the LRT. A significant result means the ATAC->H3K27ac
+slope differs across time points.
+
+```{r lrt}
+lrt <- anova(reduced, full)
+lrt
+```
+
+## 2.2 Estimated marginal slopes
+
+`emtrends()` gives the slope of `ac_l2fc` on `atac_l2fc` within each time point,
+i.e. exactly the three lines drawn in Figure 3E.
+
+Degrees of freedom: with n in the tens of thousands, Kenward-Roger /
+Satterthwaite df are computationally expensive and numerically identical to the
+asymptotic limit, so we request asymptotic (normal-theory, z) inference
+**explicitly** rather than letting `emmeans` fall back to it silently when
+`lmerTest.limit` is exceeded. This is why the table reports z rather than t,
+and it should be stated in the Methods.
+
+```{r emtrends}
+emt <- emtrends(full, ~ timepoint, var = "atac_l2fc", lmer.df = "asymptotic")
+
+# (a) slope estimates with SE, 95% CI, and test against 0
+slopes_vs0 <- summary(emt, infer = c(TRUE, TRUE), null = 0)
+
+# (b) test against 1 -- H0: H3K27ac changes 1:1 with accessibility.
+#     This is the test that actually backs the claim "H3K27ac increased more
+#     slowly than accessibility", which is a statement about slope < 1, not
+#     slope > 0. Unadjusted (3 pre-specified tests); note this in the legend.
+slopes_vs1 <- summary(emt, infer = c(FALSE, TRUE), null = 1, adjust = "none")
+
+# (c) pairwise comparisons between time points, Tukey-adjusted
+pw <- summary(pairs(emt, adjust = "tukey"), infer = c(TRUE, TRUE))
+
+slopes_vs0; slopes_vs1; pw
+```
+
+## 2.3 Descriptive correlation per time point
+
+
+
+```{r cors}
+cor_tab <- do.call(rbind, lapply(levels(df_long$timepoint), function(tp) {
+  d <- df_long[df_long$timepoint == tp, ]
+  p <- cor.test(d$atac_l2fc, d$ac_l2fc, method = "pearson")
+  s <- suppressWarnings(
+    cor.test(d$atac_l2fc, d$ac_l2fc, method = "spearman", exact = FALSE))
+  data.frame(
+    timepoint    = tp,
+    n            = nrow(d),
+    pearson_r    = unname(p$estimate),
+    pearson_lcl  = p$conf.int[1],
+    pearson_ucl  = p$conf.int[2],
+    pearson_p    = p$p.value,
+    spearman_rho = unname(s$estimate),
+    spearman_p   = s$p.value,
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(cor_tab) <- NULL
+
+cor_tab
+```
+
+# 3. Build the supplementary table
+
+## 3.1 Formatting helpers
+
+```{r helpers}
+# Report p-values honestly: below double.eps R cannot resolve them further, so
+# report the machine limit rather than "0" or a spuriously precise number.
+fmt_p <- function(p, digits = 3) {
+  ifelse(is.na(p), NA_character_,
+    ifelse(p < 2.2e-16, "< 2.2e-16", formatC(p, format = "e", digits = digits - 1)))
+}
+r3 <- function(x, d = 3) formatC(round(x, d), format = "f", digits = d)
+```
+
+## 3.2 Panels
+
+```{r panels}
+# ---- Panel A: model specification and data summary -------------------------
+panel_A <- tibble::tibble(
+  item = c(
+    "Response variable",
+    "Predictor",
+    "Grouping factor (random effect)",
+    "Full model formula",
+    "Reduced model formula",
+    "Estimation",
+    "Degrees of freedom",
+    "Multiple-testing correction (pairwise slope contrasts)",
+    "Region set",
+    "Regions (n)",
+    "Observations (n region x time point)",
+    "Observations per time point",
+    "Software"
+  ),
+  value = c(
+    "H3K27ac log2FC (dTAG/DMSO)",
+    "ATAC log2FC (dTAG/DMSO)",
+    "genomic region (random intercept)",
+    "ac_l2fc ~ atac_l2fc * timepoint + (1|region)",
+    "ac_l2fc ~ atac_l2fc + timepoint + (1|region)",
+    "REML for parameter estimates; ML refit for the likelihood-ratio test",
+    "asymptotic (normal-theory, z statistics)",
+    "Tukey",
+    "distal (enhancer / other_distal), SNAI1/2-bound, UP in H3K27ac or ATAC at >= 1 time point",
+    format(n_regions, big.mark = ","),
+    format(n_obs, big.mark = ","),
+    paste(paste0(n_per_tp$timepoint, ": ", format(n_per_tp$n_regions, big.mark = ",")),
+          collapse = "; "),
+    paste0("R ", getRversion(),
+           "; lme4 ", packageVersion("lme4"),
+           "; lmerTest ", packageVersion("lmerTest"),
+           "; emmeans ", packageVersion("emmeans"))
+  )
+)
+
+# ---- Panel B: fixed effects of the full model ------------------------------
+# Taken straight from summary() rather than via broom, so it does not depend on
+# broom.mixed exposing the lmerTest df/p columns. Wald CIs (fast, and identical
+# to profile CIs at this n).
+fe <- as.data.frame(summary(full)$coefficients)
+fe_ci <- confint(full, parm = rownames(fe), method = "Wald")
+
+panel_B <- tibble::tibble(
+  term     = rownames(fe),
+  estimate = r3(fe[["Estimate"]]),
+  SE       = r3(fe[["Std. Error"]]),
+  `95% CI` = paste0("[", r3(fe_ci[, 1]), ", ", r3(fe_ci[, 2]), "]"),
+  df       = if ("df" %in% names(fe)) formatC(fe[["df"]], format = "f", digits = 0) else "asymptotic",
+  t        = r3(fe[["t value"]], 2),
+  p        = if ("Pr(>|t|)" %in% names(fe)) fmt_p(fe[["Pr(>|t|)"]]) else NA_character_
+)
+
+# ---- Panel C: random effects / variance components -------------------------
+vc <- as.data.frame(VarCorr(full))
+v_region <- vc$vcov[vc$grp == "region"]
+v_resid  <- vc$vcov[vc$grp == "Residual"]
+panel_C <- tibble::tibble(
+  component = c("region (intercept)", "Residual", "ICC (region)"),
+  variance  = c(r3(v_region, 4), r3(v_resid, 4), ""),
+  `SD`      = c(r3(sqrt(v_region), 4), r3(sqrt(v_resid), 4), ""),
+  value     = c("", "", r3(v_region / (v_region + v_resid), 3))
+)
+
+# ---- Panel D: likelihood-ratio test, full vs reduced -----------------------
+lrt_df <- as.data.frame(lrt)
+
+# Column names of anova.merMod changed across lme4 versions
+# (npar/Df for parameter count, Df/"Chi Df" for the test df), so fetch by name
+# with fallbacks instead of positionally.
+gc_ <- function(d, ...) {
+  for (nm in c(...)) if (nm %in% names(d)) return(d[[nm]])
+  rep(NA, nrow(d))
+}
+
+panel_D <- tibble::tibble(
+  model    = c("reduced (common slope)", "full (slope x timepoint)"),
+  npar     = as.character(gc_(lrt_df, "npar", "Df")),
+  AIC      = r3(gc_(lrt_df, "AIC"), 1),
+  BIC      = r3(gc_(lrt_df, "BIC"), 1),
+  logLik   = r3(as.numeric(gc_(lrt_df, "logLik")), 1),
+  deviance = r3(gc_(lrt_df, "deviance"), 1),
+  chisq    = c("", r3(gc_(lrt_df, "Chisq")[2], 1)),
+  df       = c("", as.character(gc_(lrt_df, "Chi Df", "Df")[2])),
+  p        = c("", fmt_p(gc_(lrt_df, "Pr(>Chisq)")[2]))
+)
+
+# ---- Panel E: estimated marginal slopes, tested against 0 and against 1 ----
+sl0 <- as.data.frame(slopes_vs0)
+sl1 <- as.data.frame(slopes_vs1)
+panel_E <- tibble::tibble(
+  timepoint      = as.character(sl0$timepoint),
+  n              = n_per_tp$n_regions[match(as.character(sl0$timepoint),
+                                            as.character(n_per_tp$timepoint))],
+  slope          = r3(sl0$atac_l2fc.trend),
+  SE             = r3(sl0$SE),
+  `95% CI`       = paste0("[", r3(sl0$asymp.LCL), ", ", r3(sl0$asymp.UCL), "]"),
+  `z (H0: slope=0)` = r3(sl0$z.ratio, 2),
+  `p (H0: slope=0)` = fmt_p(sl0$p.value),
+  `z (H0: slope=1)` = r3(sl1$z.ratio, 2),
+  `p (H0: slope=1)` = fmt_p(sl1$p.value)
+)
+
+# ---- Panel F: pairwise slope contrasts ------------------------------------
+pw_df <- as.data.frame(pw)
+panel_F <- tibble::tibble(
+  contrast           = as.character(pw_df$contrast),
+  `slope difference` = r3(pw_df$estimate),
+  SE                 = r3(pw_df$SE),
+  `95% CI`           = paste0("[", r3(pw_df$asymp.LCL), ", ", r3(pw_df$asymp.UCL), "]"),
+  z                  = r3(pw_df$z.ratio, 2),
+  `p (Tukey)`        = fmt_p(pw_df$p.value)
+)
+
+# ---- Panel G: descriptive correlations ------------------------------------
+panel_G <- cor_tab %>%
+  dplyr::transmute(
+    timepoint = as.character(timepoint),
+    n,
+    `Pearson r` = r3(pearson_r),
+    `Pearson 95% CI` = paste0("[", r3(pearson_lcl), ", ", r3(pearson_ucl), "]"),
+    `Pearson p` = fmt_p(pearson_p),
+    `Spearman rho` = r3(spearman_rho),
+    `Spearman p` = fmt_p(spearman_p)
+  )
+```
+
+## 3.3 Stack the panels into one CSV
+
+```{r stack}
+panels <- list(
+  "A. Model specification and data summary"                                = panel_A,
+  "B. Fixed effects, full model (Satterthwaite df)"                        = panel_B,
+  "C. Variance components, full model"                                     = panel_C,
+  "D. Likelihood-ratio test: full vs reduced (ML refit)"                   = panel_D,
+  "E. Estimated marginal slopes of H3K27ac log2FC on ATAC log2FC by time point" = panel_E,
+  "F. Pairwise comparisons of slopes between time points"                  = panel_F,
+  "G. Descriptive correlation of ATAC and H3K27ac log2FC by time point"    = panel_G
+)
+
+ncol_total <- max(vapply(panels, ncol, integer(1)))
+
+pad <- function(m, k) {
+  if (ncol(m) < k) m <- cbind(m, matrix("", nrow(m), k - ncol(m)))
+  m
+}
+
+blocks <- lapply(names(panels), function(nm) {
+  d <- as.data.frame(lapply(panels[[nm]], as.character), stringsAsFactors = FALSE)
+  colnames(d) <- colnames(panels[[nm]])
+  rbind(
+    pad(matrix(nm, 1, 1), ncol_total),                 # panel title
+    pad(matrix(colnames(d), 1), ncol_total),           # column headers
+    pad(as.matrix(d), ncol_total),                     # body
+    matrix("", 1, ncol_total)                          # blank spacer
+  )
+})
+
+header <- rbind(
+  pad(matrix("Supplementary Table S2. Linear mixed-effects model of H3K27ac log2FC on ATAC log2FC across SNAI1/2 depletion time points at distal SNAI1/2-bound regions.", 1, 1), ncol_total),
+  matrix("", 1, ncol_total)
+)
+
+out <- rbind(header, do.call(rbind, blocks))
+
+footer <- rbind(
+  pad(matrix("Notes: log2FC = log2 fold-change, dTAG / DMSO. Slopes are estimated marginal trends of H3K27ac log2FC on ATAC log2FC within each time point (emmeans::emtrends). Inference on slopes and contrasts is asymptotic (z); the fixed-effect table in panel B uses Satterthwaite degrees of freedom (lmerTest). Pairwise contrast p-values are Tukey-adjusted; tests of slope against 1 are unadjusted. Panel G correlations are descriptive and computed independently within each time point.", 1, 1), ncol_total)
+)
+out <- rbind(out, matrix("", 1, ncol_total), footer)
+
+dir.create(tab_dir, recursive = TRUE, showWarnings = FALSE)
+write.table(out,
+            file = file.path(tab_dir, "SupplementaryTableS2_mixed_effects_ATAC_H3K27ac.csv"),
+            sep = ",", row.names = FALSE, col.names = FALSE, na = "", qmethod = "double")
+```
+
+## 3.4 Optional: same panels as separate sheets in one .xlsx
+
+Nicer for submission portals that dislike stacked CSVs. Skipped silently if
+`openxlsx` is not installed.
+
+```{r xlsx}
+if (requireNamespace("openxlsx", quietly = TRUE)) {
+  wb <- openxlsx::createWorkbook()
+  sheet_names <- c("A_model_info", "B_fixed_effects", "C_variance",
+                   "D_LRT", "E_slopes", "F_contrasts", "G_correlations")
+  for (i in seq_along(panels)) {
+    openxlsx::addWorksheet(wb, sheet_names[i])
+    openxlsx::writeData(wb, sheet_names[i], names(panels)[i], startRow = 1)
+    openxlsx::writeData(wb, sheet_names[i], panels[[i]], startRow = 3)
+    openxlsx::setColWidths(wb, sheet_names[i], cols = 1:ncol(panels[[i]]), widths = "auto")
+  }
+  openxlsx::saveWorkbook(
+    wb, file.path(tab_dir, "SupplementaryTableS2_mixed_effects_ATAC_H3K27ac.xlsx"),
+    overwrite = TRUE)
+} else {
+  message("openxlsx not installed - CSV only.")
+}
+```
+
+## 3.5 Also keep the two minimal tables used for figure annotation
+
+```{r minimal}
+slope_table <- panel_E %>% dplyr::select(timepoint, slope, `95% CI`)
+contrast_table <- panel_F %>% dplyr::select(contrast, `slope difference`, z, `p (Tukey)`)
+
+write.csv(slope_table,    file.path(tab_dir, "slope_table.csv"),    row.names = FALSE)
+write.csv(contrast_table, file.path(tab_dir, "contrast_table.csv"), row.names = FALSE)
+
+slope_table; contrast_table
+```
+
+# 4. Figure 3E
+
+The red line per facet is the **population-level (fixed-effect) fit**, i.e.
+`re.form = NA` — region random intercepts are excluded so the line shown is the
+same slope reported in panel E.
+
+```{r figure, fig.width=8, fig.height=3}
+# Prediction grid spanning the observed ATAC range within each time point,
+# so lines are not extrapolated beyond the data.
+pred_grid <- do.call(rbind, lapply(levels(df_long$timepoint), function(tp) {
+  x <- df_long$atac_l2fc[df_long$timepoint == tp]
+  data.frame(timepoint = factor(tp, levels = levels(df_long$timepoint)),
+             atac_l2fc = seq(min(x, na.rm = TRUE), max(x, na.rm = TRUE),
+                             length.out = 100))
+}))
+
+pred_grid$ac_l2fc_pred <- predict(full, newdata = pred_grid, re.form = NA)
+
+# Annotation: slope, CI and n per facet
+annot <- panel_E
+annot$timepoint <- factor(annot$timepoint, levels = levels(df_long$timepoint))
+annot$label <- paste0("slope = ", annot$slope, "\n", annot$`95% CI`,
+                      "\nn = ", format(annot$n, big.mark = ","))
+
+p_facet <- ggplot(df_long, aes(x = atac_l2fc, y = ac_l2fc)) +
+  geom_point(size = 1, alpha = 0.4, shape = 21, color = "grey40") +
+  geom_line(data = pred_grid, aes(x = atac_l2fc, y = ac_l2fc_pred),
+            color = "firebrick", linewidth = 1) +
+  facet_wrap(~timepoint) +
+  labs(x = "ATAC log2FC (dTag/DMSO)", y = "H3K27ac log2FC (dTag/DMSO)",
+       title = "SNAI-bound distal regions - upregulated") +
+  theme_bw() +
+  theme(strip.background = element_blank())
+
+p_out <- p_facet +
+  geom_text(data = annot, aes(x = -0.3, y = 2, label = label),
+            inherit.aes = FALSE, size = 3, hjust = 0)
+
+p_out
+
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+ggsave(file.path(fig_dir, "Scatter_ATAC_k27_v4_mixedeffectmodel_comb.pdf"),
+       plot = p_out, height = 3, width = 8)
+```
+
+# 6. Session info
+
+```{r session}
+sessionInfo()
+```
