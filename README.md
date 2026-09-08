@@ -36,8 +36,11 @@ R markdown with DEseq of H3K27ac and ATAC data, and MA plots
 --- 06_Define_proximal_distal_v6.Rmd
 
 R markdown including processing of data to classify regions as promoter proximal or distal and make panels shown in Figures 2 and 3 and related supplemental figures.
-This includes the linear mixed effect model of ATAC vs H3K27ac log2FC.
 The data file containing all the processed information has been uploaded to this repo (data_v4.rds).
+
+--- 07_Mixed_effect_model.Rmd
+
+ATAC vs H3K27ac log2FC across dTAG time points — linear mixed-effects model
 
 ## Figure 4: TWIST1, NR2F1, TFAP2A ChIP analysis
 
