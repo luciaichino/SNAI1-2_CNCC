@@ -21,6 +21,10 @@ Counts at CNCC regulatory regions were calculated with bedtools coverage
 R markdown of correlation analysis between human and chimpanzee ChIP changes and SNAI2 motif changes
 
 ## Figure 2/3: SNAI1/2, H3K27ac, ATAC, analyses
+--- 04_SNAI_RNAseq_DESeq2_and_downstream_nopaths.Rmd
+R markdown with processing of RNA-seq data 
+
+
 
 --- 04_Define_proximal_distal_v6.Rmd
 R markdown including processing of data to classify regions as promoter proximal or distal and make panels shown in Figures 2 and 3 and related supplemental figures.
