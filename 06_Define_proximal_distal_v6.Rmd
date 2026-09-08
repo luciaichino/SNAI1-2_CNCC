@@ -696,150 +696,10 @@ export(motif_centers,
        format = "BED")
 ```
 
----
-
-# 10. ATAC vs H3K27ac log2FC at dTag time points
-linear mixed-effects model with region as a random effect
-
-```{r lmm-atac-vs-k27ac}
-
-# ── 1. Select regions and reshape to long format ─────────────────────────────
-# Universe: SNAI-bound distal regions (enhancer or other_distal) that are
-# differentially UP in H3K27ac or ATAC at ANY of the three timepoints.
-# The same region can therefore contribute up to 3 rows, which is exactly why
-# a random intercept per region is needed below.
-sel_alltp <- data %>%
-  dplyr::filter(
-    H3K27ac_UP_3h == 1 | ATAC_UP_3h == 1 |
-    H3K27ac_UP_1d == 1 | ATAC_UP_1d == 1 |
-    H3K27ac_UP_3d == 1 | ATAC_UP_3d == 1,
-    SNAI_peaks_all == "SNAI_bound",
-    classification %in% c("enhancer", "other_distal")
-  )
-
-# H3K27ac log2FCs: one column per timepoint -> one row per region x timepoint
-ac_long <- sel_alltp %>%
-  dplyr::select(region, classification, SNAI_peaks_all,
-                H3K27ac_3h_log2FC, H3K27ac_1d_log2FC, H3K27ac_3d_log2FC) %>%
-  pivot_longer(cols      = starts_with("H3K27ac_"),
-               names_to  = "timepoint",
-               values_to = "ac_l2fc") %>%
-  mutate(timepoint = gsub("H3K27ac_|_log2FC", "", timepoint))
-
-# Same for ATAC
-atac_long <- sel_alltp %>%
-  dplyr::select(region,
-                ATACdata_3h_log2FC, ATACdata_1d_log2FC, ATACdata_3d_log2FC) %>%
-  pivot_longer(cols      = starts_with("ATACdata_"),
-               names_to  = "timepoint",
-               values_to = "atac_l2fc") %>%
-  mutate(timepoint = gsub("ATACdata_|_log2FC", "", timepoint))
-
-# Pair the two marks on region + timepoint. inner_join drops any region missing
-# a value in either assay, so both columns are complete by construction.
-df_long <- inner_join(ac_long, atac_long, by = c("region", "timepoint")) %>%
-  mutate(
-    timepoint = factor(timepoint, levels = c("3h", "1d", "3d")),  # 3h = reference
-    region    = factor(region)
-  )
-
-# ── 2. Fit the two models and test the interaction ───────────────────────────
-# reduced: one common ATAC->H3K27ac slope, each timepoint gets its own intercept
-# full:    the slope itself is allowed to differ by timepoint (interaction term)
-# (1|region) absorbs the baseline responsiveness of each region, so the slopes
-# are not inflated by repeated measurement of the same loci.
-full    <- lmer(ac_l2fc ~ atac_l2fc * timepoint + (1 | region), data = df_long)
-reduced <- lmer(ac_l2fc ~ atac_l2fc + timepoint + (1 | region), data = df_long)
-
-# anova() on two lmer fits refits both with ML (not REML) and runs a likelihood
-# ratio test. A significant result means the coupling strengthens/weakens over time.
-lrt <- anova(reduced, full)
-lrt
-
-# ── 3. Per-timepoint slopes and pairwise comparisons ─────────────────────────
-trends <- emtrends(full, pairwise ~ timepoint, var = "atac_l2fc")
-
-slope_table <- as.data.frame(trends$emtrends) %>%
-  transmute(
-    timepoint = timepoint,
-    slope     = round(atac_l2fc.trend, 3),
-    CI_lower  = round(asymp.LCL, 3),
-    CI_upper  = round(asymp.UCL, 3),
-    `95% CI`  = paste0("[", CI_lower, ", ", CI_upper, "]")
-  ) %>%
-  dplyr::select(timepoint, slope, `95% CI`)
-
-slope_table
-
-# Pairwise slope differences (3h vs 1d, 3h vs 3d, 1d vs 3d), Tukey-adjusted.
-# p is rounded to 3 significant digits, so anything below ~1e-16 prints as 0;
-# p_report rewrites those as the conventional "< 2.2e-16".
-contrast_table <- as.data.frame(trends$contrasts) %>%
-  transmute(
-    contrast           = contrast,
-    `slope difference` = round(estimate, 3),
-    z                  = round(z.ratio, 2),
-    p                  = signif(p.value, 3)
-  ) %>%
-  mutate(
-    p_report = ifelse(p == 0,
-                      paste0("z = ", z, ", p < 2.2e-16"),
-                      paste0("z = ", z, ", p = ", p))
-  ) %>%
-  dplyr::select(-p)
-
-contrast_table
-
-write.csv(slope_table,
-          file.path(figures_dir, "slope_table.csv"),    row.names = FALSE)
-write.csv(contrast_table,
-          file.path(figures_dir, "contrast_table.csv"), row.names = FALSE)
-
-# ── 4. Faceted scatter with the fitted population-level lines ────────────────
-# Build a prediction grid spanning each timepoint's observed ATAC range, then
-# predict with re.form = NA so the line reflects the FIXED effects only
-# (i.e. the average region, not any individual random intercept).
-pred_grid <- df_long %>%
-  group_by(timepoint) %>%
-  summarise(min_x = min(atac_l2fc, na.rm = TRUE),
-            max_x = max(atac_l2fc, na.rm = TRUE),
-            .groups = "drop") %>%
-  rowwise() %>%
-  reframe(timepoint = timepoint,
-          atac_l2fc = seq(min_x, max_x, length.out = 100))
-
-pred_grid$ac_l2fc_pred <- predict(full, newdata = pred_grid, re.form = NA)
-
-# Slope + CI label, one per facet
-annot <- slope_table %>%
-  mutate(label = paste0("slope = ", slope, "\n", `95% CI`))
-
-p_facet <- ggplot(df_long, aes(x = atac_l2fc, y = ac_l2fc)) +
-  geom_point(size = 1, alpha = 0.4, shape = 21, color = "grey40") +
-  geom_line(data = pred_grid, aes(x = atac_l2fc, y = ac_l2fc_pred),
-            color = "firebrick", linewidth = 1) +
-  # NOTE: label position is hard-coded; adjust if the axis ranges change
-  geom_text(data = annot, aes(x = -0.3, y = 2.3, label = label),
-            inherit.aes = FALSE, size = 3, hjust = 0) +
-  facet_wrap(~ timepoint) +
-  labs(x = "ATAC log2FC (dTag/DMSO)",
-       y = "H3K27ac log2FC (dTag/DMSO)",
-       title = "SNAI-bound distal regions - upregulated") +
-  theme_bw() +
-  theme(strip.background = element_blank())
-
-p_facet
-
-ggsave(file.path(figures_dir, "Scatter_ATAC_k27_v4_mixedeffectmodel_comb.pdf"),
-       p_facet, height = 3, width = 8)
-```
-
-
-
 
 ---
 
-# 11. Density plots: H3K27ac enrichment across region subsets
+# 10. Density plots: H3K27ac enrichment across region subsets
 
 Compares baseline H3K27ac levels between all distal regions, SNAI-bound distal
 regions, and those that become UP at each time point (only SNAI-bound).
@@ -883,7 +743,7 @@ ggsave(file.path(figures_dir, "SNAI_enh_strength_dist_k2only.pdf"),
 
 ---
 
-# 12. Motif logos
+# 11. Motif logos
 
 ```{r motif-logos-snai2}
 # SNAI2 DBD motif (Jolma 2013) – used in main figures
