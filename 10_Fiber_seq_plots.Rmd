@@ -1,0 +1,724 @@
+---
+title: "Fiber-seq: nucleosome metaplot and merged-replicate clustering heatmap at SNAI2 motifs"
+author: ""
+date: "2026-05-18"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+<!--
+================================================================================
+ SCOPE OF THIS DOCUMENT
+================================================================================
+ Reduced to the two figures that go into the paper:
+
+   FIGURE 1  metaplot_SNAI2alldistmotifs_merger_reps_v7.pdf
+             Nucleosome-midpoint rate around all distal SNAI2 motifs,
+             DMSO vs dTag, replicates exp2 + exp3 pooled.
+
+   FIGURE 2  Heatmap_V5_mergedReps_plus_FC_SNAI2_K27acUPmotifs_
+             proportional_v2_presel80bp.pdf
+             Per-read nucleosome footprint heatmap for the K27ac-UP / log2FC-Q3
+             motif subset: merged DMSO | merged dTag | per-cluster
+             log2(dTag/DMSO) bars, faceted by k-means cluster.
+
+
+ Input : fibertools "centered" tables. One row = one sequencing read (fiber)
+         x one motif instance, with nucleosome / MSP / m6A calls already
+         expressed in coordinates relative to the motif centre (position 0).
+ Conditions: DMSO (control) vs dTag (3 h degron depletion of SNAI2).
+ Replicates: exp2 (r1+r2 merged upstream) and exp3.
+================================================================================
+-->
+
+
+
+# Setup
+
+## Libraries
+
+```{r setup-libraries, message=FALSE, warning=FALSE}
+# Core data wrangling
+library(data.table)   # fread(), fast in-place := operations
+library(dplyr)
+library(tidyr)        # separate_rows(), crossing(), pivot_*(), extract()
+library(purrr)        # imap(), map(), imap_dfr()
+
+# Plotting
+library(ggplot2)
+library(patchwork)    # wrap_plots() to compose the multi-panel figure
+library(ggrastr)      # rasterise() — keeps PDFs small despite ~10^5 geom_rects
+library(zoo)          # rollmean() for metaplot smoothing
+library(scales)       # pretty_breaks()
+
+# Matrix algebra for the occupancy matrix
+library(Matrix)       # sparseMatrix() before densifying for kmeans()
+
+# NOTE: the original script also loaded GenomicRanges, rtracklayer, tidyverse
+# and stats. None of their functions are actually called below, so they are
+# omitted here to keep the dependency list honest. Re-add if you extend the
+# analysis (e.g. rtracklayer::import() for BED/bigWig overlays).
+```
+
+## Configuration — ALL FILE PATHS LIVE HERE
+
+```{r config-paths}
+# =============================================================================
+# PATH INVENTORY  ††  THE ONLY PLACE IN THIS DOCUMENT WITH ABSOLUTE PATHS  ††
+# -----------------------------------------------------------------------------
+# Original literals, for your review before public release:
+#
+#  INPUT ROOTS
+#    exp2 : .../fibertools
+#    exp3 : .../fibertools
+#
+#  OUTPUT ROOT  
+#    .../fiber-seq/
+#
+#  8 INPUT FILES = {exp2, exp3} x {DMSO, 3hdTag} x {v7 all-distal motifs,
+#                  v6 K27acUP3h_K27Log2FCQ3 subset}
+#
+#  2 OUTPUT FILES (both written to FIG_DIR)
+#    metaplot_SNAI2alldistmotifs_merger_reps_v7.pdf
+#    Heatmap_V5_mergedReps_plus_FC_<figure_prefix>.pdf
+#
+# 
+# =============================================================================
+
+## ---- Roots ------------------------------------------------------------------
+DATA_ROOT_EXP2 <- ".../fibertools"
+DATA_ROOT_EXP3 <- ".../fibertools"
+
+FIG_DIR <- file.path(
+  "..."
+)
+
+## ---- Per-sample subdirectories ----------------------------------------------
+# exp2 was sequenced as two runs (r1, r2) that were merged upstream of this
+# script; exp3 is a single run. The directory name is repeated as the file-name
+# stem in the fibertools output convention, hence the two variables per sample.
+SAMPLE_DIRS <- list(
+  DMSO_exp2 = list(root = DATA_ROOT_EXP2, stem = "fiber_exp2_DMSO_r1ANDr2"),
+  dTag_exp2 = list(root = DATA_ROOT_EXP2, stem = "fiber_exp2_3hdTag_r1ANDr2"),
+  DMSO_exp3 = list(root = DATA_ROOT_EXP3, stem = "fiber_exp3_DMSO"),
+  dTag_exp3 = list(root = DATA_ROOT_EXP3, stem = "fiber_exp3_3hdTag")
+)
+
+# Builds <root>/<stem>/<stem>_<suffix>
+fibertools_file <- function(key, suffix) {
+  s <- SAMPLE_DIRS[[key]]
+  file.path(s$root, s$stem, paste0(s$stem, "_", suffix))
+}
+
+## ---- Input file sets ---------------------------------------------------------
+# Set A: v7 tables, ALL distal SNAI2 motifs. Used for FIGURE 1 (metaplot).
+#        24 columns — includes the FIRE calls.
+SUFFIX_V7_ALL_DISTAL <- "SNAI2motif_dist_v7_centered.txt"
+
+# Set B: v6 tables, distal SNAI2 motifs restricted to those at loci with H3K27ac
+#        UP at 3 h and in the top quartile (Q3) of K27ac log2FC.
+#        Used for FIGURE 2 (clustering heatmap). 22 columns — no FIRE calls.
+SUFFIX_V6_K27AC_Q3 <- "SNAI2motif_dist_v6_K27acUP3h_K27Log2FCQ3_centered.txt"
+
+PATHS <- list(
+  v7_all_distal = lapply(setNames(names(SAMPLE_DIRS), names(SAMPLE_DIRS)),
+                         fibertools_file, suffix = SUFFIX_V7_ALL_DISTAL),
+  v6_k27ac_q3   = lapply(setNames(names(SAMPLE_DIRS), names(SAMPLE_DIRS)),
+                         fibertools_file, suffix = SUFFIX_V6_K27AC_Q3),
+  fig_dir       = FIG_DIR
+)
+
+## ---- Sanity check ------------------------------------------------------------
+# Fails loudly at the top of the document rather than halfway through a chunk.
+check_paths <- function(paths, must_exist = TRUE) {
+  flat    <- unlist(paths[c("v7_all_distal", "v6_k27ac_q3")], use.names = TRUE)
+  missing <- flat[!file.exists(flat)]
+  if (length(missing) && must_exist) {
+    stop("Input file(s) not found:\n  ", paste(missing, collapse = "\n  "),
+         "\n\nEdit the roots in the `config-paths` chunk.", call. = FALSE)
+  }
+  if (!dir.exists(paths$fig_dir)) {
+    dir.create(paths$fig_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  invisible(TRUE)
+}
+
+# Set must_exist = FALSE if you want the document to knit on a machine that
+# does not have the raw data mounted.
+check_paths(PATHS, must_exist = TRUE)
+
+str(PATHS, max.level = 2)
+```
+
+## Column schemas
+
+```{r config-schemas}
+# fibertools "centered" tables ship WITHOUT a header, so column names are
+# assigned positionally. The two versions differ: v7 carries three extra FIRE
+# columns where v6 has a single unlabelled column. Getting these out of order
+# silently corrupts everything downstream, so they are defined once here.
+
+# --- v7 (24 columns) ---------------------------------------------------------
+FIBER_COLNAMES_V7 <- c(
+  "chrom",                   # contig of the motif instance
+  "centering_position",      # genomic coordinate of the motif centre (= 0 below)
+  "strand",                  # motif strand; coordinates already strand-corrected
+  "subset_sequence",
+  "reference_start", "reference_end",   # read alignment span, genomic
+  "query_name",              # read ID (NOT unique across motif instances)
+  "RG", "HP",                # read group; haplotype tag
+  "centered_query_start", "centered_query_end", "query_length",
+  "centered_m6a_positions", "m6a_qual",       # comma-separated
+  "centered_5mC_positions", "5mC_qual",       # comma-separated
+  "centered_nuc_starts", "centered_nuc_ends", # nucleosome footprints, CSV
+  "centered_msp_starts", "centered_msp_ends", # methyl-sensitive patches, CSV
+  "centered_fire_starts", "centered_fire_ends", "fire_qual",
+  "query_sequence"
+)
+
+# --- v6 (22 columns) ---------------------------------------------------------
+# Identical up to centered_msp_ends; then one column of unknown provenance
+# (kept as "unknown" — it is never read) and the sequence.
+FIBER_COLNAMES_V6 <- c(
+  "chrom", "centering_position", "strand", "subset_sequence",
+  "reference_start", "reference_end", "query_name", "RG", "HP",
+  "centered_query_start", "centered_query_end", "query_length",
+  "centered_m6a_positions", "m6a_qual", "centered_5mC_positions", "5mC_qual",
+  "centered_nuc_starts", "centered_nuc_ends",
+  "centered_msp_starts", "centered_msp_ends",
+  "unknown", "query_sequence"
+)
+```
+
+---
+
+# FIGURE 1 — Nucleosome midpoint metaplot
+
+All distal SNAI2 motifs. Replicates are pooled *before* averaging, so each
+fiber contributes equally and the replicate with more fibers contributes
+proportionally more. The `rep` column is carried through so you can switch to a
+mean-of-means (average within replicate first, then across replicates) if you
+prefer that weighting.
+
+```{r metaplot, fig.width=7.29, fig.height=4.51}
+# =============================================================================
+# Nucleosome midpoint metaplot around SNAI2 motifs
+# Merges two biological replicates (exp2, exp3) per condition (DMSO, dTag)
+# before computing per-fiber nucleosome midpoint density.
+# =============================================================================
+
+# ---- 0. Analysis parameters -------------------------------------------------
+WINDOW    <- 1000   # +/- bp around the motif that is analysed
+BIN_WIDTH <- 10     # bp per bin  -> 200 bins across the window
+SMOOTH_K  <- 5      # rolling-mean width in BINS (= 50 bp) applied after averaging
+
+# ---- 1. Load ----------------------------------------------------------------
+# One row = one fiber (read) x one motif instance.
+read_fiber_v7 <- function(path) {
+  dt <- fread(path)
+  stopifnot(ncol(dt) == length(FIBER_COLNAMES_V7))  # guard against schema drift
+  setnames(dt, FIBER_COLNAMES_V7)
+  dt
+}
+
+files <- list(
+  list(sample = "DMSO", rep = "exp2", path = PATHS$v7_all_distal$DMSO_exp2),
+  list(sample = "dTag", rep = "exp2", path = PATHS$v7_all_distal$dTag_exp2),
+  list(sample = "DMSO", rep = "exp3", path = PATHS$v7_all_distal$DMSO_exp3),
+  list(sample = "dTag", rep = "exp3", path = PATHS$v7_all_distal$dTag_exp3)
+)
+
+combined_df <- rbindlist(lapply(files, function(f) {
+  read_fiber_v7(f$path)[, `:=`(sample = f$sample, rep = f$rep)]
+}))
+
+# Unique fiber identifier. Row number is already unique across the merged
+# table, but making it an explicit column keeps downstream grouping
+# unambiguous (query_name alone is NOT unique — a read can span several motifs).
+combined_df[, unit_id := .I]
+
+# ---- 2. Explode nucleosome calls -> one row per midpoint --------------------
+# centered_nuc_starts / _ends are comma-separated strings of equal length per
+# fiber. separate_rows() unnests them in parallel, so element i of starts pairs
+# with element i of ends.
+midpoints_df <- combined_df %>%
+  filter(!is.na(centered_nuc_starts), !is.na(centered_nuc_ends)) %>%
+  separate_rows(centered_nuc_starts, centered_nuc_ends, sep = ",") %>%
+  filter(centered_nuc_starts != "", centered_nuc_ends != "") %>%   # trailing commas
+  mutate(
+    centered_nuc_starts = as.numeric(centered_nuc_starts),
+    centered_nuc_ends   = as.numeric(centered_nuc_ends),
+    nuc_midpoint        = (centered_nuc_starts + centered_nuc_ends) / 2
+  )
+
+# ---- 3. Per-fiber counts per bin, zero-filled -------------------------------
+bins <- seq(-WINDOW, WINDOW - BIN_WIDTH, by = BIN_WIDTH)
+
+per_unit_df <- midpoints_df %>%
+  filter(nuc_midpoint >= -WINDOW, nuc_midpoint < WINDOW) %>%
+  mutate(bin = floor(nuc_midpoint / BIN_WIDTH) * BIN_WIDTH) %>%   # left edge label
+  dplyr::count(sample, rep, unit_id, bin, name = "count")
+
+# CRITICAL for an unbiased denominator: every fiber must appear in every bin.
+# Fibers with no nucleosome anywhere in the window are dropped by the count
+# above, so they are re-introduced here as zeros. Without this the "mean per
+# fiber" would silently be a mean over occupied fibers only.
+all_units <- combined_df %>% distinct(sample, rep, unit_id)
+
+per_unit_df <- all_units %>%
+  tidyr::crossing(bin = bins) %>%
+  left_join(per_unit_df, by = c("sample", "rep", "unit_id", "bin")) %>%
+  mutate(count = tidyr::replace_na(count, 0))
+
+# ---- 4. Aggregate: mean rate +/- SEM across fibers, then smooth -------------
+# Note the order: average first, smooth second. Smoothing the SEM the same way
+# as the mean keeps the ribbon width comparable to the smoothed line, though it
+# is a display convenience rather than a rigorous CI for the smoothed estimate.
+agg_df <- per_unit_df %>%
+  group_by(sample, bin) %>%                     # replicates pooled here
+  summarise(
+    mean_rate = mean(count) / BIN_WIDTH,              # nucleosomes / fiber / bp
+    sem       = (sd(count) / sqrt(n())) / BIN_WIDTH,  # SEM across fibers
+    n_fibers  = n(),
+    .groups   = "drop"
+  ) %>%
+  group_by(sample) %>%
+  arrange(bin, .by_group = TRUE) %>%
+  mutate(
+    rollmean = zoo::rollmean(mean_rate, k = SMOOTH_K, fill = NA, align = "center"),
+    rollsem  = zoo::rollmean(sem,       k = SMOOTH_K, fill = NA, align = "center"),
+    lo       = rollmean - rollsem,
+    hi       = rollmean + rollsem
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(rollmean))   # drops the (SMOOTH_K - 1)/2 bins at each edge
+
+# ---- 5. Plot ----------------------------------------------------------------
+# The dotted lines at +/-85 bp mark roughly one nucleosome half-width from the
+# motif centre, i.e. where a nucleosome midpoint would sit if the nucleosome
+# edge abutted the motif.
+metaplot <- ggplot(agg_df, aes(x = bin, y = rollmean, color = sample, fill = sample)) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(xintercept = c(-85, 85), linetype = "dotted",
+             color = "black", alpha = 0.8) +
+  labs(
+    title = "Nucleosome midpoint rate around SNAI2 motifs (distal, exp2+exp3)",
+    x     = "Position relative to SNAI2 motif (bp)",
+    y     = "Nucleosomes per fiber per bp (mean \u00b1 SEM)"
+  ) +
+  # Analysed over +/-1000 bp but displayed over +/-650 bp: the outer bins are
+  # noisier because fewer reads span them.
+  coord_cartesian(xlim = c(-650, 650)) +
+  theme_bw()
+
+metaplot
+
+ggsave(
+  file.path(PATHS$fig_dir, "metaplot_SNAI2alldistmotifs_merger_reps_v7.pdf"),
+  plot = metaplot, width = 7.29, height = 4.51
+)
+```
+
+```{r metaplot-qc}
+# Quick reporting numbers for the figure legend: fibers per condition.
+agg_df %>%
+  group_by(sample) %>%
+  summarise(n_fibers = max(n_fibers), .groups = "drop")
+```
+
+---
+
+# FIGURE 2 — Merged-replicate clustering heatmap + fold change
+
+Motif subset: distal SNAI2 motifs at loci with H3K27ac up at 3 h, restricted to
+the top log2FC quartile (Q3).
+
+## Load the K27ac-Q3 tables
+
+```{r load-k27ac-q3}
+read_fiber_v6 <- function(path) {
+  dt <- fread(path)
+  stopifnot(ncol(dt) == length(FIBER_COLNAMES_V6))
+  setnames(dt, FIBER_COLNAMES_V6)
+  dt
+}
+
+# Variable names kept as in the original script so the `samples` list below
+# stays recognisable:
+#   *_all_k27ac_K27Q3        -> exp2 (r1+r2 merged)
+#   *_dist_K27ac_exp3_K27Q3  -> exp3
+DMSO_SNAI2_fibertools_all_k27ac_K27Q3      <- read_fiber_v6(PATHS$v6_k27ac_q3$DMSO_exp2)
+dTag_SNAI2_fibertools_all_k27ac_K27Q3      <- read_fiber_v6(PATHS$v6_k27ac_q3$dTag_exp2)
+DMSO_SNAI2_fibertools_dist_K27ac_exp3_K27Q3 <- read_fiber_v6(PATHS$v6_k27ac_q3$DMSO_exp3)
+dTag_SNAI2_fibertools_dist_K27ac_exp3_K27Q3 <- read_fiber_v6(PATHS$v6_k27ac_q3$dTag_exp3)
+
+sapply(
+  list(DMSO1 = DMSO_SNAI2_fibertools_all_k27ac_K27Q3,
+       dTag1 = dTag_SNAI2_fibertools_all_k27ac_K27Q3,
+       DMSO2 = DMSO_SNAI2_fibertools_dist_K27ac_exp3_K27Q3,
+       dTag2 = dTag_SNAI2_fibertools_dist_K27ac_exp3_K27Q3),
+  nrow
+)
+```
+
+## Build occupancy matrices and cluster
+
+All four samples are still loaded and clustered **jointly** — that is what makes
+the per-cluster fold change meaningful. The replicate merge happens only at the
+drawing step.
+
+```{r clustering, fig.width=6, fig.height=4}
+# ============================================================================
+# Fiber-seq clustering: per-read nucleosome occupancy around SNAI2 motifs
+#
+# v2: nucleosome footprints are SIZE-SELECTED (width >= NUC_MIN_WIDTH) at the
+#     parsing step, i.e. BEFORE the occupancy matrix is built and before
+#     k-means. Sub-threshold nucleosome calls therefore contribute neither to
+#     the clustering nor to the heatmaps. MSP calls are left untouched.
+# ============================================================================
+
+# ---- 0. Parameters ----------------------------------------------------------
+plot_window    <- 800    # +/- bp drawn in the heatmaps
+cluster_window <- 100    # +/- bp actually fed to k-means (the motif-proximal core)
+bin_width      <- 10     # bp per column of the occupancy matrix -> 20 columns
+k_val          <- 5      # number of k-means clusters
+NUC_MIN_WIDTH  <- 80     # bp; size selection applied BEFORE clustering
+
+snai_palette  <- c("#a50f15", "#fc8d59")     # the two replicate bars
+fig_dir       <- PATHS$fig_dir               # <- from the config chunk
+
+# NUC_MIN_WIDTH is baked into the filename, so changing the parameter cannot
+# silently overwrite an earlier figure. With the default 80 this resolves to
+# "SNAI2_K27acUPmotifs_proportional_v2_presel80bp".
+figure_prefix <- sprintf("SNAI2_K27acUPmotifs_proportional_v2_presel%dbp",
+                         NUC_MIN_WIDTH)
+
+samples <- list(
+  DMSO1 = DMSO_SNAI2_fibertools_all_k27ac_K27Q3,       # exp2 DMSO
+  dTag1 = dTag_SNAI2_fibertools_all_k27ac_K27Q3,       # exp2 dTag 3 h
+  DMSO2 = DMSO_SNAI2_fibertools_dist_K27ac_exp3_K27Q3, # exp3 DMSO
+  dTag2 = dTag_SNAI2_fibertools_dist_K27ac_exp3_K27Q3  # exp3 dTag 3 h
+)
+
+# Only used to fix factor level order; the per-sample colour palette from the
+# full script is not needed here because the merged panels use a single fill.
+sample_levels <- c("DMSO1", "dTag1", "DMSO2", "dTag2")
+
+# ---- 1. Per-sample matrix + footprint table ---------------------------------
+# Returns: mat        = binary read x bin nucleosome occupancy (size-selected)
+#          footprints = size-selected nucleosomes + all MSPs
+#          size_stats = how many nucleosome calls survived selection
+build_sample_matrix <- function(df, sample_name,
+                                cluster_window = 100,
+                                bin_width      = 10,
+                                nuc_min_width  = 80) {
+
+  dt <- as.data.table(df)
+
+  # query_name repeats across motif instances, so the row index is appended to
+  # make a genuinely unique read x motif key. The sample name is prefixed so
+  # IDs stay unique after the four matrices are rbind()-ed together.
+  dt[, unique_id := paste0(sample_name, "_", query_name, "_", .I)]
+
+  # Turn two parallel comma-separated columns into a long start/end table.
+  # strsplit + rep(..., lengths()) is much faster here than separate_rows().
+  parse_intervals <- function(starts_col, ends_col) {
+    s_list <- strsplit(starts_col, ",", fixed = TRUE)
+    e_list <- strsplit(ends_col,   ",", fixed = TRUE)
+    n_per  <- lengths(s_list)
+    data.table(
+      unique_id = rep(dt$unique_id, n_per),
+      start     = suppressWarnings(as.numeric(unlist(s_list))),
+      end       = suppressWarnings(as.numeric(unlist(e_list)))
+    )[!is.na(start) & !is.na(end)]   # drops empty fields from trailing commas
+  }
+
+  nucs <- parse_intervals(dt$centered_nuc_starts, dt$centered_nuc_ends)
+  msps <- parse_intervals(dt$centered_msp_starts, dt$centered_msp_ends)
+
+  nucs[, `:=`(width = end - start + 1, type = "Nucleosome", Sample = sample_name)]
+  msps[, `:=`(width = end - start + 1, type = "MSP",        Sample = sample_name)]
+
+  # ---- SIZE SELECTION (before matrix construction / clustering) -------------
+  # Removes short "nucleosome" calls that are more likely to be subnucleosomal
+  # or mis-segmented. Doing it here rather than at plotting time means the
+  # k-means partition itself is defined on the filtered signal.
+  n_nuc_total <- nrow(nucs)
+  nucs        <- nucs[width >= nuc_min_width]
+  size_stats  <- data.table(
+    Sample    = sample_name,
+    n_total   = n_nuc_total,
+    n_kept    = nrow(nucs),
+    frac_kept = if (n_nuc_total > 0) nrow(nucs) / n_nuc_total else NA_real_
+  )
+
+  footprints <- rbind(nucs, msps)   # MSPs kept unfiltered, for optional overlays
+
+  read_ids  <- dt$unique_id
+  n_reads   <- length(read_ids)
+  n_bins    <- (2 * cluster_window) %/% bin_width
+  col_names <- as.character(seq(-cluster_window, cluster_window - bin_width,
+                                by = bin_width))
+
+  # Only nucleosomes overlapping the clustering window matter for the matrix.
+  nucs_w <- nucs[end >= -cluster_window & start < cluster_window]
+
+  # Edge case: a sample with nothing in the window still needs a conformable
+  # all-zero matrix, otherwise the rbind() in step 2 fails.
+  if (nrow(nucs_w) == 0) {
+    mat <- matrix(0L, n_reads, n_bins, dimnames = list(read_ids, col_names))
+    return(list(mat = mat, footprints = footprints, size_stats = size_stats))
+  }
+
+  # Clip footprints to the window, then convert bp -> 1-based column indices.
+  nucs_w[, `:=`(s = pmax(start, -cluster_window), e = pmin(end, cluster_window - 1))]
+  nucs_w[, `:=`(
+    sb = (floor(s / bin_width) * bin_width + cluster_window) %/% bin_width + 1L,
+    eb = (floor(e / bin_width) * bin_width + cluster_window) %/% bin_width + 1L
+  )]
+  nucs_w[, row_idx := match(unique_id, read_ids)]
+  nucs_w[, nuc_id  := .I]
+
+  # One row per (read, bin) covered by a nucleosome.
+  expanded <- nucs_w[, .(col = seq.int(sb, eb)), by = .(row_idx, nuc_id)]
+
+  smat <- Matrix::sparseMatrix(
+    i = expanded$row_idx, j = expanded$col, x = 1,
+    dims = c(n_reads, n_bins)
+  )
+  # sparseMatrix() SUMS duplicate (i, j) entries, so two nucleosomes touching
+  # the same bin on the same read would give 2. Cap at 1 to keep it binary.
+  smat@x <- pmin(smat@x, 1)
+
+  # kmeans() needs a dense matrix; the clustering window is only 20 columns
+  # wide, so densifying here is cheap.
+  mat <- as.matrix(smat)
+  storage.mode(mat) <- "integer"
+  rownames(mat) <- read_ids
+  colnames(mat) <- col_names
+
+  list(mat = mat, footprints = footprints, size_stats = size_stats)
+}
+
+all_data <- imap(samples, ~ build_sample_matrix(
+  .x, .y,
+  cluster_window = cluster_window,
+  bin_width      = bin_width,
+  nuc_min_width  = NUC_MIN_WIDTH
+))
+
+# QC: fraction of nucleosome calls surviving size selection, per sample.
+# These should be similar across DMSO and dTag; a large asymmetry would mean
+# the filter itself is driving condition differences.
+size_report <- rbindlist(map(all_data, "size_stats"))
+print(size_report)
+
+# ---- 2. Joint k-means clustering (on size-selected occupancy) ---------------
+# All four samples are clustered TOGETHER so cluster identity is comparable
+# across conditions; the condition effect is then read out as a shift in the
+# proportion of reads per cluster (step 5), not as a change in cluster shape.
+master_mat <- do.call(rbind, map(all_data, "mat"))
+
+# Reads with no >=NUC_MIN_WIDTH nucleosome in the +/-100 bp window are all-zero
+# rows; they are retained and will fall into the lowest-occupancy cluster.
+cat(sprintf("All-zero reads in clustering window: %d / %d (%.1f%%)\n",
+            sum(rowSums(master_mat) == 0), nrow(master_mat),
+            100 * mean(rowSums(master_mat) == 0)))
+
+set.seed(42)   # kmeans is stochastic — the seed makes cluster labels reproducible
+km <- kmeans(master_mat, centers = k_val, nstart = 10, iter.max = 100)
+
+# k-means labels are arbitrary. Relabel 1..k in ascending mean occupancy so
+# cluster 1 is always the most open and cluster k the most nucleosome-dense,
+# making figures comparable across re-runs and across parameter settings.
+clust_signal <- tapply(rowMeans(master_mat), km$cluster, mean)
+relabel      <- setNames(rank(clust_signal, ties.method = "first"),
+                         names(clust_signal))
+new_cluster  <- as.integer(relabel[as.character(km$cluster)])
+
+# Recover Sample and read_id from the composite unique_id. Anchored alternation
+# over the known sample names, so read IDs containing underscores are safe.
+sample_regex <- paste0("^(", paste(names(samples), collapse = "|"), ")_(.+)$")
+
+cluster_assignments <- data.frame(
+  unique_id = names(km$cluster),
+  cluster   = factor(new_cluster, levels = seq_len(k_val))
+) %>%
+  tidyr::extract(unique_id, into = c("Sample", "read_id"),
+                 regex = sample_regex, remove = FALSE)
+
+stopifnot(!anyNA(cluster_assignments$Sample))   # regex must match every row
+
+# ---- 3. Footprints + cluster assignments ------------------------------------
+# Nucleosomes in this table are already size-selected, so footprint_type just
+# labels the two footprint classes.
+all_footprints_df <- imap_dfr(all_data, ~ .x$footprints)
+
+plot_df <- all_footprints_df %>%
+  # inner_join drops footprints from reads that were not clustered (there
+  # should be none — a mismatch here means the unique_id scheme broke).
+  inner_join(cluster_assignments %>% select(unique_id, cluster), by = "unique_id") %>%
+  mutate(footprint_type = ifelse(type == "Nucleosome",
+                                 sprintf("Nucleosome (\u2265%dbp)", NUC_MIN_WIDTH),
+                                 "MSP (open)")) %>%
+  filter(end >= -plot_window, start < plot_window)
+
+nuc_label <- sprintf("Nucleosome (\u2265%dbp)", NUC_MIN_WIDTH)
+
+# Reads per cluster, pooled across samples. Reported as QC only: the
+# proportional facet heights in the figure come from facet_grid(space = "free"),
+# not from this table.
+reads_per_cluster <- cluster_assignments %>%
+  dplyr::count(cluster, name = "n_reads") %>%
+  arrange(as.integer(as.character(cluster)))
+
+print(reads_per_cluster)
+
+# ---- 4. Nucleosome-only footprint table for the heatmap ---------------------
+plot_xlim <- c(-plot_window, plot_window)
+motif_pos <- 0     # coordinates are motif-centred by construction
+
+# The per-sample local_index of the full script is not computed here: the
+# merged panels re-derive their own y-positions over the pooled replicate set
+# (see make_merged_panel), so only the factor levels matter at this stage.
+plot_df_nuc <- plot_df %>%
+  filter(footprint_type == nuc_label) %>%      # heatmaps show nucleosomes only
+  mutate(
+    Sample  = factor(Sample,  levels = sample_levels),
+    cluster = factor(cluster, levels = as.character(seq_len(k_val)))
+  )
+```
+
+## Fold-change bar panel
+
+```{r bar-panel, fig.width=3, fig.height=8}
+# The quantitative claim of the figure: does depletion redistribute reads
+# between occupancy clusters, and does it do so in both replicates?
+cluster_stats <- cluster_assignments %>%
+  dplyr::count(Sample, cluster, name = "n_reads") %>%
+  group_by(Sample) %>%
+  mutate(percent = 100 * n_reads / sum(n_reads)) %>%   # within-sample composition
+  ungroup()
+
+log2_df <- cluster_stats %>%
+  select(Sample, cluster, percent) %>%
+  pivot_wider(names_from = Sample, values_from = percent) %>%
+  mutate(
+    `Rep 1 (dTag/DMSO)` = log2(dTag1 / DMSO1),
+    `Rep 2 (dTag/DMSO)` = log2(dTag2 / DMSO2)
+  ) %>%
+  select(cluster, `Rep 1 (dTag/DMSO)`, `Rep 2 (dTag/DMSO)`) %>%
+  pivot_longer(
+    cols      = c(`Rep 1 (dTag/DMSO)`, `Rep 2 (dTag/DMSO)`),
+    names_to  = "Replicate_Pair",
+    values_to = "Log2Ratio"
+  )
+
+print(log2_df)
+
+bar_panel <- ggplot(log2_df,
+                    aes(x = Log2Ratio, y = Replicate_Pair, fill = Replicate_Pair)) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", linewidth = 0.4) +
+  geom_col(width = 0.7, color = "black", linewidth = 0.2) +
+  # Same faceting as the heatmaps so bars line up row-wise with their cluster.
+  facet_grid(cluster ~ ., scales = "free_y", space = "free", switch = "y") +
+  scale_fill_manual(values = snai_palette) +
+  scale_x_continuous(breaks = scales::pretty_breaks(n = 3)) +
+  labs(x = "Log2(dTag / DMSO)", y = NULL, fill = NULL, title = "Fold change") +
+  theme_classic() +
+  theme(
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    panel.spacing     = unit(0, "lines"),
+    strip.background  = element_blank(),
+    strip.text.y.left = element_text(angle = 0, size = 7, face = "bold",
+                                     margin = margin(r = 4, l = 2)),
+    panel.border      = element_blank(),
+    legend.position   = "bottom",
+    plot.title        = element_text(size = 10)
+  )
+```
+
+## Assemble: merged DMSO | merged dTag | log2FC bars
+
+```{r heatmap-merged-reps, fig.width=8, fig.height=8}
+# Replicates collapsed within condition, so the visual comparison is a single
+# DMSO column against a single dTag column. The bar panel still shows the two
+# replicates separately — that is where reproducibility is judged.
+make_merged_panel <- function(samples_to_merge, merged_name, fill_col) {
+  df_merged <- plot_df_nuc %>%
+    dplyr::filter(Sample %in% samples_to_merge) %>%
+    arrange(cluster, unique_id) %>%
+    group_by(cluster) %>%
+    # y-position within each cluster block, over the POOLED replicate set.
+    # Reads are ordered by unique_id: arbitrary but stable. Change the
+    # arrange() key above if you want reads sorted by footprint position.
+    mutate(local_index = as.numeric(factor(unique_id, levels = unique(unique_id)))) %>%
+    ungroup()
+
+  ggplot(df_merged) +
+    # rasterise() flattens the tens of thousands of rectangles into a bitmap
+    # layer; without it the PDF is unopenable. Axes and text stay vector.
+    rasterise(
+      geom_rect(aes(xmin = pmax(start, plot_xlim[1]),
+                    xmax = pmin(end,   plot_xlim[2]),
+                    ymin = local_index - 0.45,
+                    ymax = local_index + 0.45),
+                fill = fill_col, color = NA),
+      dpi = 150, dev = "ragg_png"
+    ) +
+    # space = "free" makes facet height proportional to reads per cluster.
+    facet_grid(cluster ~ ., scales = "free_y", space = "free", switch = "y") +
+    coord_cartesian(xlim = plot_xlim) +
+    geom_vline(xintercept = motif_pos, linetype = "dashed",
+               linewidth = 0.6, alpha = 0.7, color = "black") +
+    theme_classic() +
+    theme(
+      axis.text.y       = element_blank(),   # individual reads are unlabelled
+      axis.ticks.y      = element_blank(),
+      axis.line         = element_blank(),
+      panel.spacing     = unit(0, "lines"),  # clusters read as one stacked block
+      strip.background  = element_blank(),
+      strip.text.y.left = element_text(angle = 0, size = 7, face = "bold",
+                                       margin = margin(r = 4, l = 2)),
+      panel.border      = element_blank()
+    ) +
+    labs(title = merged_name, y = NULL, x = NULL)
+}
+
+p_dmso_merged <- make_merged_panel(c("DMSO1", "DMSO2"), "DMSO (merged)", "coral4")
+p_dtag_merged <- make_merged_panel(c("dTag1", "dTag2"), "dTag (merged)", "coral4")
+
+merged_combined <- wrap_plots(
+  list(p_dmso_merged, p_dtag_merged, bar_panel),
+  nrow = 1
+) +
+  plot_layout(widths = c(1, 1, 0.5)) +   # bar panel is half-width
+  plot_annotation(
+    title = paste("Merged replicates + per-cluster fold change:", figure_prefix)
+  )
+
+merged_combined
+
+# cairo_pdf handles the UTF-8 "≥" in the labels; the default pdf() device will
+# error or drop the glyph.
+ggsave(file.path(fig_dir, paste0("Heatmap_V5_mergedReps_plus_FC_", figure_prefix, ".pdf")),
+       plot = merged_combined, width = 8, height = 8, device = cairo_pdf)
+```
+
+---
+
+# Session info
+
+```{r session-info}
+# Recorded for reproducibility — include the knitted HTML or this block when
+# the code is deposited alongside the paper.
+sessionInfo()
+```
