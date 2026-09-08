@@ -44,16 +44,16 @@ ATAC vs H3K27ac log2FC across dTAG time points — linear mixed-effects model
 
 ## Figure 4: TWIST1, NR2F1, TFAP2A ChIP analysis
 
---- 07_Fig4_analysis_TFs_motifsdist_v5_allpeaks.Rmd
+--- 08_Fig4_analysis_TFs_motifsdist_v5_allpeaks.Rmd
 
 R markdown including analysis to generate the kernel smoothened plots of TF activators ChIP-seq foldchanges relative to distance between activator motif and SNAI1/2 motif (Figure 4).
 
---- 08_Fig4_linear_model_v2.Rmd
+--- 09_Fig4_linear_model_v2.Rmd
 
 R markdown for linear model predicting H3K27ac change based on TF binding changes (DMSO vs dTag)
 
 ## Figure 5 and 7: Fiber-seq and DAF-seq analyses
---- 09_Fiber_seq_plots.Rmd
+--- 10_Fiber_seq_plots.Rmd
 
 Code for plotting Fiber-seq data (metaplot and heatmap)
 
