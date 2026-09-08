@@ -68,3 +68,23 @@ Nucleosome clustering analysis and TF footprint analysis DAFseq data
 codependency analysis enhancers 2 and 3 DAF-seq data
 
 
+## ChromBPnet analysis (Figures 1, S1, 4, S3)
+
+run_modisco.py
+run_conversion.sh
+relaxed_modisco.sh
+generate_nonpeaks.sh
+finemo.sh
+extract_cwms.sh
+extract_cwms.py
+convert_chrombpnet_h5_to_npz.py
+chrombpnet_train_snail.sh
+chrombpnet_train_fold_validation.sh
+20_curate_cncc_regions.Rmd
+21_curate_motifs.Rmd
+22_custom_sequence_generation.Rmd
+23_predict_motif_effects.ipynb
+
+## Evolutionary constraint (Figure S1)
+
+
