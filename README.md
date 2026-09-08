@@ -57,7 +57,14 @@ R markdown for linear model predicting H3K27ac change based on TF binding change
 
 Code for plotting Fiber-seq data (metaplot and heatmap)
 
+--- 11_DAFseq_plots.Rmd
+
+Nucleosome clustering analysis and TF footprint analysis DAFseq data
+
 ## Figure 6: DAF-seq codependency analysis
 
+--- 12_DAFseq_codependency.Rmd
+
+codependency analysis enhancers 2 and 3 DAF-seq data
 
 
