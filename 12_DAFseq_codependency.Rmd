@@ -1,0 +1,2074 @@
+---
+title: "Fiber-level summit co-dependency — ENH2 and ENH3"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE,
+                      fig.width = 10, fig.height = 7, dev = "png", dpi = 200)
+```
+
+<!--
+================================================================================
+WHAT THIS DOCUMENT DOES
+================================================================================
+Question: on an individual chromatin fiber, is accessibility (an overlapping
+MSP) at one enhancer summit independent of accessibility at another summit in
+the same enhancer?
+
+  codependency = observed co-accessibility - expected under independence
+               = P(acc1 & acc2) - P(acc1) * P(acc2)
+
+  > 0  the two summits open together more often than chance (cooperative)
+  = 0  independent
+  < 0  mutually exclusive / anti-correlated
+
+--------------------------------------------------------------------------------
+DESIGN DECISIONS BAKED IN (all three matter for correctness)
+--------------------------------------------------------------------------------
+  (1) COMMON FIBER POPULATION. Marginals P(acc1), P(acc2) are computed on
+      exactly the same fibers as the joint P(acc1 & acc2), so `observed` and
+      `expected` are commensurable. fiber_set = "all_summits" (default)
+      restricts once, up front, to fibers spanning every summit of that
+      enhancer -- one population for the whole enhancer, so pairs are
+      comparable to each other as well. fiber_set = "pair" uses the per-pair
+      spanning-both population instead (more fibers per pair, but marginals
+      differ between pairs).
+
+  (2) PER REPLICATE, THEN STRATIFIED POOLING. Everything is computed separately
+      per Sample. Replicates are combined with a Cochran-Mantel-Haenszel test
+      stratified by replicate, NOT by pooling fibers -- pooling fibers across
+      replicates with different marginal accessibility can invert the apparent
+      association (Simpson's paradox).
+
+  (3) FISHER TEST ON THE 2x2 TABLE.
+                        acc2 = TRUE   acc2 = FALSE
+        acc1 = TRUE         n11            n10
+        acc1 = FALSE        n01            n00
+      `expected = p1 * p2` is derived from this table's own margins, so
+      H0: independence IS H0: observed = expected. The Fisher p-value is
+      therefore the p-value for "observed differs from expected", and the odds
+      ratio is the accompanying effect size. (A test treating `expected` as a
+      fixed external constant would be wrong: it is estimated from the same
+      fibers and carries its own sampling error.)
+
+--------------------------------------------------------------------------------
+FLOW
+--------------------------------------------------------------------------------
+  0   CONFIG -- file paths, enhancers, samples, parameters (edit only this)
+  1   BED parser + data loading
+  2   Marginal accessibility per summit
+  3   Tetrachoric correlation (threshold-invariant sensitivity measure)
+      Per-replicate co-dependency (2x2 -> obs / exp / Fisher / bootstrap)
+  4   Mantel-Haenszel pooling, Woolf homogeneity, DMSO-vs-dTag (ROR)
+  5   Plot functions
+  6   RUN -- one pass per enhancer
+  7   MAIN FIGURES
+        <label>_codep_oddsratio_groups_min<w>.pdf     (forest, pooled OR)
+        <label>_codep_triangles_colouronly_min<w>.pdf (LD-style triangles)
+  8   COMBINED SUMMARY WORKBOOK (both enhancers, one file)
+  9   Optional supplementary figures + MSP-width sweep (off by default)
+
+--------------------------------------------------------------------------------
+OUTPUTS
+--------------------------------------------------------------------------------
+  FIG_DIR    ENH2_codep_oddsratio_groups_min100.pdf
+             ENH2_codep_triangles_colouronly_min100.pdf
+             ENH3_codep_oddsratio_groups_min100.pdf
+             ENH3_codep_triangles_colouronly_min100.pdf
+  TABLE_DIR  ENH2_ENH3_codependency_metrics_min100.xlsx
+================================================================================
+-->
+
+# 0. Config
+
+Everything that should ever need editing lives in this section. File paths
+first, then the enhancer definitions, then the analysis parameters.
+
+```{r config-paths}
+# =============================================================================
+# 0a. FILE PATHS
+# =============================================================================
+
+# Root of the fiberHMM results tree. Every sample lives in
+#   <MSP_ROOT>/<run_id>/fiberHMM_v2.9.7/<run_id>.recalled_msp.bed
+MSP_ROOT       <- ".../min3/results"
+FIBERHMM_SUBDIR <- "fiberHMM_v2.9.7"
+
+# Where figures and the metrics workbook are written.
+FIG_DIR   <- "..."
+TABLE_DIR <- FIG_DIR
+
+dir.create(FIG_DIR,   showWarnings = FALSE, recursive = TRUE)
+dir.create(TABLE_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# run_id -> full path to that sample's recalled MSP BED.
+.msp_path <- function(run_id) {
+  file.path(MSP_ROOT, run_id, FIBERHMM_SUBDIR, paste0(run_id, ".recalled_msp.bed"))
+}
+
+# Sample library. Names on the left are the `Sample` labels used everywhere
+# downstream (and parsed for "repN" in figure labels); values are run_ids.
+MSP_FILES <- c(
+  "SNAI_rep1_DMSO5min"   = .msp_path("SNAI1FVSNAI2KO_rep1_DMSO5min"),
+  "SNAI_rep2_DMSO5min"   = .msp_path("SNAI1FVSNAI2KO_rep2_DMSO5min"),
+  "SNAI_rep1_dTag5min"   = .msp_path("SNAI1FVSNAI2KO_rep1_dTag5min"),
+  "SNAI_rep2_dTag5min"   = .msp_path("SNAI1FVSNAI2KO_rep2_dTag5min"),
+  "TWIST1_rep1_DMSO5min" = .msp_path("TWIST1FV_rep1_DMSO5min"),
+  "TWIST1_rep2_DMSO5min" = .msp_path("TWIST1FV_rep2_DMSO5min"),
+  "TWIST1_rep1_dTag5min" = .msp_path("TWIST1FV_rep1_dTag5min"),
+  "TWIST1_rep2_dTag5min" = .msp_path("TWIST1FV_rep2_dTag5min")
+)
+```
+
+```{r config-samples}
+# =============================================================================
+# 0b. SAMPLE GROUPS
+# =============================================================================
+
+# group label -> Samples. The order of this list is the panel / axis order in
+# every figure, for any enhancer that uses the group.
+SAMPLE_GROUPS <- list(
+  "SNAI1-FNV DMSO" = c("SNAI_rep1_DMSO5min",   "SNAI_rep2_DMSO5min"),
+  "SNAI1-FNV dTag" = c("SNAI_rep1_dTag5min",   "SNAI_rep2_dTag5min"),
+  "TWIST1-FV DMSO" = c("TWIST1_rep1_DMSO5min", "TWIST1_rep2_DMSO5min"),
+  "TWIST1-FV dTag" = c("TWIST1_rep1_dTag5min", "TWIST1_rep2_dTag5min")
+)
+
+GROUP_COLOURS <- c("SNAI1-FNV DMSO" = "#a83a1b",
+                   "SNAI1-FNV dTag" = "#d6957f",
+                   "TWIST1-FV DMSO" = "#1b6ca8",
+                   "TWIST1-FV dTag" = "#7fb2d6")
+
+# group -> cell line + treatment. Drives the DMSO-vs-dTag comparison: the two
+# groups to be contrasted must share a `line` value.
+GROUP_META <- tibble::tribble(
+  ~group,            ~line,       ~treatment,
+  "SNAI1-FNV DMSO",  "SNAI1-FNV", "DMSO",
+  "SNAI1-FNV dTag",  "SNAI1-FNV", "dTag",
+  "TWIST1-FV DMSO",  "TWIST1-FV", "DMSO",
+  "TWIST1-FV dTag",  "TWIST1-FV", "dTag"
+)
+
+REF_TREATMENT <- "DMSO"   # denominator of the ratio of odds ratios
+```
+
+```{r config-enhancers}
+# =============================================================================
+# 0c. ENHANCERS
+# =============================================================================
+# One entry per enhancer. `summits` must be 1-BASED positions (what IGV and the
+# UCSC search box show) -- see the coordinate note in section 1. `groups` names
+# which entries of SAMPLE_GROUPS this enhancer is analysed in; the two
+# enhancers deliberately use different sample sets.
+
+ENHANCERS <- list(
+  ENH2 = list(
+    chrom   = "chr11",
+    summits = c(summit1 = 12319212,
+                summit2 = 12319580,
+                summit3 = 12319893),
+    groups  = c("SNAI1-FNV DMSO", "SNAI1-FNV dTag",
+                "TWIST1-FV DMSO", "TWIST1-FV dTag")
+  ),
+  ENH3 = list(
+    chrom   = "chr20",
+    summits = c(summit1 = 57258315,
+                summit2 = 57259335),
+    groups  = c("SNAI1-FNV DMSO", "SNAI1-FNV dTag")
+  )
+)
+```
+
+```{r config-params}
+# =============================================================================
+# 0d. ANALYSIS PARAMETERS
+# =============================================================================
+
+# Minimum MSP width for the main figures. Filters MSPs, never fibers, so the
+# analysis population (and therefore n_fibers) is unaffected by it.
+MIN_WIDTH <- 100
+
+# Fiber population: "all_summits" (one common population per enhancer, so pairs
+# are mutually comparable) or "pair" (per-pair spanning-both population).
+FIBER_SET <- "all_summits"
+
+# Replicate x pair combinations below this are flagged `low_fibers`.
+MIN_FIBERS <- 20
+
+# Bootstrap draws for the percentile CI on obs-exp (0 = skip).
+N_BOOT <- 2000
+
+# Multiple-testing correction. Scope "group" adjusts within each sample group,
+# within each enhancer -- the groups are separate experiments and the two
+# enhancers are separate analyses, so nothing is adjusted across those.
+P_ADJUST_METHOD <- "BH"
+P_ADJUST_SCOPE  <- "group"
+
+# Tolerances for the tetrachoric direction check (section 4b). A comparison in
+# which neither measure moves appreciably carries no directional information,
+# so it is recorded as NA rather than being scored as agreement or as a
+# contradiction. RHO_TOL is on the correlation scale; OR_TOL is a fold change
+# in the odds ratio.
+RHO_TOL <- 0.01
+OR_TOL  <- 1.05
+
+# Supplementary outputs: numbered triangles, per-replicate dotplot,
+# observed-vs-expected bars, and the MSP-width sensitivity sweep.
+# FALSE = only the two main figures + the combined workbook are produced.
+MAKE_SUPPLEMENTARY <- FALSE
+WIDTH_SWEEP <- c(none = NA, `100` = 100, `150` = 150, `200` = 200, `250` = 250)
+
+# Figure labels contain "≥" and a Unicode minus; cairo renders those correctly.
+# Fall back to the base pdf device if this R build has no cairo support.
+PDF_DEV <- if (isTRUE(capabilities("cairo"))) grDevices::cairo_pdf else grDevices::pdf
+
+# Bootstrap reproducibility. The seed is re-set at the START of each enhancer
+# (see run_enhancer), not once for the whole document -- otherwise the second
+# enhancer would inherit whatever RNG state the first one left behind, and its
+# bootstrap CIs would change if you added, removed or reordered enhancers.
+BOOT_SEED <- 1
+```
+
+```{r deps, message=FALSE}
+# =============================================================================
+# 0e. DEPENDENCIES
+# =============================================================================
+library(dplyr)
+library(tidyr)
+library(readr)       # read_fiberhmm_bed() uses read_lines() / read_tsv()
+library(tibble)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(ggpubr)      # ggarrange
+library(openxlsx)    # metrics workbook
+library(scales)
+
+# base R only gained %||% in 4.4; define it unconditionally so the code runs on
+# older installs too.
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# fiberHMM BED lines are long (many blocks per read); readr's default
+# connection buffer truncates them, which shows up as bogus field counts.
+Sys.setenv("VROOM_CONNECTION_SIZE" = 500072)
+```
+
+```{r config-check}
+# Fail immediately on a malformed config rather than three chunks later.
+stopifnot(
+  length(ENHANCERS) >= 1,
+  !is.null(names(ENHANCERS)), !anyDuplicated(names(ENHANCERS)),
+  !anyDuplicated(names(MSP_FILES)),
+  setequal(GROUP_META$group, names(SAMPLE_GROUPS)),
+  all(names(SAMPLE_GROUPS) %in% names(GROUP_COLOURS)),
+  all(unlist(SAMPLE_GROUPS, use.names = FALSE) %in% names(MSP_FILES)),
+  REF_TREATMENT %in% GROUP_META$treatment
+)
+
+for (lab in names(ENHANCERS)) {
+  e <- ENHANCERS[[lab]]
+  stopifnot(
+    length(e$summits) >= 2,                       # need >= 1 pair
+    !is.null(names(e$summits)), !any(is.na(e$summits)),
+    !anyDuplicated(names(e$summits)),
+    length(e$chrom) == 1,
+    all(e$groups %in% names(SAMPLE_GROUPS))
+  )
+}
+
+# Only the samples some enhancer actually needs are loaded.
+SAMPLES_USED <- unique(unlist(SAMPLE_GROUPS[unique(unlist(
+  lapply(ENHANCERS, `[[`, "groups")))], use.names = FALSE))
+message("Enhancers: ", paste(names(ENHANCERS), collapse = ", "),
+        " | samples to load: ", length(SAMPLES_USED))
+```
+
+# 1. BED parser and data loading
+
+```{r parser-fn}
+# 13 standard columns written by fiberHMM v2.9.7 footprint BEDs (no TF score
+# columns). 15-column TF files use the extended set built inline below.
+BED_COLS_13 <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+                 "thickStart", "thickEnd", "itemRgb", "blockCount",
+                 "blockSizes", "chromStarts", "blockRgb")
+
+BED_COLS_15 <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+                 "thickStart", "thickEnd", "itemRgb", "blockCount",
+                 "blockSizes", "chromStarts", "blockTq", "blockEl", "blockEr")
+
+# NOTE ON COORDINATES -- read this before setting SUMMITS.
+# This parser converts everything out of BED's 0-based half-open space and into
+# 1-based inclusive coordinates:
+#   reads      read_start = chromStart + 1L
+#              read_end   = chromEnd
+#   footprints fp_start   = chromStart + chromStarts + 1L
+#              fp_end     = chromStart + chromStarts + blockSizes
+# Both tables are therefore 1-based inclusive, and the overlap test used
+# throughout this document -- `start <= pos & end >= pos` -- is exactly right,
+# with no off-by-one. The consequence: SUMMITS must be given in 1-based
+# coordinates. If you are pulling summits out of a MACS narrowPeak, add 1.
+read_fiberhmm_bed <- function(path) {
+  lines    <- readr::read_lines(path)
+  n_fields <- stringr::str_count(lines, "\t") + 1
+
+  # auto-detect format: 13 cols = v2.9.7 footprint, 15 cols = older tf format
+  expected <- as.integer(names(which.max(table(n_fields))))
+  if (!expected %in% c(13L, 15L)) {
+    warning(sprintf("%s: unexpected field count %d", path, expected))
+  }
+  cols_to_use <- if (expected == 15L) BED_COLS_15 else BED_COLS_13
+
+  # Malformed rows (the blockEl/blockEr fusion writer bug) are dropped, which
+  # is why anything downstream must join on read_name and never positionally.
+  bad <- which(n_fields != expected)
+  if (length(bad) > 0) {
+    warning(sprintf("%s: %d malformed row(s) dropped (line numbers: %s)",
+                    path, length(bad), paste(utils::head(bad, 10), collapse = ", ")))
+    lines <- lines[-bad]
+  }
+
+  raw <- readr::read_tsv(
+    I(paste(lines, collapse = "\n")),
+    col_names = cols_to_use,
+    col_types = readr::cols(.default = readr::col_character(),
+                            chromStart = "i", chromEnd = "i",
+                            score      = "i", thickStart = "i",
+                            thickEnd   = "i", blockCount = "i")
+  )
+
+  reads_tbl <- raw %>%
+    dplyr::transmute(read_name  = name,
+                     read_start = chromStart + 1L,
+                     read_end   = chromEnd,
+                     read_score = score,
+                     strand)
+
+  # Only the columns that exist are unnested. blockTq is present on 15-column
+  # TF files only; unnesting a NULL column alongside two size-k columns is the
+  # case where tidyr's behaviour has changed between versions (some error, some
+  # silently drop the row), which would empty $footprints and turn every
+  # co-dependency number into 0 / NA. check_parser() below verifies the count.
+  unnest_cols <- c("blockSizes", "chromStarts")
+  fps_tbl <- raw %>%
+    dplyr::transmute(
+      read_name   = name,
+      read_start  = chromStart,
+      blockSizes  = lapply(strsplit(blockSizes,  ","), as.integer),
+      chromStarts = lapply(strsplit(chromStarts, ","), as.integer)
+    ) %>%
+    tidyr::unnest(dplyr::all_of(unnest_cols)) %>%
+    dplyr::mutate(
+      fp_start = read_start + chromStarts + 1L,
+      fp_end   = read_start + chromStarts + blockSizes,
+      fp_width = blockSizes
+    ) %>%
+    dplyr::select(read_name, fp_start, fp_end, fp_width)
+
+  list(reads = reads_tbl, footprints = fps_tbl)
+}
+
+# Parser sanity check: run on ONE file before the whole analysis runs on eight.
+# n_footprints must equal sum(blockCount) to within rounding.
+check_parser <- function(path) {
+  obj   <- read_fiberhmm_bed(path)
+  lines <- readr::read_lines(path, progress = FALSE)
+  lines <- lines[!grepl("^(#|track|browser|$)", lines)]
+  f     <- stringr::str_split_fixed(lines, "\t", 11)
+  expected_blocks <- sum(as.integer(f[, 10]), na.rm = TRUE)   # blockCount col
+  tibble::tibble(
+    file             = basename(path),
+    n_data_lines     = length(lines),
+    n_reads_returned = nrow(obj$reads),
+    n_reads_dropped  = length(lines) - nrow(obj$reads),
+    n_footprints     = nrow(obj$footprints),
+    expected_blocks  = expected_blocks,
+    blocks_ok        = nrow(obj$footprints) > 0 &&
+                       abs(nrow(obj$footprints) - expected_blocks) <=
+                         expected_blocks * 0.01,
+    coords_1based    = min(obj$footprints$fp_start) > 0
+  )
+}
+```
+
+```{r load-fn}
+# read_fiberhmm_bed() returns chrom in neither $reads nor $footprints, so chrom
+# is recovered from column 1 of the BED and matched on read_name (column 4).
+# It must be matched on read_name, NOT positionally: malformed rows are dropped
+# before the parser returns, so nrow(obj$reads) can be smaller than the number
+# of data lines and any positional scheme silently shifts every chrom after the
+# first dropped line. The map is de-duplicated first, so a repeated read_name
+# cannot multiply fibers (which a plain left_join would do).
+.bed_chrom_map <- function(path) {
+  lines <- readr::read_lines(path, progress = FALSE)
+  lines <- lines[!grepl("^(#|track|browser|$)", lines)]
+  f <- stringr::str_split_fixed(lines, "\t", 5)   # cols 1..4 + remainder
+  tibble::tibble(read_name = f[, 4], chrom = f[, 1]) %>%
+    dplyr::distinct(read_name, .keep_all = TRUE)
+}
+
+# Read and pool every MSP .bed file into:
+#   $reads : one row per fiber (chrom, Sample, unique_id, read_start, read_end)
+#            -- the full aligned span, needed to know whether a fiber even
+#            reaches a summit (fibers that don't span it cannot be scored)
+#   $msps  : one row per accessible patch (chrom, Sample, unique_id,
+#            start, end, width)
+# unique_id = Sample + read_name, so identical read names across samples stay
+# distinct once the tables are bound together.
+load_msp_data <- function(msp_files) {
+  missing <- msp_files[!file.exists(msp_files)]
+  if (length(missing) > 0) {
+    stop("MSP file(s) not found:\n", paste(missing, collapse = "\n"))
+  }
+  if (is.null(names(msp_files)) || any(names(msp_files) == "")) {
+    stop("msp_files must be a NAMED vector; names become the Sample column.")
+  }
+
+  loaded <- purrr::imap(msp_files, function(path, s_name) {
+    obj       <- read_fiberhmm_bed(path)
+    chrom_map <- .bed_chrom_map(path)
+
+    reads <- obj$reads %>%
+      dplyr::left_join(chrom_map, by = "read_name") %>%
+      dplyr::transmute(chrom, Sample = s_name,
+                       unique_id = paste0(s_name, "_", read_name),
+                       read_start, read_end)
+
+    msps <- obj$footprints %>%
+      dplyr::left_join(chrom_map, by = "read_name") %>%
+      dplyr::transmute(chrom, Sample = s_name,
+                       unique_id = paste0(s_name, "_", read_name),
+                       start = fp_start, end = fp_end, width = fp_width)
+
+    if (anyNA(reads$chrom) || anyNA(msps$chrom)) {
+      warning(sprintf("%s: %d reads / %d MSPs got no chrom from the BED.",
+                      s_name, sum(is.na(reads$chrom)), sum(is.na(msps$chrom))))
+    }
+    if (nrow(msps) == 0) {
+      stop(sprintf("%s: read_fiberhmm_bed() returned 0 footprints -- run check_parser().",
+                   s_name))
+    }
+    list(reads = reads, msps = msps)
+  })
+
+  out <- list(reads = dplyr::bind_rows(purrr::map(loaded, "reads")),
+              msps  = dplyr::bind_rows(purrr::map(loaded, "msps")))
+  message(sprintf("Loaded %d samples: %d fibers, %d MSPs.",
+                  length(msp_files), nrow(out$reads), nrow(out$msps)))
+  out
+}
+
+# Shared coordinate / width / sample filtering. The argument is `chrom_sel`,
+# not `chrom`, so it can never be shadowed by the `chrom` COLUMN inside filter().
+.prep_inputs <- function(reads, msps, chrom_sel = NULL, min_width = NULL,
+                         samples = NULL) {
+  if (!is.null(chrom_sel)) {
+    if (!"chrom" %in% names(reads)) stop("`reads` has no chrom column.")
+    reads <- reads %>% dplyr::filter(chrom %in% chrom_sel)
+    msps  <- msps  %>% dplyr::filter(chrom %in% chrom_sel)
+  }
+  if (!is.null(min_width) && !is.na(min_width)) {
+    msps <- msps %>% dplyr::filter(width >= min_width)
+  }
+  if (!is.null(samples)) {
+    reads <- reads %>% dplyr::filter(Sample %in% samples)
+    msps  <- msps  %>% dplyr::filter(Sample %in% samples)
+  }
+  list(reads = reads, msps = msps)
+}
+```
+
+```{r load-data}
+# Parser check on one file first -- fails fast and cheaply if the import is wrong.
+check_parser(MSP_FILES[[SAMPLES_USED[1]]])
+
+# Loaded ONCE for all enhancers; each enhancer then filters by chrom + samples.
+d <- load_msp_data(MSP_FILES[SAMPLES_USED])
+```
+
+# 2. Marginal accessibility per summit
+
+```{r accessibility-fns}
+# Per fiber: is there an MSP overlapping `pos`? Restricted to fibers that
+# structurally span `pos` (a fiber that does not reach the summit is not
+# evidence of inaccessibility).
+.accessibility_at <- function(reads, msps, pos) {
+  spanning <- reads %>% dplyr::filter(read_start <= pos, read_end >= pos)
+  hit_ids  <- msps %>% dplyr::filter(start <= pos, end >= pos) %>%
+    dplyr::pull(unique_id) %>% unique()
+  spanning %>% dplyr::mutate(accessible = unique_id %in% hit_ids)
+}
+
+# Marginal accessibility for each named summit position.
+#
+# CAUTION when reading the output: this uses every fiber spanning THAT summit,
+# which is a larger population than the all-summits set used for the
+# co-dependency tables. So `fraction_accessible` here and `frac_peak1` /
+# `frac_peak2` in the per-replicate table are not the same quantity and should
+# not be compared directly.
+compute_summit_accessibility <- function(reads, msps, summits,
+                                         chrom_sel = NULL, min_width = NULL,
+                                         samples = NULL, by_sample = FALSE) {
+  p <- .prep_inputs(reads, msps, chrom_sel, min_width, samples)
+  reads <- p$reads; msps <- p$msps
+
+  one <- function(reads, msps, tag = NA_character_) {
+    purrr::imap_dfr(summits, function(pos, label) {
+      acc <- .accessibility_at(reads, msps, pos)
+      if (nrow(acc) == 0) {
+        warning(sprintf("Summit '%s' at %s:%d: NO reads span this position.",
+                        label, chrom_sel %||% "?", pos))
+        return(tibble::tibble(Sample = tag, summit = label, position = pos,
+                              n_reads_spanning    = 0L,
+                              n_accessible        = 0L,
+                              fraction_accessible = NA_real_))
+      }
+      tibble::tibble(Sample = tag, summit = label, position = pos,
+                     n_reads_spanning    = nrow(acc),
+                     n_accessible        = sum(acc$accessible),
+                     fraction_accessible = mean(acc$accessible))
+    })
+  }
+
+  if (!by_sample) return(one(reads, msps) %>% dplyr::select(-Sample))
+
+  purrr::map_dfr(sort(unique(reads$Sample)), function(s) {
+    one(reads %>% dplyr::filter(Sample == s),
+        msps  %>% dplyr::filter(Sample == s), tag = s)
+  })
+}
+```
+
+# 3. Per-replicate co-dependency
+
+```{r tetrachoric-fn}
+# =============================================================================
+# TETRACHORIC CORRELATION -- sensitivity analysis for the odds ratio
+# =============================================================================
+# The odds ratio is the effect size reported throughout, but it is not
+# invariant to the marginals under a threshold model. If per-fiber
+# accessibility is a binary readout of an underlying continuous propensity to
+# open, then a treatment that shifts the marginal accessibility also moves the
+# threshold, and the odds ratio changes even when the underlying association is
+# unchanged. Because the treatments here DO shift marginal accessibility
+# substantially, the DMSO-vs-dTag comparison needs a check that the change in
+# association is not an artifact of that shift.
+#
+# The tetrachoric correlation is that check: it is the correlation of the
+# latent bivariate normal that would produce the observed 2x2 table given its
+# own margins, so it is invariant to the thresholds by construction. If the
+# tetrachoric correlation moves in the same direction as the odds ratio, the
+# marginal shift is not driving the result.
+#
+# IMPLEMENTATION. No extra package is needed. For a standard bivariate normal
+# with correlation r,
+#     d/dr P(X > h, Y > k; r) = phi2(h, k; r),
+# the bivariate normal density, so
+#     P(X > h, Y > k; r) = P(X > h) P(Y > k) + integral_0^r phi2(h, k; t) dt,
+# a one-dimensional integral that stats::integrate() evaluates to machine
+# precision. The tetrachoric correlation is then the r solving
+#     P(X > h, Y > k; r) = n11 / n,  with  h = qnorm(1 - p1), k = qnorm(1 - p2).
+# This was verified against mvtnorm/scipy bivariate normal CDFs to ~1e-16.
+
+.bvn_upper <- function(h, k, r) {
+  base <- stats::pnorm(-h) * stats::pnorm(-k)
+  if (r == 0) return(base)
+  dens <- function(t) {
+    (1 / (2 * pi * sqrt(1 - t^2))) *
+      exp(-(h^2 - 2 * t * h * k + k^2) / (2 * (1 - t^2)))
+  }
+  base + stats::integrate(dens, 0, r, rel.tol = 1e-10)$value
+}
+
+# Tetrachoric correlation of a 2x2 table. Returns NA only when the latent
+# correlation is genuinely not identified (a degenerate margin) or when the
+# integral fails -- and the latter warns rather than failing silently.
+#
+# P(X > h, Y > k; r) increases monotonically in r, so f() below is increasing.
+# If the root lies outside +/-0.999 the association is stronger than the search
+# interval can express; that is the strong-coupling case this analysis most
+# cares about, so the value is CLAMPED to the boundary and flagged rather than
+# discarded as NA (uniroot would otherwise just error with "values at end
+# points not of opposite sign").
+tetrachoric_rho <- function(n11, n10, n01, n00, warn = TRUE) {
+  n <- n11 + n10 + n01 + n00
+  if (n == 0) return(NA_real_)
+  p1 <- (n11 + n10) / n
+  p2 <- (n11 + n01) / n
+  if (p1 <= 0 || p1 >= 1 || p2 <= 0 || p2 >= 1) return(NA_real_)
+  h <- stats::qnorm(1 - p1)
+  k <- stats::qnorm(1 - p2)
+  target <- n11 / n
+  f <- function(r) .bvn_upper(h, k, r) - target
+  lim <- 0.999
+
+  ends <- tryCatch(c(f(-lim), f(lim)),
+                   error = function(e) {
+                     if (warn) warning("tetrachoric_rho: bivariate normal ",
+                                       "integral failed: ", conditionMessage(e))
+                     c(NA_real_, NA_real_)
+                   })
+  if (anyNA(ends)) return(NA_real_)
+  if (ends[1] > 0) return(-lim)   # root below -0.999: clamp
+  if (ends[2] < 0) return( lim)   # root above +0.999: clamp
+
+  tryCatch(stats::uniroot(f, interval = c(-lim, lim), tol = 1e-10)$root,
+           error = function(e) {
+             if (warn) warning("tetrachoric_rho: uniroot failed: ",
+                               conditionMessage(e))
+             NA_real_
+           })
+}
+```
+
+```{r codep-helpers}
+# Fibers spanning EVERY summit. Reads are contiguous intervals and summits are
+# single positions, so spanning the two extreme summits implies spanning all.
+.fibers_spanning_all <- function(reads, summits) {
+  pos <- unlist(summits, use.names = FALSE)
+  reads %>% dplyr::filter(read_start <= min(pos), read_end >= max(pos))
+}
+
+.fibers_spanning_pair <- function(reads, pos1, pos2) {
+  reads %>% dplyr::filter(read_start <= min(pos1, pos2),
+                          read_end   >= max(pos1, pos2))
+}
+
+# Tag each fiber accessible / not at every summit (>= 1 overlapping MSP).
+.acc_flags <- function(fibers, msps, summits) {
+  out <- fibers %>% dplyr::select(Sample, unique_id)
+  for (lab in names(summits)) {
+    pos <- summits[[lab]]
+    hit <- msps %>%
+      dplyr::filter(start <= pos, end >= pos) %>%
+      dplyr::pull(unique_id) %>% unique()
+    out[[paste0("acc_", lab)]] <- out$unique_id %in% hit
+  }
+  out
+}
+
+# One replicate, one summit pair: 2x2 table -> obs / exp / codependency + Fisher.
+.codep_one <- function(a1, a2, boot = 0) {
+  n11 <- sum(a1 & a2);  n10 <- sum(a1 & !a2)
+  n01 <- sum(!a1 & a2); n00 <- sum(!a1 & !a2)
+  n   <- n11 + n10 + n01 + n00
+  if (n == 0) return(NULL)
+
+  p1  <- (n11 + n10) / n          # marginal at summit 1, THIS fiber set
+  p2  <- (n11 + n01) / n          # marginal at summit 2, THIS fiber set
+  obs <- n11 / n
+  exp <- p1 * p2
+
+  tbl <- matrix(c(n11, n10, n01, n00), nrow = 2, byrow = TRUE)
+  ft  <- suppressWarnings(stats::fisher.test(tbl))
+
+  res <- tibble::tibble(
+    n_fibers = n, n11 = n11, n10 = n10, n01 = n01, n00 = n00,
+    frac_peak1 = p1, frac_peak2 = p2,
+    observed_coaccessibility = obs,
+    expected_coaccessibility = exp,
+    codependency = obs - exp,
+    odds_ratio = unname(ft$estimate),
+    or_ci_lo   = ft$conf.int[1],
+    or_ci_hi   = ft$conf.int[2],
+    p_fisher   = ft$p.value,
+    # Threshold-invariant companion to the odds ratio (see tetrachoric-fn).
+    rho_tetrachoric = tetrachoric_rho(n11, n10, n01, n00)
+  )
+
+  # Percentile bootstrap on codependency. Fibers are resampled and BOTH the
+  # marginals and the joint are recomputed on each resample, as they must be.
+  if (boot > 0) {
+    bv <- purrr::map_dbl(seq_len(boot), function(i) {
+      idx <- sample.int(n, n, replace = TRUE)
+      b1 <- a1[idx]; b2 <- a2[idx]
+      mean(b1 & b2) - mean(b1) * mean(b2)
+    })
+    res$boot_ci_lo <- unname(stats::quantile(bv, 0.025))
+    res$boot_ci_hi <- unname(stats::quantile(bv, 0.975))
+  } else {
+    res$boot_ci_lo <- NA_real_
+    res$boot_ci_hi <- NA_real_
+  }
+  res
+}
+```
+
+```{r codep-main}
+# reads, msps   : from load_msp_data()
+# summits       : named numeric vector of single-bp positions (1-based)
+# sample_groups : named list, group label -> Samples. Used for labelling and
+#                 for the p-adjustment scope; NULL = every Sample its own group.
+# p_adjust_scope: "group" adjusts within each sample group (recommended -- the
+#                 groups are separate experiments); "all" adjusts across the
+#                 whole table; "none" leaves p_fisher unadjusted.
+compute_codependency_perrep <- function(reads, msps, summits,
+                                        chrom_sel = NULL, min_width = NULL,
+                                        fiber_set = c("all_summits", "pair"),
+                                        samples = NULL,
+                                        sample_groups = NULL,
+                                        min_fibers = 20,
+                                        boot = 0,
+                                        p_adjust_method = "BH",
+                                        p_adjust_scope = c("group", "all", "none")) {
+  fiber_set      <- match.arg(fiber_set)
+  p_adjust_scope <- match.arg(p_adjust_scope)
+  if (length(summits) < 2) stop("Need at least 2 summits to form a pair.")
+
+  p <- .prep_inputs(reads, msps, chrom_sel, min_width, samples)
+  reads <- p$reads; msps <- p$msps
+  if (nrow(reads) == 0) stop("compute_codependency_perrep: no fibers left after filtering.")
+
+  grp_of <- function(s) {
+    if (is.null(sample_groups)) return(s)
+    hit <- names(sample_groups)[vapply(sample_groups, function(v) s %in% v, logical(1))]
+    if (length(hit) == 0) NA_character_ else hit[1]
+  }
+
+  reps  <- sort(unique(reads$Sample))
+  pairs <- utils::combn(names(summits), 2, simplify = FALSE)
+
+  out <- purrr::map_dfr(reps, function(s) {
+    r_s <- reads %>% dplyr::filter(Sample == s)
+    m_s <- msps  %>% dplyr::filter(Sample == s)
+
+    if (fiber_set == "all_summits") {
+      fib <- .fibers_spanning_all(r_s, summits)
+      if (nrow(fib) == 0) {
+        warning(sprintf("%s: no fibers span all summits -- replicate dropped.", s))
+        return(NULL)
+      }
+      flags <- .acc_flags(fib, m_s, summits)
+      purrr::map_dfr(pairs, function(pr) {
+        r <- .codep_one(flags[[paste0("acc_", pr[1])]],
+                        flags[[paste0("acc_", pr[2])]], boot = boot)
+        if (is.null(r)) return(NULL)
+        dplyr::bind_cols(tibble::tibble(Sample = s, group = grp_of(s),
+                                        peak1 = pr[1], peak2 = pr[2]), r)
+      })
+    } else {
+      purrr::map_dfr(pairs, function(pr) {
+        pos1 <- summits[[pr[1]]]; pos2 <- summits[[pr[2]]]
+        fib  <- .fibers_spanning_pair(r_s, pos1, pos2)
+        if (nrow(fib) == 0) {
+          warning(sprintf("%s: no fibers span both %s and %s -- pair skipped.",
+                          s, pr[1], pr[2]))
+          return(NULL)
+        }
+        flags <- .acc_flags(fib, m_s, summits[pr])
+        r <- .codep_one(flags[[paste0("acc_", pr[1])]],
+                        flags[[paste0("acc_", pr[2])]], boot = boot)
+        if (is.null(r)) return(NULL)
+        dplyr::bind_cols(tibble::tibble(Sample = s, group = grp_of(s),
+                                        peak1 = pr[1], peak2 = pr[2]), r)
+      })
+    }
+  })
+
+  if (nrow(out) == 0) stop("compute_codependency_perrep: nothing computed.")
+
+  out <- out %>%
+    dplyr::mutate(pair       = paste(peak1, peak2, sep = " – "),
+                  fiber_set  = fiber_set,
+                  low_fibers = n_fibers < min_fibers)
+
+  out <- switch(
+    p_adjust_scope,
+    none  = out %>% dplyr::mutate(p_adj = p_fisher),
+    all   = out %>% dplyr::mutate(p_adj = stats::p.adjust(p_fisher, p_adjust_method)),
+    group = out %>% dplyr::group_by(group) %>%
+      dplyr::mutate(p_adj = stats::p.adjust(p_fisher, p_adjust_method)) %>%
+      dplyr::ungroup()
+  ) %>%
+    dplyr::relocate(pair, .after = peak2)
+
+  if (any(out$low_fibers)) {
+    message("Replicate x pair combinations with < ", min_fibers,
+            " fibers (flagged `low_fibers`, interpret with caution):\n  ",
+            paste(sprintf("%s / %s (n=%d)",
+                          out$Sample[out$low_fibers], out$pair[out$low_fibers],
+                          out$n_fibers[out$low_fibers]), collapse = "\n  "))
+  }
+  out
+}
+```
+
+# 4. Replicate summary, stratified pooling, DMSO vs dTag
+
+```{r summarise-fn}
+# mean / sd of codependency across replicates, plus sign consistency.
+summarise_codependency_reps <- function(perrep_df, by_group = TRUE) {
+  keys <- if (by_group && !all(is.na(perrep_df$group))) c("group", "pair") else "pair"
+  perrep_df %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(keys))) %>%
+    dplyr::summarise(
+      n_reps       = dplyr::n(),
+      mean_codep   = mean(codependency),
+      sd_codep     = stats::sd(codependency),
+      min_codep    = min(codependency),
+      max_codep    = max(codependency),
+      same_sign    = length(unique(sign(codependency))) == 1,
+      mean_obs     = mean(observed_coaccessibility),
+      mean_exp     = mean(expected_coaccessibility),
+      # Tetrachoric correlation, averaged over replicates. Averaging the
+      # per-replicate values keeps this consistent with the rest of the
+      # document: fibers are never pooled across replicates (see design
+      # decision 2), so this cannot be inverted by Simpson's paradox the way a
+      # rho computed on the replicate-summed table could be.
+      # Guarded: mean(na.rm) of an all-NA vector is NaN and min/max are
+      # -Inf/Inf, all of which would be written to the sheet as if they were
+      # values.
+      mean_rho     = if (all(is.na(rho_tetrachoric))) NA_real_ else
+                       mean(rho_tetrachoric, na.rm = TRUE),
+      min_rho      = if (all(is.na(rho_tetrachoric))) NA_real_ else
+                       min(rho_tetrachoric, na.rm = TRUE),
+      max_rho      = if (all(is.na(rho_tetrachoric))) NA_real_ else
+                       max(rho_tetrachoric, na.rm = TRUE),
+      total_fibers = sum(n_fibers),
+      any_low_n    = any(low_fibers),
+      .groups = "drop"
+    )
+}
+```
+
+```{r pool-fn}
+# Pools the per-replicate 2x2 tables WITHOUT pooling fibers. Returns a common
+# odds ratio + CI, an MH p-value, and a Woolf homogeneity check (tests whether
+# the OR differs between replicates -- i.e. whether pooling is defensible).
+# With only 2 replicates the Woolf test has 1 df and very little power: treat a
+# non-significant woolf_p as "no evidence against pooling", not "homogeneous".
+#
+# WHY THE CI IS COMPUTED HERE INSTEAD OF TAKEN FROM mantelhaen.test():
+# mantelhaen.test(exact = FALSE) does return conf.int, but it returns
+# c(NaN, NaN) whenever the Robins-Breslow-Greenland variance degenerates --
+# which happens as soon as a 2x2 cell is empty in every replicate (then either
+# sum(a*d/n) or sum(b*c/n) is 0, the common OR is 0 or Inf, and the variance of
+# its log is undefined). That is the usual reason mh_ci_lo/mh_ci_hi come back
+# all-NA and no error bars appear in the forest plot.
+#
+# So: OR, SE(log OR) and CI are computed explicitly by the RBG formula, the
+# degenerate case is DETECTED and reported (`any_zero_cell`, `min_cell`), and a
+# Haldane-Anscombe fallback (+0.5 to every cell) supplies a finite, clearly
+# flagged interval so the figure is not silently empty. `ci_method` records
+# which one each row used. se_log_or is what the Wald cross-check below needs.
+.mh_or_ci <- function(arr, conf_level = 0.95, haldane_if_degenerate = TRUE) {
+  core <- function(a, b, c, d) {
+    n  <- a + b + c + d
+    R  <- sum(a * d / n);  S <- sum(b * c / n)
+    P  <- (a + d) / n;     Q <- (b + c) / n
+    or <- R / S
+    v  <- sum(P * a * d / n) / (2 * R^2) +
+          sum(P * b * c / n + Q * a * d / n) / (2 * R * S) +
+          sum(Q * b * c / n) / (2 * S^2)
+    list(or = or, se = sqrt(v))
+  }
+  a <- arr[1, 1, ]; b <- arr[1, 2, ]; c <- arr[2, 1, ]; d <- arr[2, 2, ]
+  min_cell   <- min(c(a, b, c, d))
+  degenerate <- sum(a * d / (a + b + c + d)) == 0 ||
+                sum(b * c / (a + b + c + d)) == 0
+  est    <- core(a, b, c, d)
+  method <- "Robins-Breslow-Greenland"
+
+  if ((degenerate || !is.finite(est$se)) && haldane_if_degenerate) {
+    est    <- core(a + 0.5, b + 0.5, c + 0.5, d + 0.5)
+    method <- "RBG after Haldane-Anscombe +0.5 (empty cell)"
+  }
+  z <- stats::qnorm((1 + conf_level) / 2)
+  list(or = est$or,
+       se_log_or = est$se,
+       ci_lo = est$or * exp(-z * est$se),
+       ci_hi = est$or * exp( z * est$se),
+       min_cell = min_cell,
+       any_zero_cell = min_cell == 0,
+       ci_method = method)
+}
+
+pool_codependency_mh <- function(perrep_df, by_group = TRUE, exact = FALSE,
+                                 p_adjust_method = "BH", conf_level = 0.95) {
+  keys <- if (by_group && !all(is.na(perrep_df$group))) c("group", "pair") else "pair"
+
+  woolf <- function(x) {   # Woolf test for homogeneity of odds ratios
+    x   <- x + 1 / 2
+    k   <- dim(x)[3]
+    or  <- apply(x, 3, function(m) (m[1, 1] * m[2, 2]) / (m[1, 2] * m[2, 1]))
+    w   <- apply(x, 3, function(m) 1 / sum(1 / m))
+    chi <- sum(w * (log(or) - stats::weighted.mean(log(or), w))^2)
+    stats::pchisq(chi, k - 1, lower.tail = FALSE)
+  }
+
+  perrep_df %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(keys))) %>%
+    dplyr::group_modify(function(dd, k) {
+      arr <- array(NA_integer_, dim = c(2, 2, nrow(dd)))
+      for (i in seq_len(nrow(dd))) {
+        arr[, , i] <- matrix(c(dd$n11[i], dd$n10[i], dd$n01[i], dd$n00[i]),
+                             nrow = 2, byrow = TRUE)
+      }
+      ci <- .mh_or_ci(arr, conf_level = conf_level)
+
+      # p-value: CMH for >= 2 strata, Fisher for 1. Guarded, since the CMH
+      # variance is also undefined for fully degenerate tables.
+      pv <- if (nrow(dd) < 2) {
+        tryCatch(suppressWarnings(stats::fisher.test(arr[, , 1])$p.value),
+                 error = function(e) NA_real_)
+      } else {
+        tryCatch(suppressWarnings(stats::mantelhaen.test(arr, exact = exact)$p.value),
+                 error = function(e) NA_real_)
+      }
+
+      tibble::tibble(
+        n_reps        = nrow(dd),
+        total_fibers  = sum(arr),
+        mh_or         = ci$or,
+        mh_ci_lo      = ci$ci_lo,
+        mh_ci_hi      = ci$ci_hi,
+        se_log_or     = ci$se_log_or,
+        p_mh          = pv,
+        woolf_p       = tryCatch(woolf(arr), error = function(e) NA_real_),
+        min_cell      = ci$min_cell,
+        any_zero_cell = ci$any_zero_cell,
+        ci_method     = ci$ci_method,
+        mh_note       = if (nrow(dd) < 2) "single replicate: Fisher p, not CMH"
+                        else if (isTRUE(exact)) "exact CMH p" else "asymptotic CMH p"
+      )
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(p_mh_adj = stats::p.adjust(p_mh, method = p_adjust_method))
+}
+```
+
+```{r or-compare-fn}
+# =============================================================================
+# Within each cell line, is the summit-summit association DIFFERENT between
+# DMSO and dTag? That is a question about a RATIO OF ODDS RATIOS (ROR), i.e. an
+# interaction -- NOT something you can answer by noting that one OR is
+# significant and the other is not. Two CIs overlapping (or not) is also not a
+# test of their difference.
+#
+#   ROR = OR_dTag / OR_DMSO
+#   ROR = 1  association unchanged by dTag
+#   ROR < 1  association weaker after dTag (co-dependency lost with the TF)
+#   ROR > 1  association stronger after dTag
+#
+# Two independent routes are computed, and they should broadly agree:
+#
+#  (1) PRIMARY -- fiber-level logistic regression interaction.
+#        acc_b ~ acc_a + Sample + acc_a:treatment
+#      `Sample` gives every replicate its own intercept, so replicate-to-
+#      replicate differences in baseline accessibility cannot masquerade as a
+#      treatment effect. The acc_a:treatment coefficient IS log(ROR), and the
+#      likelihood-ratio test of dropping it is the test of "the two odds ratios
+#      are equal". log-OR is symmetric, so regressing acc_b on acc_a or acc_a
+#      on acc_b gives the identical interaction -- no arbitrary choice of
+#      response here.
+#
+#  (2) CROSS-CHECK -- Wald test on the two pooled MH log odds ratios:
+#        z = (log OR_dTag - log OR_DMSO) / sqrt(SE_dTag^2 + SE_DMSO^2)
+#      Cruder (it ignores within-replicate structure beyond the MH
+#      stratification) but a useful sanity check: if (1) and (2) disagree
+#      badly, look at the per-replicate tables before believing either.
+# =============================================================================
+
+# Per-fiber accessibility flags for every sample, on the analysis population.
+build_fiber_flags <- function(reads, msps, summits, chrom_sel = NULL,
+                              min_width = NULL, samples = NULL,
+                              fiber_set = c("all_summits", "pair"),
+                              pair = NULL) {
+  fiber_set <- match.arg(fiber_set)
+  p <- .prep_inputs(reads, msps, chrom_sel, min_width, samples)
+  purrr::map_dfr(sort(unique(p$reads$Sample)), function(s) {
+    r_s <- p$reads %>% dplyr::filter(Sample == s)
+    m_s <- p$msps  %>% dplyr::filter(Sample == s)
+    sm  <- if (fiber_set == "pair" && !is.null(pair)) summits[pair] else summits
+    fib <- if (fiber_set == "all_summits") .fibers_spanning_all(r_s, sm)
+           else .fibers_spanning_pair(r_s, sm[[1]], sm[[2]])
+    if (nrow(fib) == 0) return(NULL)
+    .acc_flags(fib, m_s, sm)
+  })
+}
+
+# (1) PRIMARY: interaction test, per cell line x summit pair.
+# sample_meta: tibble(Sample, group, line, treatment)
+compare_or_treatments_glm <- function(reads, msps, summits, sample_meta,
+                                      chrom_sel = NULL, min_width = NULL,
+                                      fiber_set = "all_summits",
+                                      ref_treatment = "DMSO",
+                                      p_adjust_method = "BH") {
+
+  if (!ref_treatment %in% sample_meta$treatment) {
+    stop(sprintf("ref_treatment '%s' not found in sample_meta$treatment (%s)",
+                 ref_treatment, paste(unique(sample_meta$treatment), collapse = ", ")))
+  }
+
+  flags <- build_fiber_flags(reads, msps, summits, chrom_sel, min_width,
+                             samples = sample_meta$Sample, fiber_set = fiber_set) %>%
+    dplyr::left_join(sample_meta, by = "Sample")
+
+  pairs         <- utils::combn(names(summits), 2, simplify = FALSE)
+  lines         <- unique(sample_meta$line)
+  alt_treatment <- setdiff(unique(sample_meta$treatment), ref_treatment)[1]
+
+  out <- purrr::map_dfr(lines, function(L) {
+    purrr::map_dfr(pairs, function(pr) {
+
+      # WHY THE INTERACTION IS AN EXPLICIT NUMERIC COLUMN AND NOT `acc_a:dtag`.
+      # R gives a factor FULL indicator coding inside a term whenever the term
+      # with that factor deleted is absent from the model. Deleting acc_a from
+      # `acc_a:dtag` leaves `dtag`, which has no main effect here (it cannot
+      # have one -- it is collinear with Sample, since replicates are nested in
+      # treatment). So acc_a is fully dummy-coded and the matrix gets BOTH
+      # acc_aFALSE:dtag and acc_aTRUE:dtag; their sum is dtag, which the Sample
+      # dummies already span. Rank deficient by one, acc_aTRUE:dtag is pivoted
+      # out to NA, and the surviving acc_aFALSE:dtag coefficient is -log(ROR).
+      # summary()$coefficients drops aliased rows, so a regex for the term
+      # finds exactly one match and every estimability check passes --
+      # returning the RECIPROCAL of the intended ratio, with a plausible CI and
+      # p-value. The same happens with `acc_a:treatment`, for the same reason.
+      #
+      # acc_a is therefore coerced to 0/1 integer and multiplied by dtag by
+      # hand. `acc_a_x_dtag` is then one ordinary numeric predictor: nothing to
+      # expand, nothing to alias, no name matching, and its coefficient is
+      #   log(OR at dtag=1) - log(OR at dtag=0) = log(OR_alt/OR_ref) = log(ROR).
+      dd <- flags %>%
+        dplyr::filter(line == L) %>%
+        dplyr::transmute(
+          Sample = factor(Sample),
+          dtag   = as.integer(treatment != ref_treatment),   # 0 = ref, 1 = alt
+          acc_a  = as.integer(.data[[paste0("acc_", pr[1])]]),
+          acc_b  = as.integer(.data[[paste0("acc_", pr[2])]])) %>%
+        dplyr::filter(!is.na(dtag), !is.na(acc_a), !is.na(acc_b)) %>%
+        dplyr::mutate(Sample       = droplevels(Sample),
+                      acc_a_x_dtag = acc_a * dtag)
+
+      # Counted AFTER filtering, so they describe the fibers the model saw.
+      base <- tibble::tibble(
+        line = L, pair = paste(pr[1], pr[2], sep = " – "),
+        peak1 = pr[1], peak2 = pr[2],
+        n_fibers_total = nrow(dd),
+        n_fibers_ref   = sum(dd$dtag == 0L),
+        n_fibers_alt   = sum(dd$dtag == 1L))
+
+      if (nrow(dd) == 0 || dplyr::n_distinct(dd$dtag) < 2) {
+        return(dplyr::bind_cols(base, tibble::tibble(
+          ror = NA_real_, ror_ci_lo = NA_real_, ror_ci_hi = NA_real_,
+          p_interaction = NA_real_,
+          glm_note = "only one treatment present -- not comparable")))
+      }
+
+      fit <- tryCatch({
+        m0 <- stats::glm(acc_b ~ acc_a + Sample,
+                         family = stats::binomial, data = dd)
+        m1 <- stats::glm(acc_b ~ acc_a + Sample + acc_a_x_dtag,
+                         family = stats::binomial, data = dd)
+
+        # Keep this: coef() retains NAs, summary()$coefficients silently drops
+        # them, so this is the only place aliasing is visible.
+        aliased <- names(stats::coef(m1))[is.na(stats::coef(m1))]
+        if (length(aliased) > 0) {
+          stop(sprintf("rank-deficient model, aliased coefficient(s): %s",
+                       paste(aliased, collapse = ", ")))
+        }
+
+        co <- summary(m1)$coefficients
+        if (!"acc_a_x_dtag" %in% rownames(co)) {
+          stop("interaction term absent from the fit")
+        }
+        est <- co["acc_a_x_dtag", "Estimate"]
+        se  <- co["acc_a_x_dtag", "Std. Error"]
+        an  <- stats::anova(m0, m1, test = "LRT")
+
+        list(ror = exp(est),
+             lo  = exp(est - stats::qnorm(0.975) * se),
+             hi  = exp(est + stats::qnorm(0.975) * se),
+             p   = an$`Pr(>Chi)`[2],
+             note = sprintf(paste0("logistic interaction (explicit acc_a x dtag ",
+                                   "column), LRT 1 df; ROR = OR_%s / OR_%s"),
+                            alt_treatment, ref_treatment))
+      }, error = function(e) list(ror = NA_real_, lo = NA_real_, hi = NA_real_,
+                                  p = NA_real_,
+                                  note = paste("failed:", conditionMessage(e))))
+
+      dplyr::bind_cols(base, tibble::tibble(
+        ror = fit$ror, ror_ci_lo = fit$lo, ror_ci_hi = fit$hi,
+        p_interaction = fit$p, glm_note = fit$note))
+    })
+  })
+
+  out %>% dplyr::mutate(
+    p_interaction_adj = stats::p.adjust(p_interaction, method = p_adjust_method))
+}
+
+# (2) CROSS-CHECK: Wald test on the two pooled MH log ORs.
+# group_meta: tibble(group, line, treatment)
+compare_or_treatments_wald <- function(pooled_df, group_meta,
+                                       ref_treatment = "DMSO",
+                                       p_adjust_method = "BH") {
+  pooled_df %>%
+    dplyr::left_join(group_meta, by = "group") %>%
+    dplyr::group_by(line, pair) %>%
+    dplyr::group_modify(function(dd, k) {
+      # Every branch returns the SAME columns, so a failure in one line x pair
+      # cannot make a column disappear from the bound result (which would then
+      # break the figure annotation and the export downstream).
+      blank <- tibble::tibble(
+        group_ref = NA_character_, group_alt = NA_character_,
+        or_ref = NA_real_, or_alt = NA_real_,
+        ror_wald = NA_real_, ror_wald_ci_lo = NA_real_, ror_wald_ci_hi = NA_real_,
+        p_wald = NA_real_, wald_note = NA_character_)
+
+      ref <- dd %>% dplyr::filter(treatment == ref_treatment)
+      alt <- dd %>% dplyr::filter(treatment != ref_treatment)
+      if (nrow(ref) != 1 || nrow(alt) != 1) {
+        blank$wald_note <- "need exactly one group per treatment"
+        return(blank)
+      }
+      blank$group_ref <- ref$group; blank$group_alt <- alt$group
+      blank$or_ref    <- ref$mh_or; blank$or_alt    <- alt$mh_or
+
+      dlog <- log(alt$mh_or) - log(ref$mh_or)
+      se   <- sqrt(alt$se_log_or^2 + ref$se_log_or^2)
+      blank$ror_wald <- exp(dlog)
+      if (!is.finite(dlog) || !is.finite(se) || se == 0) {
+        blank$wald_note <- "SE undefined (empty cell) -- use the interaction test"
+        return(blank)
+      }
+      blank$ror_wald_ci_lo <- exp(dlog - stats::qnorm(0.975) * se)
+      blank$ror_wald_ci_hi <- exp(dlog + stats::qnorm(0.975) * se)
+      blank$p_wald         <- 2 * stats::pnorm(-abs(dlog / se))
+      blank$wald_note      <- "Wald on difference of pooled MH log ORs"
+      blank
+    }) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(p_wald_adj = stats::p.adjust(p_wald, method = p_adjust_method))
+}
+```
+
+# 5. Plot functions
+
+## 5a. Triangle plot (LD-style)
+
+```{r plot-triangle}
+# Summits sit evenly spaced on a baseline; each pair's diamond is centred above
+# the midpoint of its two summits at a height proportional to their separation,
+# so adjacent pairs sit low and distal pairs form the apex.
+#
+#   FILL  = mean codependency (obs - exp) across replicates
+#   LABEL = the individual replicate values that mean is made of
+#
+# `limits` should be supplied when several panels are combined, so all panels
+# share one colour scale. Works for any number of summits and replicates; with
+# exactly two summits the plot is a single diamond.
+# show_numbers = FALSE gives the colour-only version used in the main figure
+# (the per-replicate numbers then live in the metrics workbook).
+plot_codep_triangle_reps <- function(perrep_df, summits,
+                                     title = "", subtitle = NULL,
+                                     limits = NULL,
+                                     show_numbers = TRUE,
+                                     rep_label_fn = function(x) {
+                                       lab <- stringr::str_extract(x, "rep[0-9]+")
+                                       ifelse(is.na(lab), x, lab)
+                                     },
+                                     digits = 1,
+                                     mark_sig = TRUE, sig_col = "p_adj",
+                                     sig_cut = 0.05) {
+  peaks  <- names(summits)
+  pos    <- setNames(seq_along(peaks) - 1, peaks)   # 0, 1, 2, ...
+  combos <- utils::combn(peaks, 2, simplify = FALSE)
+
+  df <- perrep_df %>%
+    dplyr::mutate(rep_lab = rep_label_fn(Sample)) %>%
+    dplyr::arrange(rep_lab)
+
+  # pull a pair's rows regardless of peak1 / peak2 order
+  get_rows <- function(a, b) {
+    df %>% dplyr::filter((peak1 == a & peak2 == b) | (peak1 == b & peak2 == a))
+  }
+
+  fmt <- function(v) sprintf(paste0("%+.", digits, "f"), v * 100)
+
+  cell <- purrr::map_dfr(combos, function(pr) {
+    rows <- get_rows(pr[1], pr[2])
+    if (nrow(rows) == 0) {
+      return(tibble::tibble(pair = paste(pr[1], pr[2], sep = " – "),
+                            i = pos[[pr[1]]], j = pos[[pr[2]]],
+                            mean_codep = NA_real_, label = "n/a"))
+    }
+    star <- if (mark_sig && sig_col %in% names(rows)) {
+      ifelse(!is.na(rows[[sig_col]]) & rows[[sig_col]] < sig_cut, "*", "")
+    } else rep("", nrow(rows))
+    tibble::tibble(
+      pair = paste(pr[1], pr[2], sep = " – "),
+      i = pos[[pr[1]]], j = pos[[pr[2]]],
+      mean_codep = mean(rows$codependency, na.rm = TRUE),
+      label = paste(sprintf("%s %s%s", rows$rep_lab, fmt(rows$codependency), star),
+                    collapse = "\n")
+    )
+  })
+
+  # unit rhombi (N/E/S/W vertices offset by 0.5) so neighbouring diamonds tile
+  diamonds <- purrr::pmap_dfr(
+    list(cell$pair, cell$i, cell$j, cell$mean_codep),
+    function(pr, i, j, mc) {
+      cx <- (i + j) / 2; cy <- (j - i) / 2
+      tibble::tibble(pair = pr, mean_codep = mc,
+                     x = c(cx, cx + 0.5, cx, cx - 0.5),
+                     y = c(cy + 0.5, cy, cy - 0.5, cy))
+    })
+
+  labels   <- cell %>% dplyr::mutate(x = (i + j) / 2, y = (j - i) / 2)
+  baseline <- tibble::tibble(peak = peaks, x = unname(pos), y = 0)
+
+  if (is.null(limits)) {
+    lim <- suppressWarnings(max(abs(cell$mean_codep), na.rm = TRUE))
+    if (!is.finite(lim) || lim == 0) lim <- 0.01   # guard: all-NA or all-zero
+    limits <- c(-lim, lim)
+  }
+
+  p <- ggplot() +
+    geom_polygon(data = diamonds,
+                 aes(x = x, y = y, group = pair, fill = mean_codep),
+                 colour = "black", linewidth = 0.25)
+
+  if (show_numbers) {
+    p <- p + geom_text(data = labels, aes(x = x, y = y, label = label),
+                       size = 3, lineheight = 1.05)
+  }
+
+  p +
+    geom_point(data = baseline, aes(x = x, y = y), size = 2) +
+    geom_text(data = baseline, aes(x = x, y = y, label = peak),
+              vjust = 2.2, fontface = "bold", size = 4) +
+    scale_fill_gradient2(low = "steelblue", mid = "white", high = "firebrick",
+                         midpoint = 0, limits = limits, oob = scales::squish,
+                         na.value = "grey90",
+                         name = "mean codependency\n(obs − exp)",
+                         labels = scales::label_percent(accuracy = 1)) +
+    coord_fixed(clip = "off") +
+    theme_void(base_size = 13) +
+    labs(title = title, subtitle = subtitle) +
+    theme(plot.title    = element_text(hjust = 0.5, face = "bold",
+                                       margin = margin(b = 4)),
+          plot.subtitle = element_text(hjust = 0.5, size = 9, colour = "grey30",
+                                       margin = margin(b = 8)),
+          plot.margin   = margin(10, 10, 25, 10))
+}
+
+# One triangle per group on a SHARED colour scale, then arranged.
+# group_levels fixes the panel order (e.g. SNAI DMSO, SNAI dTag, TWIST DMSO...).
+triangle_panels_by_group <- function(perrep_df, summits, group_levels = NULL,
+                                     ncol = 2, ...) {
+  groups <- group_levels %||% sort(unique(perrep_df$group))
+  groups <- groups[groups %in% unique(perrep_df$group)]
+
+  means <- perrep_df %>%
+    dplyr::group_by(group, pair) %>%
+    dplyr::summarise(m = mean(codependency), .groups = "drop")
+  lim <- suppressWarnings(max(abs(means$m), na.rm = TRUE))
+  if (!is.finite(lim) || lim == 0) lim <- 0.01
+
+  plots <- purrr::map(groups, function(g) {
+    plot_codep_triangle_reps(
+      perrep_df %>% dplyr::filter(group == g),
+      summits, title = g, limits = c(-lim, lim), ...)
+  })
+  list(plots = plots, limits = c(-lim, lim),
+       arranged = ggpubr::ggarrange(plotlist = plots, ncol = ncol,
+                                    nrow = ceiling(length(plots) / ncol),
+                                    common.legend = TRUE, legend = "right"))
+}
+```
+
+## 5b. Odds ratio forest plot
+
+```{r plot-forest}
+# ggplot2 >= 3.5 renamed `trans` to `transform`; support both.
+.scale_x_log2 <- function(...) {
+  if (utils::packageVersion("ggplot2") >= "3.5.0") {
+    ggplot2::scale_x_continuous(transform = "log2", ...)
+  } else {
+    ggplot2::scale_x_continuous(trans = "log2", ...)
+  }
+}
+
+# Group-comparable forest plot.
+#   one facet per summit pair; groups stacked on the y axis in a fixed order,
+#   so DMSO and dTag for the same TF sit next to each other
+#   large diamond + CI = Mantel-Haenszel pooled OR for that group
+#   small open points  = individual replicates (Fisher)
+# Fisher ORs are Inf / 0 whenever a cell is empty; those are squished to
+# `clamp` and drawn with an open symbol so they are not read as finite.
+# or_compare : optional output of the DMSO-vs-dTag comparison, i.e. columns
+#              pair, line, group_ref, group_alt, ror, p_interaction_adj. Drawn
+#              as a bracket spanning the two rows of each cell line.
+plot_codep_forest_groups <- function(pooled_df, perrep_df = NULL,
+                                     group_levels = NULL,
+                                     group_colours = NULL,
+                                     clamp = NULL,
+                                     point_size = 2.6,
+                                     or_compare = NULL,
+                                     title = "Association between summits (odds ratio)",
+                                     subtitle = NULL) {
+  glev <- group_levels %||% sort(unique(pooled_df$group))
+
+  pooled <- pooled_df %>%
+    dplyr::transmute(pair, group, or = mh_or, lo = mh_ci_lo, hi = mh_ci_hi,
+                     p = p_mh_adj, kind = "pooled")
+
+  df <- pooled
+  if (!is.null(perrep_df)) {
+    df <- dplyr::bind_rows(
+      df,
+      perrep_df %>%
+        dplyr::transmute(pair, group, or = odds_ratio, lo = or_ci_lo,
+                         hi = or_ci_hi, p = p_adj, kind = "replicate"))
+  }
+
+  # Axis limits, data-driven by default. THIS MATTERS: with tens of thousands
+  # of fibers per replicate, SE(log OR) is ~0.02 and the 95% CI is only a few
+  # percent wide. On a hard-coded wide axis such as c(0.05, 20) that interval
+  # is narrower than the plotting symbol, so the error bars are invisible even
+  # though they were computed correctly. Fitting the axis to the data (and
+  # shrinking the point) is what makes them visible.
+  if (is.null(clamp)) {
+    fin <- c(df$or, df$lo, df$hi)
+    fin <- fin[is.finite(fin) & fin > 0]
+    if (length(fin) == 0) fin <- c(0.5, 2)
+    clamp <- c(min(fin, 1) / 1.15, max(fin, 1) * 1.15)
+  }
+
+  df <- df %>%
+    dplyr::mutate(
+      group    = factor(group, levels = glev),
+      censored = !is.finite(or) | or <= clamp[1] | or >= clamp[2],
+      dplyr::across(c(or, lo, hi), ~ pmin(pmax(.x, clamp[1]), clamp[2])),
+      sig      = ifelse(!is.na(p) & p < 0.05, "p < 0.05", "n.s."),
+      kind     = factor(kind, levels = c("pooled", "replicate"))) %>%
+    dplyr::filter(!is.na(group))
+
+  pool_only <- df %>% dplyr::filter(kind == "pooled")
+  rep_only  <- df %>% dplyr::filter(kind == "replicate")
+
+  p <- ggplot(df, aes(x = or, y = group)) +
+    geom_vline(xintercept = 1, linetype = "dashed", linewidth = 0.4,
+               colour = "grey40")
+
+  if (nrow(rep_only) > 0) {
+    p <- p + geom_point(data = rep_only, aes(colour = group),
+                        shape = 1, size = point_size * 0.6, alpha = 0.85,
+                        position = position_nudge(y = 0.18))
+  }
+
+  p <- p +
+    # End caps on, so a very narrow CI still reads as an interval rather than
+    # disappearing under the marker.
+    geom_errorbarh(data = pool_only, aes(xmin = lo, xmax = hi, colour = group),
+                   height = 0.16, linewidth = 0.55) +
+    geom_point(data = pool_only, aes(colour = group, shape = censored),
+               size = point_size) +
+    geom_text(data = pool_only,
+              aes(label = ifelse(is.na(p), "",
+                          ifelse(p < 0.001, "***",
+                          ifelse(p < 0.01, "**",
+                          ifelse(p < 0.05, "*", ""))))),
+              nudge_y = -0.24, size = 4, colour = "grey20")
+
+  # DMSO vs dTag brackets, one per cell line per facet.
+  if (!is.null(or_compare) && nrow(or_compare) > 0) {
+    ann <- or_compare %>%
+      dplyr::filter(pair %in% unique(df$pair),
+                    group_ref %in% glev, group_alt %in% glev) %>%
+      dplyr::mutate(
+        y1   = match(group_ref, rev(glev)),   # matches scale_y_discrete below
+        y2   = match(group_alt, rev(glev)),
+        ymid = (y1 + y2) / 2,
+        xb   = clamp[2] / 1.25,
+        label = ifelse(is.na(ror), "ROR n/a",
+                       sprintf("ROR %.2f, p=%s", ror,
+                               format.pval(p_interaction_adj, digits = 2, eps = 1e-4))))
+    p <- p +
+      geom_segment(data = ann, aes(x = xb, xend = xb, y = y1, yend = y2),
+                   inherit.aes = FALSE, linewidth = 0.3, colour = "grey45") +
+      geom_text(data = ann, aes(x = clamp[2], y = ymid, label = label),
+                inherit.aes = FALSE, hjust = 1, vjust = 0.5, size = 2.7,
+                colour = "grey20")
+  }
+
+  p +
+    facet_wrap(~ pair, ncol = 1) +
+    .scale_x_log2(labels = function(x) signif(x, 2)) +
+    scale_y_discrete(limits = rev(glev)) +
+    # Only advertise clamping when something is actually clamped, and say what
+    # it means: the point sits ON the axis limit, its true value is beyond it.
+    scale_shape_manual(
+      values = c(`FALSE` = 18, `TRUE` = 5),
+      labels = c(`FALSE` = "OR and 95% CI within axis limits",
+                 `TRUE`  = "clamped: true OR or CI beyond axis limits"),
+      name = NULL, drop = FALSE,
+      guide = if (any(pool_only$censored, na.rm = TRUE)) "legend" else "none") +
+    { if (is.null(group_colours)) scale_colour_discrete(guide = "none")
+      else scale_colour_manual(values = group_colours, guide = "none") } +
+    labs(title = title, subtitle = subtitle,
+         x = "Odds ratio for co-accessibility (log2 scale) (1 = independent)",
+         y = NULL) +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          strip.background = element_rect(fill = "grey95", colour = NA),
+          strip.text = element_text(face = "bold"),
+          plot.subtitle = element_text(size = 9, colour = "grey30"),
+          legend.position = "bottom")
+}
+```
+
+## 5c. Supplementary plots
+
+```{r plot-supp}
+# One point per replicate, crossbar at the group mean, hline at 0.
+# Significance is counted per group x pair (counting per pair only would
+# mislabel panels once faceted by group).
+plot_codep_perrep <- function(perrep_df, facet_group = TRUE,
+                              show_sig = TRUE, sig_col = "p_adj",
+                              group_levels = NULL,
+                              title = "Peak co-dependency by replicate",
+                              subtitle = NULL) {
+  has_grp <- !all(is.na(perrep_df$group))
+  if (has_grp && !is.null(group_levels)) {
+    perrep_df <- perrep_df %>%
+      dplyr::mutate(group = factor(group, levels = group_levels))
+  }
+  keys <- if (has_grp && facet_group) c("group", "pair") else "pair"
+
+  mn <- perrep_df %>%
+    dplyr::group_by(dplyr::across(dplyr::all_of(keys))) %>%
+    dplyr::summarise(m = mean(codependency), .groups = "drop")
+
+  p <- ggplot(perrep_df, aes(x = pair, y = codependency)) +
+    geom_hline(yintercept = 0, linewidth = 0.4, colour = "grey20") +
+    geom_crossbar(data = mn, aes(x = pair, y = m, ymin = m, ymax = m),
+                  width = 0.55, linewidth = 0.4, fatten = 0, inherit.aes = FALSE) +
+    geom_point(aes(colour = Sample,
+                   shape = factor(low_fibers, levels = c(FALSE, TRUE))),
+               position = position_jitter(width = 0.12, height = 0), size = 2.6) +
+    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 1),
+                       labels = c(`FALSE` = "ok", `TRUE` = "low n"),
+                       name = NULL, drop = FALSE) +
+    labs(title = title, subtitle = subtitle,
+         x = NULL, y = "codependency (obs − exp)", colour = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "right",
+          axis.text.x = element_text(angle = 20, hjust = 1))
+
+  if (show_sig && sig_col %in% names(perrep_df)) {
+    span <- diff(range(perrep_df$codependency, na.rm = TRUE))
+    if (!is.finite(span) || span == 0) span <- 0.02
+    stars <- perrep_df %>%
+      dplyr::group_by(dplyr::across(dplyr::all_of(keys))) %>%
+      dplyr::summarise(y   = max(codependency, na.rm = TRUE) + 0.06 * span,
+                       lab = paste0(sum(.data[[sig_col]] < 0.05, na.rm = TRUE),
+                                    "/", dplyr::n(), " reps *"),
+                       .groups = "drop")
+    p <- p + geom_text(data = stars, aes(x = pair, y = y, label = lab),
+                       inherit.aes = FALSE, size = 3, vjust = 0)
+  }
+  if (has_grp && facet_group) p <- p + facet_wrap(~ group)
+  p
+}
+
+plot_codep_obsexp_perrep <- function(perrep_df,
+                                     title = "Observed vs expected co-accessibility",
+                                     subtitle = NULL) {
+  df <- perrep_df %>%
+    dplyr::select(Sample, group, pair,
+                  observed = observed_coaccessibility,
+                  expected = expected_coaccessibility, p_adj) %>%
+    tidyr::pivot_longer(c(observed, expected),
+                        names_to = "type", values_to = "fraction")
+
+  ggplot(df, aes(x = Sample, y = fraction, fill = type)) +
+    geom_col(position = position_dodge(width = 0.75), width = 0.7) +
+    facet_wrap(~ pair) +
+    scale_fill_manual(values = c(observed = "firebrick", expected = "grey65")) +
+    scale_y_continuous(labels = scales::label_percent(accuracy = 1)) +
+    labs(title = title, subtitle = subtitle, x = NULL,
+         y = "Fraction of fibers", fill = NULL) +
+    theme_minimal(base_size = 13) +
+    theme(legend.position = "top",
+          axis.text.x = element_text(angle = 35, hjust = 1))
+}
+```
+
+# 6. RUN — one pass per enhancer
+
+```{r run-fn}
+# Everything one enhancer needs, in the order the sections above define it.
+# Returns a list; nothing is written to disk here (see sections 7-9).
+run_enhancer <- function(label, cfg, d) {
+  message("\n==== ", label, " (", cfg$chrom, ", ",
+          length(cfg$summits), " summits, ", length(cfg$groups), " groups) ====")
+
+  # Re-seeded per enhancer so each enhancer's bootstrap CIs are reproducible
+  # on their own and do not depend on how many enhancers ran before it.
+  set.seed(BOOT_SEED)
+
+  sample_groups <- SAMPLE_GROUPS[cfg$groups]           # keeps the config order
+  samples       <- unlist(sample_groups, use.names = FALSE)
+  group_meta    <- GROUP_META %>% dplyr::filter(group %in% cfg$groups)
+  sample_meta   <- tibble::tibble(
+    Sample = samples,
+    group  = rep(names(sample_groups), lengths(sample_groups))
+  ) %>% dplyr::left_join(group_meta, by = "group")
+  stopifnot(!any(is.na(sample_meta$line)))
+
+  codep <- compute_codependency_perrep(
+    d$reads, d$msps, cfg$summits,
+    chrom_sel       = cfg$chrom,
+    min_width       = MIN_WIDTH,
+    fiber_set       = FIBER_SET,
+    samples         = samples,
+    sample_groups   = sample_groups,
+    min_fibers      = MIN_FIBERS,
+    boot            = N_BOOT,
+    p_adjust_method = P_ADJUST_METHOD,
+    p_adjust_scope  = P_ADJUST_SCOPE)
+
+  rep_summary <- summarise_codependency_reps(codep, by_group = TRUE)
+  pooled      <- pool_codependency_mh(codep, by_group = TRUE,
+                                      p_adjust_method = P_ADJUST_METHOD)
+
+  # Marginal accessibility per summit per sample. NB: computed on all fibers
+  # spanning each summit, a larger set than the co-dependency population.
+  marginals <- compute_summit_accessibility(
+    d$reads, d$msps, cfg$summits,
+    chrom_sel = cfg$chrom, min_width = MIN_WIDTH,
+    samples = samples, by_sample = TRUE) %>%
+    dplyr::left_join(sample_meta %>% dplyr::select(Sample, group), by = "Sample") %>%
+    dplyr::relocate(group, .after = Sample)
+
+  # ---- DMSO vs dTag ---------------------------------------------------------
+  or_cmp_glm <- compare_or_treatments_glm(
+    d$reads, d$msps, cfg$summits, sample_meta,
+    chrom_sel       = cfg$chrom,
+    min_width       = MIN_WIDTH,
+    fiber_set       = FIBER_SET,
+    ref_treatment   = REF_TREATMENT,
+    p_adjust_method = P_ADJUST_METHOD)
+
+  or_cmp_wald <- compare_or_treatments_wald(
+    pooled, group_meta, ref_treatment = REF_TREATMENT,
+    p_adjust_method = P_ADJUST_METHOD)
+
+  # Which two groups each cell line contrasts. Derived from group_meta rather
+  # than borrowed from compare_or_treatments_wald(), which returns NA group
+  # labels on its bail-out branch -- that would silently skip the tetrachoric
+  # check below even when the GLM result is perfectly valid.
+  contrast_groups <- group_meta %>%
+    dplyr::group_by(line) %>%
+    dplyr::summarise(
+      group_ref = group[treatment == REF_TREATMENT][1],
+      group_alt = group[treatment != REF_TREATMENT][1],
+      .groups = "drop")
+
+  or_compare <- or_cmp_glm %>%
+    dplyr::left_join(
+      # wald_note is carried through so section 8 can verify it, and dropped
+      # from the exported sheet there.
+      or_cmp_wald %>% dplyr::select(line, pair, ror_wald,
+                                    ror_wald_ci_lo, ror_wald_ci_hi,
+                                    p_wald, p_wald_adj, wald_note),
+      by = c("line", "pair")) %>%
+    dplyr::left_join(contrast_groups, by = "line") %>%
+    dplyr::relocate(group_ref, group_alt, .after = pair) %>%
+    # Pooled MH odds ratio for each contrasted group, taken straight from
+    # `pooled` (one row per group x pair, so no fan-out).
+    dplyr::left_join(pooled %>% dplyr::select(group, pair, or_ref = mh_or),
+                     by = c("group_ref" = "group", "pair")) %>%
+    dplyr::left_join(pooled %>% dplyr::select(group, pair, or_alt = mh_or),
+                     by = c("group_alt" = "group", "pair")) %>%
+    # Tetrachoric sensitivity check: the replicate-mean, threshold-invariant
+    # correlation for each contrasted group. If rho moves the same way as the
+    # odds ratio, the change in association is not an artifact of the treatment
+    # shifting marginal accessibility. Comparisons in which neither measure
+    # moves appreciably are recorded as NA -- they carry no directional
+    # information and must not be scored as contradictions.
+    dplyr::left_join(rep_summary %>% dplyr::select(group, pair, rho_ref = mean_rho),
+                     by = c("group_ref" = "group", "pair")) %>%
+    dplyr::left_join(rep_summary %>% dplyr::select(group, pair, rho_alt = mean_rho),
+                     by = c("group_alt" = "group", "pair")) %>%
+    dplyr::mutate(
+      delta_rho = rho_alt - rho_ref,
+      rho_direction_agrees = dplyr::case_when(
+        is.na(delta_rho) | is.na(ror) | !is.finite(ror)     ~ NA,
+        abs(delta_rho) < RHO_TOL | abs(log(ror)) < log(OR_TOL) ~ NA,
+        TRUE ~ sign(delta_rho) == sign(log(ror))))
+
+  # ---- diagnostics ----------------------------------------------------------
+  # An empty 2x2 cell means the common odds ratio is 0 or Inf and the variance
+  # of its log does not exist; the CI then comes from the Haldane fallback.
+  if (any(pooled$any_zero_cell)) {
+    message(label, ": pairs with an empty 2x2 cell (CI uses Haldane correction):")
+    print(pooled %>% dplyr::filter(any_zero_cell) %>%
+            dplyr::select(group, pair, mh_or, mh_ci_lo, mh_ci_hi,
+                          min_cell, ci_method))
+  }
+
+  # The Wald ROR is or_alt/or_ref straight from the pooled MH tables, so it
+  # fixes the orientation. If the GLM ROR is its reciprocal, the interaction
+  # term is being read the wrong way round (see compare_or_treatments_glm).
+  chk <- or_compare %>%
+    dplyr::filter(is.finite(ror), is.finite(ror_wald)) %>%
+    dplyr::mutate(dlog = log(ror) - log(ror_wald))
+  if (nrow(chk) > 0 && max(abs(chk$dlog)) > 0.15) {
+    stop(label, ": GLM and Wald RORs disagree in direction or magnitude:\n",
+         paste(sprintf("  %s / %s: ror=%.3f ror_wald=%.3f",
+                       chk$line, chk$pair, chk$ror, chk$ror_wald), collapse = "\n"))
+  }
+
+  list(label         = label,
+       config        = cfg,
+       samples       = samples,
+       sample_groups = sample_groups,
+       group_levels  = names(sample_groups),
+       group_colours = GROUP_COLOURS[names(sample_groups)],
+       codep         = codep,
+       rep_summary   = rep_summary,
+       pooled        = pooled,
+       marginals     = marginals,
+       or_compare    = or_compare)
+}
+```
+
+```{r run-all}
+res <- purrr::imap(ENHANCERS, function(cfg, label) run_enhancer(label, cfg, d))
+```
+
+# 7. Main figures
+
+Two PDFs per enhancer:
+
+* `<label>_codep_oddsratio_groups_min<w>.pdf` — pooled Mantel-Haenszel odds
+  ratio per group, one facet per summit pair, replicate ORs as open points,
+  DMSO-vs-dTag ROR bracket.
+* `<label>_codep_triangles_colouronly_min<w>.pdf` — LD-style triangle per
+  group on a shared colour scale, fill = mean codependency (obs − exp).
+
+```{r fig-forest, fig.width=8, fig.height=7}
+forest_plots <- purrr::imap(res, function(r, label) {
+  p <- plot_codep_forest_groups(
+    r$pooled, r$codep,
+    group_levels  = r$group_levels,
+    group_colours = r$group_colours,
+    or_compare    = r$or_compare,
+    title = sprintf("Association between summits (odds ratio) - %s", label))
+
+  # Width follows the number of stacked groups (4 groups -> 7 in, 2 -> 5 in),
+  # height follows the number of facets (one per summit pair).
+  ggsave(file.path(FIG_DIR, sprintf("%s_codep_oddsratio_groups_min%s.pdf",
+                                    label, MIN_WIDTH)),
+         plot   = p,
+         width  = 3 + length(r$group_levels),
+         height = 0.5 + 2 * length(unique(r$codep$pair)),
+         device = PDF_DEV)
+  p
+})
+purrr::walk(forest_plots, print)
+```
+
+```{r fig-triangles, fig.width=11, fig.height=9}
+# Colour only: the per-replicate numbers live in the metrics workbook, and the
+# fill is described in the figure legend text rather than a subtitle.
+#
+# NB: pass `plot =` to ggsave() explicitly. Without it ggsave() falls back to
+# last_plot(), which for a ggarrange object is the last individual panel built,
+# not the arranged figure -- that is why a saved PDF can differ from the
+# on-screen one.
+triangle_plots <- purrr::imap(res, function(r, label) {
+  tri <- triangle_panels_by_group(
+    r$codep, r$config$summits,
+    group_levels = r$group_levels, ncol = 2,
+    show_numbers = FALSE)
+
+  ggsave(file.path(FIG_DIR, sprintf("%s_codep_triangles_colouronly_min%s.pdf",
+                                    label, MIN_WIDTH)),
+         plot = tri$arranged, width = 6, height = 6, device = PDF_DEV)
+  tri$arranged
+})
+purrr::walk(triangle_plots, print)
+```
+
+# 8. Combined summary workbook
+
+One workbook covering both enhancers. Every sheet carries an `enhancer`
+column. Redundancies present in the two original per-enhancer workbooks have
+been removed:
+
+* `replicate_summary` — folded into `summary` (mean / sd / sign of the
+  per-replicate codependency now sit beside the pooled OR for the same
+  group × pair).
+* `fiber_depth` — exactly equal to `n_fibers` in `per_replicate`, because
+  `MIN_WIDTH` filters MSPs and never fibers, so the analysis population is the
+  same count. Dropped.
+* Constant note columns (`mh_note`, `glm_note`, `wald_note`, `fiber_set`) —
+  moved to `config` / `README`, and checked programmatically below so a
+  non-standard value cannot pass unnoticed.
+* `min_codep` / `max_codep`, `peak1` / `peak2`, `any_zero_cell`,
+  `n_fibers_total` — recoverable from columns that are kept.
+
+```{r combine-tables}
+.tag <- function(x, label) dplyr::mutate(x, enhancer = label, .before = 1)
+
+# ---- constant columns are dropped from the sheets, so verify they really are
+# constant. Anything unexpected must surface here rather than vanish.
+.constant_check <- function(values, expected, what) {
+  bad <- setdiff(unique(as.character(values)), expected)
+  if (length(bad) > 0) {
+    warning(sprintf("%s is not the expected constant -- found: %s",
+                    what, paste(bad, collapse = " | ")))
+  }
+  invisible(NULL)
+}
+.constant_check(unlist(lapply(res, function(r) r$codep$fiber_set)),
+                FIBER_SET, "fiber_set")
+.constant_check(unlist(lapply(res, function(r) r$pooled$mh_note)),
+                "asymptotic CMH p", "mh_note")
+
+# ---- 8a. headline summary: one row per enhancer x group x summit pair -------
+summary_tbl <- purrr::imap_dfr(res, function(r, label) {
+  r$pooled %>%
+    dplyr::left_join(
+      r$rep_summary %>%
+        dplyr::select(group, pair, mean_obs, mean_exp, mean_codep, sd_codep,
+                      same_sign, any_low_n, mean_rho, min_rho, max_rho),
+      by = c("group", "pair")) %>%
+    dplyr::mutate(group = factor(group, levels = r$group_levels)) %>%
+    dplyr::arrange(group, pair) %>%
+    dplyr::mutate(group = as.character(group)) %>%
+    .tag(label)
+}) %>%
+  dplyr::select(enhancer, group, pair, n_reps, total_fibers,
+                mean_obs, mean_exp, mean_codep, sd_codep, same_sign, any_low_n,
+                mh_or, mh_ci_lo, mh_ci_hi, p_mh, p_mh_adj,
+                mean_rho, min_rho, max_rho, woolf_p, min_cell, ci_method)
+
+# ---- 8b. per-replicate detail (the 2x2 tables everything else derives from) --
+perrep_tbl <- purrr::imap_dfr(res, function(r, label) {
+  r$codep %>%
+    dplyr::mutate(group = factor(group, levels = r$group_levels)) %>%
+    dplyr::arrange(group, pair, Sample) %>%
+    dplyr::mutate(group = as.character(group)) %>%
+    .tag(label)
+}) %>%
+  dplyr::select(enhancer, Sample, group, pair, n_fibers,
+                n11, n10, n01, n00, frac_peak1, frac_peak2,
+                observed_coaccessibility, expected_coaccessibility,
+                codependency, boot_ci_lo, boot_ci_hi,
+                odds_ratio, or_ci_lo, or_ci_hi, rho_tetrachoric,
+                p_fisher, p_adj, low_fibers)
+
+# ---- 8c. DMSO vs dTag --------------------------------------------------------
+or_tbl_full <- purrr::imap_dfr(res, function(r, label) .tag(r$or_compare, label))
+
+# The note columns are dropped from the sheet, so anything non-standard has to
+# surface here instead of disappearing silently.
+odd_notes <- or_tbl_full %>%
+  dplyr::filter(!grepl("^logistic interaction", glm_note) |
+                !grepl("^Wald on difference",  wald_note))
+if (nrow(odd_notes) > 0) {
+  warning("Non-standard DMSO-vs-dTag fits (inspect before reporting):")
+  print(odd_notes %>% dplyr::select(enhancer, line, pair, glm_note, wald_note))
+}
+
+or_tbl <- or_tbl_full %>%
+  dplyr::arrange(enhancer, line, pair) %>%
+  dplyr::select(enhancer, line, pair, group_ref, group_alt,
+                n_fibers_ref, n_fibers_alt, or_ref, or_alt,
+                ror, ror_ci_lo, ror_ci_hi, p_interaction, p_interaction_adj,
+                ror_wald, ror_wald_ci_lo, ror_wald_ci_hi, p_wald_adj,
+                rho_ref, rho_alt, delta_rho, rho_direction_agrees)
+
+# The sensitivity analysis is only informative if it is actually checked, and
+# NA rows must be counted as "not checked", never folded into the pass count.
+n_pass   <- sum(or_tbl$rho_direction_agrees %in% TRUE)
+n_fail   <- sum(or_tbl$rho_direction_agrees %in% FALSE)
+n_notest <- sum(is.na(or_tbl$rho_direction_agrees))
+
+if (n_fail > 0) {
+  warning("Tetrachoric correlation and odds ratio move in OPPOSITE directions ",
+          "for the comparisons below. The change in odds ratio may reflect the ",
+          "shift in marginal accessibility rather than a change in association ",
+          "-- do not report these as changes in coupling without addressing it.")
+  print(or_tbl %>%
+          dplyr::filter(rho_direction_agrees %in% FALSE) %>%
+          dplyr::select(enhancer, line, pair, or_ref, or_alt, ror,
+                        rho_ref, rho_alt, delta_rho))
+}
+if (n_notest > 0) {
+  message(n_notest, " comparison(s) were NOT testable (rho undefined, or ",
+          "neither measure moved by more than RHO_TOL = ", RHO_TOL,
+          " / OR_TOL = ", OR_TOL, "):")
+  print(or_tbl %>%
+          dplyr::filter(is.na(rho_direction_agrees)) %>%
+          dplyr::select(enhancer, line, pair, ror, rho_ref, rho_alt, delta_rho))
+}
+message(sprintf(
+  "Tetrachoric sensitivity check: %d agree, %d disagree, %d not testable (of %d).",
+  n_pass, n_fail, n_notest, nrow(or_tbl)))
+
+# ---- 8d. marginal accessibility ---------------------------------------------
+marginals_tbl <- purrr::imap_dfr(res, function(r, label) .tag(r$marginals, label))
+
+# ---- 8e. config --------------------------------------------------------------
+config_tbl <- dplyr::bind_rows(
+  tibble::tibble(
+    enhancer  = "(global)",
+    parameter = c("min_width_main", "fiber_set", "min_fibers", "n_boot",
+                  "boot_seed", "p_adjust_method", "p_adjust_scope",
+                  "ref_treatment", "mh_p_type", "rho_tol", "or_tol",
+                  "date", "R_version", "ggplot2_version"),
+    value     = c(as.character(MIN_WIDTH), FIBER_SET,
+                  as.character(MIN_FIBERS), as.character(N_BOOT),
+                  as.character(BOOT_SEED),
+                  P_ADJUST_METHOD, P_ADJUST_SCOPE, REF_TREATMENT,
+                  "asymptotic CMH (>=2 replicates per group)",
+                  as.character(RHO_TOL), as.character(OR_TOL),
+                  as.character(Sys.Date()),
+                  paste(R.version$major, R.version$minor, sep = "."),
+                  as.character(utils::packageVersion("ggplot2")))),
+  purrr::imap_dfr(res, function(r, label) {
+    tibble::tibble(
+      enhancer  = label,
+      parameter = c("chrom", "summits", "n_summit_pairs", "groups",
+                    "n_samples", "samples"),
+      value     = c(r$config$chrom,
+                    paste(sprintf("%s=%d", names(r$config$summits),
+                                  r$config$summits), collapse = "; "),
+                    as.character(choose(length(r$config$summits), 2)),
+                    paste(r$group_levels, collapse = "; "),
+                    as.character(length(r$samples)),
+                    paste(r$samples, collapse = "; ")))
+  })
+)
+
+# ---- 8f. README --------------------------------------------------------------
+readme <- tibble::tribble(
+  ~sheet,          ~column,                       ~meaning,
+  "(all)",         "enhancer",                    "which enhancer the row belongs to; the two enhancers are analysed independently and nothing is adjusted or pooled across them",
+  "summary",       "group / pair",                "experimental group and summit pair; ONE ROW PER enhancer x group x pair -- this is the headline table",
+  "summary",       "n_reps / total_fibers",       "replicates contributing, and fibers summed over them",
+  "summary",       "mean_obs / mean_exp",         "replicate mean of observed and expected co-accessibility",
+  "summary",       "mean_codep / sd_codep",       "replicate mean and sd of codependency = observed - expected; >0 cooperative, <0 mutually exclusive",
+  "summary",       "same_sign",                   "TRUE if all replicates agree in direction",
+  "summary",       "any_low_n",                   sprintf("TRUE if any replicate had < %d fibers", MIN_FIBERS),
+  "summary",       "mh_or, mh_ci_lo/hi",          "Cochran-Mantel-Haenszel odds ratio stratified by replicate (fibers NOT pooled), with a Robins-Breslow-Greenland 95% CI",
+  "summary",       "p_mh / p_mh_adj",             sprintf("asymptotic CMH p and its %s-adjusted value -- p_mh_adj is the headline p-value", P_ADJUST_METHOD),
+  "summary",       "mean_rho / min_rho / max_rho","tetrachoric correlation averaged over replicates, and its range. This is the latent-variable correlation that would produce the observed 2x2 table given its own margins: unlike the odds ratio it is invariant to the marginals under a threshold model, so it shows whether an apparent change in association survives a change in accessibility. Computed per replicate and then averaged, so fibers are never pooled across replicates",
+  "summary",       "woolf_p",                     "Woolf homogeneity of the OR across replicates; small = replicates disagree and pooling is questionable (very low power with 2 replicates)",
+  "summary",       "min_cell",                    "smallest 2x2 cell across replicates; 0 means the exact MH variance is undefined and the CI used the Haldane fallback",
+  "summary",       "ci_method",                   "RBG, or RBG after Haldane-Anscombe +0.5 when a cell was empty (interval then approximate)",
+  "per_replicate", "n_fibers",                    "fibers in the analysis population for that replicate (spanning ALL summits of the enhancer). MIN_WIDTH filters MSPs, not fibers, so this is also the raw fiber depth over the summit window",
+  "per_replicate", "n11/n10/n01/n00",             "2x2 counts: accessible/inaccessible at summit1 x summit2",
+  "per_replicate", "frac_peak1 / frac_peak2",     "marginal accessible fraction at each summit ON THIS FIBER SET (not comparable to the marginals sheet)",
+  "per_replicate", "observed_coaccessibility",    "P(accessible at both) = n11 / n_fibers",
+  "per_replicate", "expected_coaccessibility",    "frac_peak1 * frac_peak2, i.e. independence",
+  "per_replicate", "codependency",                "observed - expected",
+  "per_replicate", "boot_ci_lo / boot_ci_hi",     sprintf("percentile bootstrap 95%% CI on codependency (%d draws, fibers resampled and both marginals and joint recomputed each draw)", N_BOOT),
+  "per_replicate", "odds_ratio, or_ci_lo/hi",     "Fisher exact conditional OR and 95% CI for that replicate (Inf/0 when a cell is empty)",
+  "per_replicate", "rho_tetrachoric",             "tetrachoric correlation of that replicate's 2x2 table; threshold-invariant companion to odds_ratio",
+  "per_replicate", "p_fisher / p_adj",            sprintf("Fisher exact two-sided p for independence, and its %s-adjusted value (scope = %s)", P_ADJUST_METHOD, P_ADJUST_SCOPE),
+  "per_replicate", "low_fibers",                  sprintf("TRUE if n_fibers < %d", MIN_FIBERS),
+  "DMSO_vs_dTag",  "-",                           "within each cell line, IS the odds ratio different between DMSO and dTag? A ratio of odds ratios (interaction) -- not answerable by comparing two separate p-values or overlapping CIs",
+  "DMSO_vs_dTag",  "or_ref / or_alt",             "pooled MH odds ratio in DMSO / in dTag",
+  "DMSO_vs_dTag",  "ror, ror_ci_lo/hi",           "ROR = OR_dTag / OR_DMSO from the fiber-level logistic interaction (PRIMARY). 1 = association unchanged, <1 = weaker after dTag",
+  "DMSO_vs_dTag",  "p_interaction(_adj)",         "likelihood-ratio test (1 df) of the acc_a x dTag interaction in acc_b ~ acc_a + Sample + acc_a_x_dtag, fitted with an explicit product column -- the headline DMSO-vs-dTag p-value",
+  "DMSO_vs_dTag",  "ror_wald, p_wald_adj",        "independent cross-check: Wald test on the difference of the two pooled MH log ORs. Should agree with ror / p_interaction; the run stops if |log ror - log ror_wald| > 0.15",
+  "DMSO_vs_dTag",  "n_fibers_ref / n_fibers_alt", "fibers contributing from each treatment (replicates combined)",
+  "DMSO_vs_dTag",  "rho_ref / rho_alt",           "replicate-mean tetrachoric correlation in DMSO / in dTag (threshold-invariant sensitivity analysis)",
+  "DMSO_vs_dTag",  "delta_rho",                   "rho_alt - rho_ref. Reported as a difference only: a ratio of correlations is undefined at rho = 0 and changes sign when the two straddle zero",
+  "DMSO_vs_dTag",  "rho_direction_agrees",        sprintf("TRUE if the tetrachoric correlation moves in the same direction as the odds ratio, i.e. the change in association is NOT explained by the treatment shifting marginal accessibility. FALSE triggers a warning and the comparison should not be reported as a change in coupling. NA = not testable: rho undefined, or neither measure moved by more than RHO_TOL = %s / OR_TOL = %s, in which case there is no direction to agree about", RHO_TOL, OR_TOL),
+  "marginals",     "fraction_accessible",         "marginal accessibility per summit per sample, using EVERY fiber spanning that summit -- a larger population than the co-dependency tables, so do not compare with frac_peak1/2",
+  "config",        "-",                           "parameters used for this run, global and per enhancer"
+)
+```
+
+## 8g. MSP width sensitivity (optional sheets)
+
+Computed here, *before* the workbook is assembled, so that the workbook can be
+written and saved exactly once. Skipped unless `MAKE_SUPPLEMENTARY` is TRUE.
+
+```{r sweep-init}
+# Always defined, so the export chunk below can test for content without
+# needing exists(). NULL = the sweep did not run.
+sweep_perrep <- NULL
+sweep_pooled <- NULL
+```
+
+```{r width-sweep, eval=MAKE_SUPPLEMENTARY}
+# Same analysis at several MSP width thresholds. Bootstrap off (boot = 0) --
+# this is a robustness table, not a figure.
+sweep_perrep <- purrr::imap_dfr(res, function(r, label) {
+  purrr::imap_dfr(WIDTH_SWEEP, function(w, wlab) {
+    compute_codependency_perrep(
+      d$reads, d$msps, r$config$summits,
+      chrom_sel       = r$config$chrom,
+      min_width       = if (is.na(w)) NULL else w,
+      fiber_set       = FIBER_SET,
+      samples         = r$samples,
+      sample_groups   = r$sample_groups,
+      min_fibers      = MIN_FIBERS,
+      boot            = 0,
+      p_adjust_method = P_ADJUST_METHOD,
+      p_adjust_scope  = P_ADJUST_SCOPE
+    ) %>% dplyr::mutate(enhancer = label, width_label = wlab, min_width = w,
+                        .before = 1)
+  })
+})
+
+sweep_pooled <- sweep_perrep %>%
+  dplyr::group_split(enhancer, width_label) %>%
+  purrr::map_dfr(function(dd) {
+    pool_codependency_mh(dd, by_group = TRUE,
+                         p_adjust_method = P_ADJUST_METHOD) %>%
+      dplyr::mutate(enhancer = dd$enhancer[1], width_label = dd$width_label[1],
+                    .before = 1)
+  })
+
+sweep_pooled
+```
+
+## 8h. Write the workbook
+
+```{r export-xlsx}
+# The full sheet list is assembled first and the workbook is created, written
+# and saved in ONE pass.
+#
+# DO NOT go back to calling saveWorkbook() twice on the same workbook object
+# (e.g. saving here and then appending extra sheets later). openxlsx does not
+# reliably retain the sheet data of already-written sheets across a second
+# save of the same object: the result is a file in which every sheet written
+# before the first save is EMPTY and only the later ones are populated.
+sheets <- list(
+  README        = readme,
+  config        = config_tbl,
+  summary       = summary_tbl,
+  per_replicate = perrep_tbl,
+  DMSO_vs_dTag  = or_tbl,
+  marginals     = marginals_tbl
+)
+
+# Optional sweep sheets, included only when they were actually computed.
+if (!is.null(sweep_perrep) && nrow(sweep_perrep) > 0) {
+  sheets$width_sweep_perrep <- sweep_perrep
+}
+if (!is.null(sweep_pooled) && nrow(sweep_pooled) > 0) {
+  sheets$width_sweep_pooled <- sweep_pooled
+}
+
+# Guard: a sheet that is empty or has no columns would be written as a blank
+# tab, which is easy to miss when the workbook has eight tabs.
+empty <- names(sheets)[vapply(sheets, function(x)
+  is.null(x) || nrow(x) == 0 || ncol(x) == 0, logical(1))]
+if (length(empty) > 0) {
+  stop("These sheets have no data and would be written blank: ",
+       paste(empty, collapse = ", "))
+}
+
+wb  <- openxlsx::createWorkbook()
+hdr <- openxlsx::createStyle(textDecoration = "bold", fgFill = "#EFEFEF",
+                             border = "bottom", halign = "left")
+for (nm in names(sheets)) {
+  openxlsx::addWorksheet(wb, nm)
+  openxlsx::writeData(wb, nm, as.data.frame(sheets[[nm]]), headerStyle = hdr)
+  openxlsx::freezePane(wb, nm, firstActiveRow = 2)
+  openxlsx::setColWidths(wb, nm, cols = seq_len(ncol(sheets[[nm]])),
+                         widths = "auto")
+}
+
+xlsx_path <- file.path(
+  TABLE_DIR,
+  sprintf("%s_codependency_metrics_min%s.xlsx",
+          paste(names(ENHANCERS), collapse = "_"), MIN_WIDTH))
+openxlsx::saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+
+# Read the file back and confirm every sheet actually contains rows. This is
+# the check that would have caught the double-save bug immediately.
+check_written <- purrr::map_dfr(names(sheets), function(nm) {
+  got <- tryCatch(openxlsx::read.xlsx(xlsx_path, sheet = nm),
+                  error = function(e) NULL)
+  tibble::tibble(sheet = nm,
+                 rows_expected = nrow(sheets[[nm]]),
+                 rows_in_file  = if (is.null(got)) NA_integer_ else nrow(got))
+})
+if (any(is.na(check_written$rows_in_file) |
+        check_written$rows_in_file < check_written$rows_expected)) {
+  print(check_written)
+  stop("Workbook written but some sheets are empty or short -- see above.")
+}
+message("Wrote ", xlsx_path, " (", length(sheets), " sheets, all verified)")
+check_written
+
+summary_tbl
+```
+
+```{r report-sentences}
+# Ready-to-paste numbers for the results text.
+summary_tbl %>%
+  dplyr::transmute(
+    enhancer, group, pair,
+    sentence = sprintf(
+      "OR = %.2f (95%% CI %.2f-%.2f), %s p = %s, n = %d fibers across %d replicates; mean obs - exp = %+.1f%%",
+      mh_or, mh_ci_lo, mh_ci_hi, P_ADJUST_METHOD,
+      format.pval(p_mh_adj, digits = 2, eps = 1e-4),
+      total_fibers, n_reps, 100 * mean_codep)) %>%
+  as.data.frame()
+
+or_tbl %>%
+  dplyr::transmute(
+    enhancer, line, pair,
+    sentence = sprintf(
+      "OR %.2f (%s) vs %.2f (%s); ROR = %.2f (95%% CI %.2f-%.2f), interaction %s p = %s; tetrachoric rho %.3f -> %.3f",
+      or_ref, REF_TREATMENT, or_alt, sub("^.* ", "", group_alt),
+      ror, ror_ci_lo, ror_ci_hi, P_ADJUST_METHOD,
+      format.pval(p_interaction_adj, digits = 2, eps = 1e-4),
+      rho_ref, rho_alt)) %>%
+  as.data.frame()
+```
+
+# 9. Supplementary figures
+
+Off by default. Set `MAKE_SUPPLEMENTARY <- TRUE` in section 0d to produce the
+numbered triangles, the per-replicate dotplot and the observed-vs-expected
+bars. The same flag adds the two width-sensitivity sheets to the workbook in
+section 8g; that part runs earlier, because the workbook must be assembled and
+saved in a single pass.
+
+```{r fig-supp, eval=MAKE_SUPPLEMENTARY, fig.width=12, fig.height=8}
+for (label in names(res)) {
+  r <- res[[label]]
+
+  # Triangles with each replicate's obs - exp printed in the diamond.
+  tri_num <- triangle_panels_by_group(
+    r$codep, r$config$summits,
+    group_levels = r$group_levels, ncol = 2, show_numbers = TRUE)
+  print(tri_num$arranged)
+  ggsave(file.path(FIG_DIR, sprintf("%s_codep_triangles_min%s.pdf",
+                                    label, MIN_WIDTH)),
+         plot = tri_num$arranged, width = 6, height = 6, device = PDF_DEV)
+
+  p_var    <- plot_codep_perrep(r$codep, group_levels = r$group_levels,
+                                subtitle = label)
+  p_obsexp <- plot_codep_obsexp_perrep(r$codep, subtitle = label)
+  print(p_var); print(p_obsexp)
+
+  ggsave(file.path(FIG_DIR, sprintf("%s_codep_perrep_min%s.pdf", label, MIN_WIDTH)),
+         plot = p_var, width = 11, height = 7, device = PDF_DEV)
+  ggsave(file.path(FIG_DIR, sprintf("%s_codep_obsexp_min%s.pdf", label, MIN_WIDTH)),
+         plot = p_obsexp, width = 11, height = 7, device = PDF_DEV)
+}
+```
+
+```{r session-info}
+sessionInfo()
+```
