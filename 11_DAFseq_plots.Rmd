@@ -1,0 +1,3852 @@
+---
+title: "DAF-seq single-molecule chromatin analysis (fiberHMM v2.9.7)"
+author: "Lucia Ichino"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = FALSE, dev = "ragg_png")
+```
+
+<!-- ==========================================================================
+     WHAT THIS DOCUMENT DOES
+
+     Single-molecule (DAF-seq / Fiber-seq style) analysis of nucleosome
+     footprints, MSPs and TF footprints called by fiberHMM v2.9.7, at six
+     enhancers, comparing DMSO vs dTag (TWIST1 degron, SNAI1/2 degron).
+
+     Per enhancer it produces:
+       1. a read-level "heatmap" of nucleosome footprints, k-means clustered
+          on the local nucleosome pattern, with an ATAC track and DMSO->dTag
+          cluster-flow ribbons;
+       2. a log2(dTag/DMSO) bar panel of the % of reads in each cluster;
+       3. an open/closed summary log2FC, where "open" clusters are defined
+          automatically from MSP geometry around the motif;
+       4. TF-footprint occupancy metaplots (all reads vs accessible reads);
+       5. a cross-enhancer summary and a CMH-tested TF occupancy barplot.
+
+     STRUCTURE
+       Section 1  CONFIGURATION  <-- the ONLY place with absolute paths
+       Section 2  Libraries
+       Section 3  Enhancer registry (names, coordinates, motifs, k, clusters)
+       Section 4  Sample / file-path helpers
+       Section 5  Core functions
+       Section 6  Per-enhancer analyses
+       Section 7  Cross-enhancer summaries
+     ========================================================================== -->
+
+
+# 1. Configuration
+
+<!-- ==========================================================================
+     >>>>>>>>>>>>>>>>  THE ONLY PLACE WITH ABSOLUTE PATHS  <<<<<<<<<<<<<<<<
+
+     Before pushing to GitHub, replace the four strings below with relative
+     paths or environment lookups, e.g.
+
+         DAF_ROOT <- Sys.getenv("DAF_ROOT", "data/fiberHMM")
+         ATAC_DIR <- Sys.getenv("ATAC_DIR", "data/atac")
+         FIG_DIR  <- "figures"
+         ROBJ_DIR <- "cache"
+
+     Nothing else in this document contains a machine-specific path.
+     ========================================================================== -->
+
+```{r config}
+## ---- paths -----------------------------------------------------------------
+DAF_ROOT <- "/Volumes/storage/DAFseq/DAFseq_pacbio_exp2_andplasmid_fiber/DAF_QC_marlowe"
+ATAC_DIR <- file.path("/Users/luciaichino/Library/CloudStorage/Dropbox",
+                      "lucia (1)/Lucia 09_05_16/postdoc/Wysocka_lab_personal_folder",
+                      "seq_data/dataforIGV")
+FIG_DIR  <- file.path("/Users/luciaichino/Library/CloudStorage/Dropbox",
+                      "lucia (1)/Lucia 09_05_16/postdoc/Wysocka_lab_personal_folder",
+                      "SNAI_paper/codes/single molecule/DAF/figures_min1")
+ROBJ_DIR <- file.path(FIG_DIR, "min1Robj")
+
+## ---- run options -----------------------------------------------------------
+FIBERHMM_VER <- "fiberHMM_v2.9.7"
+
+# TRUE  = recompute bundles + k-means and overwrite the cache
+# FALSE = reuse cached .rds where present
+
+REBUILD_CLUSTERS <- TRUE
+
+## ---- k-means -----------------------------------------------------------
+# kmeans(centers = <k>) seeds by SAMPLING ROWS, so the
+# result depends on the order the bundles happen to be stacked in. Rows are now
+# sorted into a canonical, locale-independent order before clustering, and the
+# search is run much harder, so a run is reproducible from (reads, k, seed)
+# alone.
+KMEANS_SEED      <- 42L
+KMEANS_NSTART    <- 200L   # was 25 -- see C7 for why 25 was not enough
+KMEANS_ITER_MAX  <- 200L
+# Full-data k-means at nstart = 200 is impractical here (~180k reads x ~400 bp
+# per start). Instead the many random starts are run on a subsample to find
+# good centres, then ONE deterministic pass over all reads refines them from
+# those centres. Set to NULL to run every start on the full matrix.
+KMEANS_SUBSAMPLE <- 20000L
+
+## ---- analysis choices ------------------------------------------------------
+TF_SCORE_THR <- 70L    # blockTq quality floor for TF footprints
+TF_MAX_WIDTH <- 40L    # drop TF "footprints" wider than this (nucleosome-scale)
+MIN_READ_COV <- 5L     # bp with fewer spanning reads than this are NA
+
+LOW_COV_RULE <- "both"
+
+MIN_READS_FC      <- 30L
+MIN_READS_FC_ENH1 <- 110L
+
+dir.create(FIG_DIR,  recursive = TRUE, showWarnings = FALSE)
+dir.create(ROBJ_DIR, recursive = TRUE, showWarnings = FALSE)
+
+fig  <- function(...) file.path(FIG_DIR,  ...)   # figure output path
+robj <- function(...) file.path(ROBJ_DIR, ...)   # cached object path
+
+# null-coalescing operator (base R only has it from 4.4.0)
+`%||%` <- function(a, b) if (is.null(a)) b else a
+```
+
+# 2. Libraries
+
+```{r libraries}
+library(tidyverse)      # dplyr / tidyr / purrr / stringr / ggplot2 / readr
+library(GenomicRanges)
+library(rtracklayer)    # import.bw() for the ATAC tracks
+library(patchwork)      # p1 | p2 composition
+library(ggpubr)         # ggarrange();  FIX B7: was loaded mid-document
+library(ggnewscale)     # second fill scale for the motif bands
+library(ggrastr)        # rasterise the dense footprint rectangles
+library(zoo)            # rollmean() in the midpoint metaplot
+library(scales)         # comma(), pretty_breaks()
+
+# fiberHMM writes very long BED lines (one block per footprint per read).
+# Only relevant if a file is ever handed to readr as a *connection*.
+Sys.setenv(VROOM_CONNECTION_SIZE = 500072)
+
+# ---- conflicted -------------------------------------------------------------
+# tidyverse + Bioconductor collide on a lot of common verb names (filter, lag,
+# rename, select, slice, first, last, reduce, expand, the set operations...).
+# Ambiguous calls in this document are namespaced explicitly, but if the
+# `conflicted` package is attached these preferences settle the rest up front
+# rather than letting them surface one error at a time mid-run.
+if (requireNamespace("conflicted", quietly = TRUE) &&
+    "conflicted" %in% loadedNamespaces()) {
+  prefer <- function(pkg, fn) {
+    try(conflicted::conflict_prefer(fn, pkg, quiet = TRUE), silent = TRUE)
+  }
+  for (f in c("filter", "lag", "select", "rename", "slice", "mutate", "count",
+              "first", "last", "desc", "collapse", "summarise", "n")) prefer("dplyr", f)
+  for (f in c("expand", "unnest", "complete", "extract"))              prefer("tidyr", f)
+  for (f in c("map", "reduce", "discard", "compact", "simplify"))      prefer("purrr", f)
+  for (f in c("setdiff", "intersect", "union", "setequal"))            prefer("base",  f)
+  rm(prefer, f)
+}
+```
+
+# 3. Enhancer registry
+
+<!-- ==========================================================================
+     One row per analysed window. `label` is the ONLY name that reaches a
+     figure. Everything else in the document refers to enhancers by their
+     internal key and calls enh_label() to render the name.
+
+     `cluster_range` selects which reads enter the k-means and defines the
+     matrix columns. `plot_range` is the (wider) window that gets drawn.
+     `minset`        is the fiberHMM call set used -- see reviewer note Q1.
+     `accessible`    are the cluster IDs treated as "open" in the TF
+                     occupancy quantification (post-hoc, from the metaplots).
+     ========================================================================== -->
+
+```{r enhancer-registry}
+ENH <- list(
+
+  enh4 = list(
+    label   = "Enh 1",
+    chrom   = "chr20",
+    minset  = "min1",                    # <-- Q1: the only enhancer on min1
+    # clustering window spans BOTH the TWIST1 and the SNAI motif
+    cluster = IRanges(17169646, 17170010),
+    plot    = IRanges(17168966, 17170700),
+    tf_plot = IRanges(17169600, 17170100),
+    k       = 12L,
+    accessible = "1",
+    motifs  = tribble(
+      ~TF,      ~xmin,     ~xmax,     ~col,
+      "TWIST1",  17169866,  17169882, "turquoise3",
+      "TFAP2A",  17169974,  17169985, "deepskyblue",
+      "SNAI",    17169746,  17169754, "magenta3"
+    ),
+    # the TF metaplots used a different palette for the same three motifs
+    motifs_tf = tribble(
+      ~TF,      ~xmin,     ~xmax,     ~col,
+      "TWIST1",  17169866,  17169882, "blue",
+      "TFAP2A",  17169974,  17169985, "#6baed6",
+      "SNAI",    17169746,  17169754, "purple"
+    ),
+    # alternative clustering windows tried during development:
+    #   TWIST1 only : IRanges(17169794, 17170010)
+    #   SNAI only   : IRanges(17169646, 17169854)
+    peaks = list(
+      snai   = list(motif = c(17169746, 17169754), tf = "SNAI"),
+      twist1 = list(motif = c(17169866, 17169882), tf = "TWIST1")
+    )
+  ),
+
+  enh10 = list(
+    label   = "Enh 2",
+    chrom   = "chr11",
+    minset  = "min3",
+    plot    = IRanges(12318593, 12320381),
+    tf_plot = IRanges(12318950, 12320181),
+    k       = 10L,
+    # NO top-level `accessible` on purpose: this enhancer is clustered three
+    # times, once per peak, so "cluster 1" is a different set of molecules in
+    # each. The accessible sets live on the peak entries below, and
+    # enh_accessible("enh10") now errors rather than guessing.
+    motifs  = tribble(
+      ~TF,       ~xmin,     ~xmax,     ~col,
+      "TWIST1",   12319212,  12319228, "turquoise3",
+      "SNAI1/2",  12319565,  12319573, "magenta3",
+      "E-box",    12319892,  12319899, "turquoise4"
+    ),
+    # full motif set used for the TF metaplots (includes lower-confidence calls)
+    motifs_tf = tribble(
+      ~TF,       ~xmin,     ~xmax,     ~col,
+      "TFAP2",    12319535,  12319546, "blue",
+      "TWIST1",   12319212,  12319228, "blue",
+      "SNAI",     12319565,  12319573, "purple",
+      "?",        12319607,  12319626, "blue",
+      "E-box",    12319892,  12319899, "turquoise4"
+    ),
+    # three separate clusterings, one per accessible peak
+    peaks = list(
+      peak1 = list(cluster = IRanges(12319112, 12319328),
+                   motif = c(12319212, 12319228), tf = "TWIST1",
+                   accessible = c("1", "2")),
+      peak2 = list(cluster = IRanges(12319465, 12319665),
+                   motif = c(12319565, 12319573), tf = "SNAI",
+                   accessible = c("1")),
+      # peak3$accessible is READ BY NOTHING today -- there is no peak-3 TF
+      # metaplot chunk. Editing it has no effect until one is added.
+      peak3 = list(cluster = IRanges(12319792, 12319999),
+                   motif = c(12319892, 12319899), tf = "E-box",
+                   accessible = c("1"))
+    )
+  ),
+
+  enh8 = list(
+    label   = "Enh 3",
+    chrom   = "chr20",
+    minset  = "min3",
+    plot    = IRanges(57257593, 57259949),
+    tf_plot = IRanges(57257900, 57259650),
+    atac_plot = IRanges(57257593, 57259600),
+    k       = 10L,
+    accessible = "1",
+    motifs  = tribble(
+      ~TF,        ~xmin,     ~xmax,     ~col,
+      "SNAI",      57258380,  57258388, "purple",
+      "AP2A",      57258364,  57258374, "blue",
+      "TWIST1",    57259398,  57259414, "blue",
+      "TWIST1",    57259464,  57259480, "blue",
+      "ZNF184?",   57259320,  57259332, "blue"
+    ),
+    peaks = list(
+      peak1 = list(cluster = IRanges(57258280, 57258488),
+                   motif = c(57258380, 57258388), tf = "SNAI",
+                   motifs = tribble(~TF, ~xmin, ~xmax, ~col,
+                                    "SNAI", 57258380, 57258388, "purple")),
+      peak2 = list(cluster = IRanges(57259298, 57259514),
+                   motif = c(57259398, 57259414), tf = "TWIST1",
+                   motifs = tribble(~TF, ~xmin, ~xmax, ~col,
+                                    "SNAI",   57258380, 57258388, "darkorchid",
+                                    "TWIST1", 57259398, 57259414, "darkcyan"))
+    )
+  ),
+
+  enh15 = list(
+    label   = "Enh 4",
+    chrom   = "chr6",
+    minset  = "min3",
+    # NB the section header in the old file quoted chr6:79,609,697-79,612,498
+    # as the locus; the window actually drawn is the narrower one below.
+    cluster = IRanges(79610335, 79610535),   # around the SNAI motif
+    plot    = IRanges(79609721, 79611537),
+    k       = 10L,
+    accessible = "1",
+    motifs  = tribble(
+      ~TF,     ~xmin,     ~xmax,     ~col,
+      "SNAI",   79610435,  79610443, "purple"
+    ),
+    # alternative clustering window tried: IRanges(79610635, 79610845) (TFAP2A)
+    peaks = list(
+      snai = list(motif = c(79610435, 79610443), tf = "SNAI")
+    )
+  ),
+
+  enh30 = list(
+    label   = "Enh 5",
+    chrom   = "chr3",
+    minset  = "min3",
+    cluster = IRanges(69116902, 69117314),
+    plot    = IRanges(69116276, 69117925),
+    tf_plot = IRanges(69116800, 69118000),
+    atac_plot = IRanges(69116600, 69117925),
+    k       = 10L,
+    accessible = "1",
+    motifs  = tribble(
+      ~TF,     ~xmin,     ~xmax,     ~col,
+      "SNAI",   69117105,  69117112, "purple"
+    ),
+    # SOX9 (chr3:69117056-69117072) produced no footprint and is omitted
+    motifs_tf = tribble(
+      ~TF,        ~xmin,     ~xmax,     ~col,
+      "SNAI",      69117105,  69117112, "purple",
+      "STAT1/4",   69117023,  69117031, "blue",
+      "AP2A",      69117131,  69117141, "blue",
+      "NR2F1",     69117159,  69117165, "blue",
+      "NR2F1",     69117169,  69117175, "blue",
+      "ZNF596?",   69117861,  69117871, "blue"
+    ),
+    peaks = list(
+      snai = list(motif = c(69117105, 69117112), tf = "SNAI")
+    )
+  ),
+
+  enh33 = list(
+    label   = "Enh 6",
+    chrom   = "chr11",
+    minset  = "min3",
+    cluster = IRanges(8708990, 8709198),
+    plot    = IRanges(8708345, 8709876),
+    tf_plot = IRanges(8708750, 8709964),
+    atac_plot = IRanges(8708500, 8709964),
+    k       = 10L,
+    accessible = "1",
+    motifs  = tribble(
+      ~TF,     ~xmin,    ~xmax,    ~col,
+      "SNAI",   8709103,  8709110, "purple"
+    ),
+    motifs_tf = tribble(
+      ~TF,       ~xmin,    ~xmax,    ~col,
+      "SNAI",     8709103,  8709110, "purple",
+      "TWIST1",   8709132,  8709147, "blue",
+      "TFAP2A",   8709060,  8709071, "blue",
+      "TFAP2A",   8709416,  8709427, "blue",
+      "TFAP2A",   8709511,  8709523, "blue",
+      "PRDM5",    8709453,  8709463, "blue",
+      "PRDM5",    8709924,  8709934, "blue"
+    ),
+    peaks = list(
+      snai = list(motif = c(8709103, 8709110), tf = "SNAI")
+    )
+  )
+)
+
+# ---- accessors -------------------------------------------------------------
+# enh_label("enh10")           -> "Enh 2"
+# enh_label("enh10", "peak 1") -> "Enh 2 peak 1"
+enh_label <- function(key, suffix = NULL) {
+  lab <- ENH[[key]]$label
+  if (is.null(lab)) stop("No registry entry for enhancer key '", key, "'")
+  if (is.null(suffix)) lab else paste(lab, suffix)
+}
+
+# "enh10" -> "Enh2"; used to build output filenames from the paper name so the
+# PDFs on disk can no longer disagree with the titles inside them.
+enh_slug <- function(key, suffix = NULL) {
+  s <- gsub(" ", "", ENH[[key]]$label)
+  if (is.null(suffix)) s else paste0(s, "_", gsub("[^A-Za-z0-9]+", "", suffix))
+}
+
+# fig_name("enh10", "heatmap", "peak1") -> <FIG_DIR>/Enh2_peak1_heatmap_v297.pdf
+fig_name <- function(key, what, suffix = NULL, ext = "pdf") {
+  fig(paste0(enh_slug(key, suffix), "_", what, "_v297.", ext))
+}
+
+# GRanges built from the registry, so chrom can never drift from coordinates
+enh_gr <- function(key, which = c("cluster", "plot", "tf_plot", "atac_plot"),
+                   peak = NULL) {
+  which <- match.arg(which)
+  cfg   <- ENH[[key]]
+  ir    <- if (!is.null(peak) && !is.null(cfg$peaks[[peak]][[which]])) {
+    cfg$peaks[[peak]][[which]]
+  } else if (!is.null(cfg[[which]])) {
+    cfg[[which]]
+  } else {
+    cfg$plot     # sensible fallback: tf_plot/atac_plot default to plot
+  }
+  GRanges(cfg$chrom, ir)
+}
+
+# Accessible ("open") cluster IDs, per enhancer or per peak.
+#
+# WHY THIS IS A FUNCTION AND NOT A BARE $accessible LOOKUP:
+# compute_tf_metaplot(clusters = NULL) applies NO cluster filter and returns
+# the all-reads curve. So a missing or mistyped `accessible` would not error --
+# it would quietly draw every read under an "accessible reads" title. Erroring
+# here makes that impossible.
+enh_accessible <- function(key, peak = NULL) {
+  cfg <- ENH[[key]]
+  if (is.null(cfg)) stop("No registry entry for enhancer key '", key, "'")
+  a <- if (!is.null(peak)) cfg$peaks[[peak]]$accessible else cfg$accessible
+  if (is.null(a) || length(a) == 0) {
+    stop("No `accessible` cluster set for '", key,
+         if (!is.null(peak)) paste0("' peak '", peak, "'") else "'",
+         "`. Enhancers clustered per peak (e.g. enh10) require the `peak` ",
+         "argument, because cluster 1 means a different thing in each ",
+         "clustering. Returning NULL here would silently pool EVERY cluster.")
+  }
+  as.character(a)
+}
+
+# motif band table for the plotting helpers
+enh_motifs <- function(key, set = c("motifs", "motifs_tf"), peak = NULL) {
+  set <- match.arg(set)
+  cfg <- ENH[[key]]
+  if (!is.null(peak) && !is.null(cfg$peaks[[peak]]$motifs)) return(cfg$peaks[[peak]]$motifs)
+  if (!is.null(cfg[[set]])) return(cfg[[set]])
+  cfg$motifs
+}
+```
+
+# 4. Samples and file paths
+
+```{r sample-helpers}
+# ---- short sample name  <->  on-disk directory stem -------------------------
+# "SNAI_rep1_DMSO5min"  ->  "SNAI1FVSNAI2KO_rep1_DMSO5min"
+# "TWIST1_rep1_DMSO5min"->  "TWIST1FV_rep1_DMSO5min"
+SAMPLE_PREFIX <- c(SNAI = "SNAI1FVSNAI2KO", TWIST1 = "TWIST1FV")
+
+sample_stem <- function(samples) {
+  tf   <- sub("_.*$", "", samples)
+  rest <- sub("^[^_]+_", "", samples)
+  unname(paste0(SAMPLE_PREFIX[tf], "_", rest))
+}
+
+# ---- canonical sample vectors ----------------------------------------------
+SNAI_SAMPLES <- c(
+  "SNAI_rep1_DMSO5min", "SNAI_rep1_dTag5min",
+  "SNAI_rep2_DMSO5min", "SNAI_rep2_dTag5min",
+  "SNAI_rep1_DMSO1min", "SNAI_rep1_dTag1min",
+  "SNAI_rep2_DMSO1min", "SNAI_rep2_dTag1min"
+)
+TWIST1_SAMPLES <- sub("^SNAI", "TWIST1", SNAI_SAMPLES)
+BOTH_SAMPLES   <- c(SNAI_SAMPLES, TWIST1_SAMPLES)
+
+only <- function(samples, pattern) grep(pattern, samples, value = TRUE)
+
+# ---- fiberHMM .bed path builder --------------------------------------------
+# kind: "footprint" (nucleosomes), "tf" (TF footprints), "msp" (accessible patches)
+daf_bed <- function(samples, minset, kind = c("footprint", "tf", "msp")) {
+  kind <- match.arg(kind)
+  stem <- sample_stem(samples)
+  setNames(
+    file.path(DAF_ROOT, minset, "results", stem, FIBERHMM_VER,
+              paste0(stem, ".recalled_", kind, ".bed")),
+    samples
+  )
+}
+
+# convenience: the file set an enhancer needs, using ITS minset (see Q1)
+enh_files <- function(key, samples, kind = "footprint") {
+  daf_bed(samples, ENH[[key]]$minset, kind)
+}
+
+# ---- bulk ATAC bigWigs ------------------------------------------------------
+ATAC_BW <- c(
+  SNAI_DMSO   = file.path(ATAC_DIR, "ATAC_DMSO_merged.bw"),
+  SNAI_dTag   = file.path(ATAC_DIR, "ATAC_3h_merged.bw"),
+  TWIST1_DMSO = file.path(ATAC_DIR, "GSM7213525_TWIST1FV_dTAG0h_r1_ATAC.bw"),
+  TWIST1_dTag = file.path(ATAC_DIR, "GSM7213526_TWIST1FV_dTAG3h_r1_ATAC.bw")
+)
+
+# map merged pseudo-sample names -> the right bigWig
+atac_for <- function(merged_samples) {
+  key <- paste0(ifelse(grepl("TWIST1", merged_samples), "TWIST1", "SNAI"), "_",
+                ifelse(grepl("DMSO",   merged_samples), "DMSO",   "dTag"))
+  setNames(unname(ATAC_BW[key]), merged_samples)
+}
+
+# ---- replicate merging ------------------------------------------------------
+# "SNAI_rep1_DMSO5min" -> group "SNAI_DMSO_5min"
+# Generated, never typed, so the merged names can never drift between sections.
+merged_name <- function(samples) {
+  tf   <- ifelse(grepl("^TWIST1", samples), "TWIST1", "SNAI")
+  trt  <- ifelse(grepl("DMSO",    samples), "DMSO",   "dTag")
+  time <- stringr::str_extract(samples, "\\d+min")
+  paste(tf, trt, time, sep = "_")
+}
+merge_groups_for <- function(samples) split(samples, merged_name(samples))
+
+# ---- palettes ---------------------------------------------------------------
+twist_palette <- c("#08519c", "#6baed6")   # dark blue,  light blue
+snai_palette  <- c("#a50f15", "#fc8d59")   # dark red,   light red
+
+TF_FILL <- c(TWIST1 = "darkblue", SNAI = "darkred")   # read-rectangle colours
+
+META_COLORS <- c(                                     # metaplot line colours
+  TWIST1_DMSO = "#56B4E9", TWIST1_dTag = "#CC79A7",
+  SNAI_DMSO   = "#99000D", SNAI_dTag   = "#FC9272"
+)
+
+# shared geometry for every linked heatmap, so the panels are comparable
+LINKED_STYLE <- list(
+  raster_dpi = 300, cluster_gap = 0.8, binding_site_linewidth = 0.4,
+  lane_height = 180, atac_gap = 5, atac_height = 10,
+  label_gap = 5, label_tier_gap = 8,
+  sample_label_gap = 7, group_label_gap = 14
+)
+
+# ---- caching ----------------------------------------------------------------
+# Replaces the old saveRDS(x, f); x <- readRDS(f) pattern (see C2).
+cache_rds <- function(name, expr, rebuild = REBUILD_CLUSTERS) {
+  f <- robj(paste0(name, ".rds"))
+  if (!rebuild && file.exists(f)) {
+    message("cache hit : ", basename(f))
+    return(readRDS(f))
+  }
+  message("computing : ", basename(f))
+  val <- force(expr)
+  saveRDS(val, f)
+  val
+}
+```
+
+# 5. Core functions
+
+## 5.1 Reading fiberHMM BED files
+
+<!-- ==========================================================================
+     fiberHMM writes one BED12-like line per READ, with one block per
+     footprint. Two flavours appear in this project:
+
+       13 columns : nucleosome footprint and MSP files (v2.9.7). Column 13 is
+                    blockRgb.
+       15 columns : TF footprint files. Columns 13-15 are blockTq / blockEl /
+                    blockEr, where blockTq is the per-footprint quality byte
+                    of fiberHMM's tf.QQQ annotation. blockEl / blockEr are
+                    edge-sharpness bytes, NOT quality -- the score filter must
+                    use blockTq.
+
+     WHY NOT rtracklayer::import(): its BED/bigBed parser tries to coerce the
+     list-valued extra columns to a single integer and fails. We parse as
+     plain text instead.
+     ========================================================================== -->
+
+```{r fn-read-bed}
+# 13-column layout (nucleosome / MSP files)
+BED_COLS_13 <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+                 "thickStart", "thickEnd", "itemRgb", "blockCount",
+                 "blockSizes", "chromStarts", "blockRgb")
+
+# 15-column layout (TF footprint files)
+BED_COLS_15 <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+                 "thickStart", "thickEnd", "itemRgb", "blockCount",
+                 "blockSizes", "chromStarts", "blockTq", "blockEl", "blockEr")
+
+#' Parse one fiberHMM .bed into reads + footprints
+#'
+#' @return list(reads, footprints)
+#'   reads      : chrom, read_name, read_start, read_end, read_score, strand
+#'   footprints : chrom, read_name, fp_start, fp_end, fp_width [, blockTq]
+#'
+#' COORDINATES: BED is 0-based half-open. Both tables are returned 1-based
+#' inclusive, so a footprint of width w has fp_end - fp_start + 1 == w.
+read_fiberhmm_bed <- function(path) {
+
+  lines    <- read_lines(path)
+  n_fields <- str_count(lines, "\t") + 1L
+
+  # Auto-detect the layout from the modal field count.
+  expected <- as.integer(names(which.max(table(n_fields))))
+  if (!expected %in% c(13L, 15L)) {
+    warning(sprintf("%s: unexpected field count %d", path, expected))
+  }
+  cols_to_use <- if (expected == 15L) BED_COLS_15 else BED_COLS_13
+
+  # A rare fiberHMM writer bug fuses blockEl/blockEr with no delimiter. Drop
+  # those rows rather than failing the whole import.
+  # FIX B1: dropping rows here used to silently break compute_msp_motif_stats(),
+  #         which recovered `chrom` by matching row POSITION against a separate
+  #         readLines() of the same file. `chrom` is now carried through here,
+  #         so a dropped row can no longer shift the chromosome assignment.
+  bad <- which(n_fields != expected)
+  if (length(bad) > 0) {
+    warning(sprintf("%s: %d malformed row(s) dropped (lines: %s%s)",
+                    path, length(bad), paste(head(bad, 10), collapse = ", "),
+                    if (length(bad) > 10) ", ..." else ""))
+    lines <- lines[-bad]
+  }
+
+  raw <- read_tsv(
+    I(paste(lines, collapse = "\n")),
+    col_names = cols_to_use,
+    col_types = cols(.default    = col_character(),
+                     chromStart  = "i", chromEnd   = "i",
+                     score       = "i", thickStart = "i",
+                     thickEnd    = "i", blockCount = "i")
+  )
+
+  reads_tbl <- raw %>%
+    transmute(
+      chrom,
+      read_name  = name,
+      read_start = chromStart + 1L,   # 0-based -> 1-based inclusive
+      read_end   = chromEnd,
+      read_score = score,
+      strand
+    )
+
+  has_tq <- "blockTq" %in% names(raw)
+
+  # FIX B3: blockTq used to be unnested unconditionally. For 13-column files it
+  #         was created as vector("list", n) -- a length-0 entry per row --
+  #         and unnesting that against length-k blockSizes is version-dependent
+  #         at best. No-op for 15-column files; makes the 13-column path safe.
+  fp_base <- raw %>%
+    transmute(
+      chrom,
+      read_name   = name,                                    # BED col 4
+      .read0      = chromStart,                              # 0-based read start
+      blockSizes  = lapply(strsplit(blockSizes,  ","), as.integer),
+      chromStarts = lapply(strsplit(chromStarts, ","), as.integer),
+      blockTq     = if (has_tq) lapply(strsplit(blockTq, ","), as.integer) else NULL
+    )
+
+  unnest_cols <- if (has_tq) c("blockSizes", "chromStarts", "blockTq")
+                 else        c("blockSizes", "chromStarts")
+
+  fps_tbl <- fp_base %>%
+    unnest(all_of(unnest_cols)) %>%
+    mutate(
+      fp_start = .read0 + chromStarts + 1L,                  # 1-based inclusive
+      fp_end   = .read0 + chromStarts + blockSizes,
+      fp_width = blockSizes
+    ) %>%
+    select(chrom, read_name, fp_start, fp_end, fp_width, any_of("blockTq"))
+
+  list(reads = reads_tbl, footprints = fps_tbl)
+}
+```
+
+## 5.2 Building per-sample bundles
+
+```{r fn-bundles}
+#' Reads overlapping cluster_range, plus ALL of those reads' footprints
+#'
+#' Footprints are deliberately NOT clipped here: the clustering matrix clips to
+#' cluster_range, the plot clips to plot_range, and those are different windows.
+build_sample_bundle <- function(path, sample_name, cluster_range) {
+
+  obj          <- read_fiberhmm_bed(path)
+  region_chrom <- as.character(seqnames(cluster_range))
+  region_start <- start(cluster_range)
+  region_end   <- end(cluster_range)
+
+  reads <- obj$reads %>%
+    dplyr::filter(chrom == region_chrom,
+                  read_end >= region_start, read_start <= region_end) %>%
+    mutate(unique_id = paste0(sample_name, "_", read_name))
+
+  if (nrow(reads) == 0) return(NULL)
+
+  footprints <- obj$footprints %>%
+    dplyr::filter(read_name %in% reads$read_name) %>%
+    mutate(unique_id = paste0(sample_name, "_", read_name))
+
+  list(reads = reads, footprints = footprints,
+       region_start = region_start, region_end = region_end)
+}
+
+#' Run build_sample_bundle() over a named vector of paths
+build_all_bundles <- function(files, cluster_range) {
+
+  missing <- files[!file.exists(files)]
+  if (length(missing) > 0) {
+    stop("File(s) not found:\n", paste(missing, collapse = "\n"))
+  }
+
+  bundles <- imap(files, ~ build_sample_bundle(.x, .y, cluster_range))
+
+  empty <- names(Filter(is.null, bundles))
+  if (length(empty) > 0) {
+    message("Samples with 0 reads in cluster_range (dropped): ",
+            paste(empty, collapse = ", "))
+  }
+
+  bundles <- compact(bundles)
+  if (length(bundles) == 0) stop("No reads overlapped cluster_range in any sample.")
+  bundles
+}
+```
+
+## 5.3 Merging replicates for joint clustering
+
+<!-- ==========================================================================
+     Replicates are clustered TOGETHER so that a cluster means the same thing
+     in rep1 and rep2, then split back apart for the per-replicate log2FC.
+
+     Each read is re-stamped
+         unique_id = "<merged_name>_<orig_sample>READSEP<orig_read_name>"
+     cluster_reads() parses the merged name off the front and
+     split_cluster_assignments() reverses the READSEP token.
+     ========================================================================== -->
+
+```{r fn-merge-split}
+READSEP <- "READSEP"
+
+merge_replicate_bundles <- function(bundles, merge_groups) {
+
+  missing_samples <- base::setdiff(unlist(merge_groups), names(bundles))
+  if (length(missing_samples) > 0) {
+    stop("merge_replicate_bundles: sample(s) not in bundles: ",
+         paste(missing_samples, collapse = ", "))
+  }
+
+  imap(merge_groups, function(orig_samples, merged_name) {
+
+    parts <- bundles[orig_samples]
+
+    restamp <- function(df, s_name) {
+      df %>% mutate(
+        orig_read_name = sub(paste0("^", s_name, "_"), "", unique_id),
+        unique_id      = paste0(merged_name, "_", s_name, READSEP, orig_read_name)
+      )
+    }
+
+    list(
+      reads        = imap_dfr(parts, function(b, s) restamp(b$reads,      s)),
+      footprints   = imap_dfr(parts, function(b, s) restamp(b$footprints, s)),
+      region_start = parts[[1]]$region_start,
+      region_end   = parts[[1]]$region_end
+    )
+  })
+}
+
+#' Expand merged cluster assignments back to one row per (replicate, read)
+split_cluster_assignments <- function(cluster_assignments_merged) {
+
+  merged_rows <- grepl(READSEP, cluster_assignments_merged$read_id, fixed = TRUE)
+
+  if (!any(merged_rows)) {
+    warning("split_cluster_assignments: no '", READSEP, "' token found. ",
+            "Were these produced by merge_replicate_bundles()? Returning input.")
+    return(cluster_assignments_merged)
+  }
+
+  cluster_assignments_merged %>%
+    dplyr::filter(merged_rows) %>%
+    mutate(
+      orig_sample    = sub(paste0(READSEP, ".*$"), "", read_id),
+      orig_read_name = sub(paste0("^.*", READSEP), "", read_id)
+    ) %>%
+    transmute(
+      unique_id = paste0(orig_sample, "_", orig_read_name),
+      cluster,
+      Sample    = orig_sample,
+      read_id   = orig_read_name
+    )
+}
+```
+
+## 5.4 Occupancy matrix and k-means clustering
+
+```{r fn-cluster}
+#' Binary nucleosome-occupancy matrix: rows = reads, columns = bp of cluster_range
+bundle_to_matrix <- function(bundle) {
+
+  region_start <- bundle$region_start
+  region_end   <- bundle$region_end
+  width_range  <- region_end - region_start + 1L
+
+  reads <- bundle$reads
+  mat   <- matrix(0, nrow = nrow(reads), ncol = width_range,
+                  dimnames = list(reads$unique_id, NULL))
+
+  ft <- bundle$footprints %>%
+    dplyr::filter(fp_end >= region_start, fp_start <= region_end) %>%
+    mutate(rel_start = pmax(1L,           fp_start - region_start + 1L),
+           rel_end   = pmin(width_range,  fp_end   - region_start + 1L))
+
+  row_idx <- match(ft$unique_id, rownames(mat))
+  for (i in seq_len(nrow(ft))) {
+    if (!is.na(row_idx[i])) mat[row_idx[i], ft$rel_start[i]:ft$rel_end[i]] <- 1
+  }
+  mat
+}
+
+#' k-means that does not depend on the order rows were stacked in
+#'
+#' PROBLEM : kmeans(centers = <a number>) chooses its initial
+#' centres by SAMPLING ROWS of the matrix. Two runs with the same seed but a
+#' different row order therefore start from different centres and can land in
+#' different local optima. In this dataset that was worth ~11% of reads.
+#'
+#' FIX, in two parts:
+#'   1. the caller sorts rows into a canonical order before calling this;
+#'   2. the random restarts are run on a SUBSAMPLE to find good centres, then a
+#'      single pass over the full matrix refines them. Passing `centers` as a
+#'      matrix makes that final pass fully deterministic -- no sampling at all.
+#'
+#' Why subsample: nstart = 200 on ~180k x ~400 is hours of compute, and nstart
+#' = 25 was demonstrably too few to converge on a stable partition. Running 200
+#' starts on 20k rows explores far more of the space for a fraction of the cost,
+#' and the full-data refinement recovers the exact centres.
+#'
+#' @return the kmeans object, plus $init_method describing how it was seeded
+kmeans_stable <- function(mat, k,
+                          seed      = KMEANS_SEED,
+                          nstart    = KMEANS_NSTART,
+                          iter_max  = KMEANS_ITER_MAX,
+                          subsample = KMEANS_SUBSAMPLE) {
+
+  set.seed(seed)
+
+  if (is.null(subsample) || nrow(mat) <= subsample) {
+    km <- kmeans(mat, centers = k, nstart = nstart, iter.max = iter_max)
+    km$init_method <- sprintf("full data, nstart = %d", nstart)
+  } else {
+    idx <- sort(sample.int(nrow(mat), subsample))
+    km0 <- kmeans(mat[idx, , drop = FALSE], centers = k,
+                  nstart = nstart, iter.max = iter_max)
+    # a degenerate subsample can yield an empty centre; refuse rather than
+    # silently return fewer than k clusters
+    if (nrow(km0$centers) < k) {
+      stop("kmeans_stable: subsample produced only ", nrow(km0$centers),
+           " of ", k, " centres. Increase KMEANS_SUBSAMPLE or lower k.")
+    }
+    km <- kmeans(mat, centers = km0$centers, iter.max = iter_max)
+    km$init_method <- sprintf("centres from %d-row subsample, nstart = %d, then one full pass",
+                              subsample, nstart)
+  }
+
+  if (!is.null(km$ifault) && km$ifault == 4L) {
+    warning("kmeans did not converge in ", iter_max,
+            " iterations -- raise KMEANS_ITER_MAX.")
+  }
+  km
+}
+
+#' Pool every sample's reads, k-means, then relabel clusters by "openness"
+#'
+#' After k-means the clusters are RENUMBERED by mean nucleosome occupancy,
+#' ascending: cluster 1 = fewest nucleosomes = most open, cluster k = most
+#' nucleosome-occupied. Set rank_clusters = FALSE to keep k-means' arbitrary
+#' labels.
+#'
+#' @return tibble(unique_id, Sample, read_id, cluster) with attr "kmeans_info"
+cluster_reads <- function(bundles, k, seed = KMEANS_SEED, rank_clusters = TRUE,
+                          nstart = KMEANS_NSTART, subsample = KMEANS_SUBSAMPLE) {
+
+  master_mat <- do.call(rbind, map(bundles, bundle_to_matrix))
+
+  # FIX C7, part 1: canonical row order, so the clustering depends only on the
+  # reads / k / seed and not on how the bundles happened to be stacked.
+  # method = "radix" sorts in C collation, which is locale-independent --
+  # plain order() on strings can differ between machines and locales.
+  master_mat <- master_mat[order(rownames(master_mat), method = "radix"), ,
+                           drop = FALSE]
+
+  if (anyDuplicated(rownames(master_mat))) {
+    stop("cluster_reads: duplicated read ids in the pooled matrix. ",
+         "Two bundles are contributing the same unique_id.")
+  }
+
+  km         <- kmeans_stable(master_mat, k = k, seed = seed,
+                              nstart = nstart, subsample = subsample)
+  cluster_id <- km$cluster
+
+  if (rank_clusters) {
+    clust_signal <- tapply(rowMeans(master_mat), cluster_id, mean)
+    relabel      <- setNames(rank(clust_signal, ties.method = "first"),
+                             names(clust_signal))
+    cluster_id   <- as.integer(relabel[as.character(cluster_id)])
+  }
+
+  sample_names <- names(bundles)
+  ordered      <- sample_names[order(nchar(sample_names), decreasing = TRUE)]
+  prefixes     <- paste0(ordered, "_")
+
+  ids <- rownames(master_mat)
+  hit <- rep(NA_integer_, length(ids))
+  for (i in seq_along(prefixes)) {
+    todo      <- is.na(hit) & startsWith(ids, prefixes[i])
+    hit[todo] <- i
+  }
+
+  if (anyNA(hit)) {
+    stop("cluster_reads: ", sum(is.na(hit)), " read id(s) matched no sample name. ",
+         "First offender: ", ids[which(is.na(hit))[1]])
+  }
+
+  smp <- ordered[hit]
+
+  out <- tibble(
+    unique_id = ids,
+    Sample    = smp,
+    read_id   = substring(ids, nchar(smp) + 2L),   # drop "<Sample>_"
+    cluster   = factor(cluster_id, levels = seq_len(k))
+  )
+
+  # Record how well this fit actually did, so two runs can be compared on
+  # something better than eyeballing the panels. tot_withinss is the quantity
+  # k-means minimises: lower is a better fit to the SAME data at the SAME k.
+  attr(out, "kmeans_info") <- list(
+    k             = k,
+    seed          = seed,
+    nstart        = nstart,
+    subsample     = subsample,
+    init_method   = km$init_method,
+    n_reads       = nrow(master_mat),
+    n_positions   = ncol(master_mat),
+    tot_withinss  = km$tot.withinss,
+    betweenss     = km$betweenss,
+    prop_between  = km$betweenss / km$totss,
+    iterations    = km$iter,
+    cluster_sizes = as.integer(table(factor(cluster_id, levels = seq_len(k))))
+  )
+  out
+}
+
+#' Agreement between two clusterings of the same reads (Adjusted Rand Index)
+#'
+#' 1 = identical up to relabelling, ~0 = no better than chance. Use it to check
+#' whether a partition is a property of the data or of the random seed.
+adjusted_rand <- function(a, b) {
+  tab <- table(a, b)
+  nij <- sum(choose(tab, 2))
+  ai  <- sum(choose(rowSums(tab), 2))
+  bj  <- sum(choose(colSums(tab), 2))
+  n   <- choose(sum(tab), 2)
+  exp <- ai * bj / n
+  (nij - exp) / ((ai + bj) / 2 - exp)
+}
+
+#' One row per footprint, tagged with its cluster, restricted to plot_range,
+#' with a within-(Sample, cluster) stacking index for drawing.
+prepare_plot_data <- function(bundles, cluster_assignments, plot_range) {
+
+  imap_dfr(bundles, function(b, s_name) {
+    b$footprints %>%
+      transmute(unique_id, Sample = s_name,
+                start = fp_start, end = fp_end, width = fp_width)
+  }) %>%
+    inner_join(cluster_assignments, by = c("unique_id", "Sample")) %>%
+    dplyr::filter(start <= end(plot_range), end >= start(plot_range)) %>%
+    arrange(Sample, cluster, unique_id) %>%
+    group_by(Sample, cluster) %>%
+    mutate(local_index = as.numeric(factor(unique_id, levels = unique(unique_id)))) %>%
+    ungroup()
+}
+```
+
+## 5.5 Shared coverage helpers
+
+```{r fn-coverage}
+#' Look up a per-sample fill colour: exact name, then regex, then a warned default
+.resolve_fill <- function(s, fill_color, default = "grey30") {
+  if (is.null(names(fill_color))) return(fill_color[[1]])
+  if (s %in% names(fill_color))   return(unname(fill_color[[s]]))
+  hit <- names(fill_color)[vapply(names(fill_color),
+                                  function(p) grepl(p, s), logical(1))]
+  if (length(hit) >= 1) return(unname(fill_color[[hit[1]]]))
+  warning(sprintf("No fill colour matched sample '%s'; using %s", s, default))
+  default
+}
+
+#' Per-bp integer coverage over [region_start, region_end] from a set of intervals
+#'
+#' FIX B2: intervals lying entirely OUTSIDE the region give s > e after
+#'         clipping. `s:e` then counts downwards and adds coverage at the wrong
+#'         positions instead of adding none. This matters because reads are
+#'         selected on cluster_range but coverage is computed on plot_range,
+#'         so a read outside plot_range is perfectly possible. Now dropped.
+.coverage_vector <- function(starts, ends, region_start, region_end) {
+
+  n_pos   <- region_end - region_start + 1L
+  cov_vec <- integer(n_pos)
+  if (length(starts) == 0) return(cov_vec)
+
+  s <- pmax(starts, region_start) - region_start + 1L
+  e <- pmin(ends,   region_end)   - region_start + 1L
+
+  keep <- which(e >= s)                    # <-- the guard
+  for (i in keep) cov_vec[s[i]:e[i]] <- cov_vec[s[i]:e[i]] + 1L
+  cov_vec
+}
+
+#' Every read's extent + Sample, tagged with its cluster.
+#' This is the per-bp read-coverage DENOMINATOR for every metaplot below.
+reads_with_clusters <- function(bundles, cluster_assignments) {
+  imap_dfr(bundles, function(b, s_name) {
+    b$reads %>% transmute(Sample = s_name, unique_id, read_start, read_end)
+  }) %>%
+    inner_join(cluster_assignments %>% select(Sample, unique_id, cluster),
+               by = c("Sample", "unique_id"))
+}
+```
+
+## 5.6 Per-cluster log2 fold change
+
+<!-- ==========================================================================
+     `comparisons` is a named list; each element is a length-2 NAMED vector
+         c(numerator = "<sample>", denominator = "<sample>")
+     compute_log2fc_df() computes, per cluster, the % of that sample's reads
+     falling in the cluster, then log2(numerator% / denominator%).
+     ========================================================================== -->
+
+```{r fn-log2fc}
+#' @param min_reads     read-count floor for the "low coverage" flag
+#' @param low_cov_rule  "both"   flag only if BOTH sides are below min_reads
+#'                               (original behaviour -- see reviewer note Q2)
+#'                      "either" flag if EITHER side is below min_reads
+#'                               (the more conservative rule)
+compute_log2fc_df <- function(cluster_assignments, comparisons,
+                              min_reads    = MIN_READS_FC,
+                              low_cov_rule = LOW_COV_RULE) {
+
+  low_cov_rule <- match.arg(low_cov_rule, c("both", "either"))
+
+  cluster_stats <- cluster_assignments %>%
+    dplyr::count(Sample, cluster, name = "n_reads") %>%
+    group_by(Sample) %>%
+    mutate(percent = 100 * n_reads / sum(n_reads)) %>%
+    ungroup()
+
+  percent_wide <- cluster_stats %>%
+    select(Sample, cluster, percent) %>%
+    pivot_wider(names_from = Sample, values_from = percent, values_fill = 0)
+
+  reads_wide <- cluster_stats %>%
+    select(Sample, cluster, n_reads) %>%
+    pivot_wider(names_from = Sample, values_from = n_reads, values_fill = 0)
+
+  imap_dfr(comparisons, function(pair, label) {
+
+    num <- pair[["numerator"]]
+    den <- pair[["denominator"]]
+
+    missing <- base::setdiff(c(num, den), names(percent_wide))
+    if (length(missing) > 0) {
+      stop("Comparison '", label, "' references sample(s) not in ",
+           "cluster_assignments: ", paste(missing, collapse = ", "))
+    }
+
+    # a sample absent from reads_wide has 0 reads in every cluster
+    num_reads <- if (num %in% names(reads_wide)) reads_wide[[num]] else rep(0L, nrow(reads_wide))
+    den_reads <- if (den %in% names(reads_wide)) reads_wide[[den]] else rep(0L, nrow(reads_wide))
+
+    low <- if (low_cov_rule == "both") {
+      num_reads < min_reads & den_reads < min_reads
+    } else {
+      num_reads < min_reads | den_reads < min_reads
+    }
+
+    pct_num <- percent_wide[[num]]
+    pct_den <- percent_wide[[den]]
+
+    tibble(
+      cluster        = percent_wide$cluster,
+      Replicate_Pair = label,
+      num_reads      = num_reads,
+      den_reads      = den_reads,
+      Log2Ratio      = log2(pct_num / pct_den),
+      # A cluster emptied (or created) by the treatment gives +/-Inf. That is a
+      # real result, not a defect -- but geom_col silently DROPS non-finite
+      # values, so without this flag the strongest effect on the panel would be
+      # the one bar you could not see. make_log2fc_panel() draws these clamped
+      # to the panel edge with a marker.
+      status = dplyr::case_when(
+        num_reads == 0 & den_reads == 0 ~ "no reads",
+        num_reads == 0                  ~ "complete loss",
+        den_reads == 0                  ~ "complete gain",
+        TRUE                            ~ "ok"
+      )
+    ) %>%
+      left_join(tibble(cluster = reads_wide$cluster, low_coverage = low),
+                by = "cluster")
+  })
+}
+
+#' Horizontal log2FC bar panel, one facet row per cluster.
+#' Designed to sit alongside a heatmap that uses the same
+#' facet_grid(space = "free_y") cluster rows.
+make_log2fc_panel <- function(log2fc_df, title = "Fold change",
+                              palette = twist_palette,
+                              xlim = NULL,
+                              low_coverage_color = "grey70",
+                              low_coverage_label = "low coverage",
+                              show_boundary = TRUE) {
+
+  if (!"low_coverage" %in% names(log2fc_df)) log2fc_df$low_coverage <- FALSE
+  if (!"status" %in% names(log2fc_df))       log2fc_df$status <- "ok"
+
+  # A cluster that the treatment empties gives log2 = -Inf (or +Inf if it
+  # appears only after treatment). geom_col drops non-finite values without
+  # comment, so the strongest effect on the panel would otherwise be invisible.
+  # Clamp those bars to the panel edge and mark them, leaving every finite
+  # value exactly as computed -- no pseudocount, nothing rescaled.
+  finite_vals <- log2fc_df$Log2Ratio[is.finite(log2fc_df$Log2Ratio)]
+  edge <- if (!is.null(xlim)) {
+    max(abs(xlim))
+  } else if (length(finite_vals) > 0) {
+    max(abs(finite_vals)) * 1.15
+  } else 1
+
+  log2fc_df <- log2fc_df %>%
+    mutate(
+      is_boundary = !is.finite(Log2Ratio) & !is.na(Log2Ratio),
+      Log2Plot    = ifelse(is_boundary, sign(Log2Ratio) * edge, Log2Ratio),
+      # collapse the fill grouping so every flagged bar shares one grey category
+      fill_group  = ifelse(low_coverage, low_coverage_label,
+                           as.character(Replicate_Pair))
+    )
+
+  rp_levels   <- unique(as.character(log2fc_df$Replicate_Pair))
+  fill_values <- setNames(palette[seq_along(rp_levels)], rp_levels)
+  fill_values[low_coverage_label] <- low_coverage_color
+
+  p <- ggplot(log2fc_df, aes(x = Log2Plot, y = Replicate_Pair, fill = fill_group)) +
+    geom_vline(xintercept = 0, colour = "black", linetype = "dashed", linewidth = 0.4) +
+    geom_col(width = 0.7, colour = "black", linewidth = 0.2) +
+    facet_grid(cluster ~ ., scales = "free_y", space = "free_y", switch = "y") +
+    scale_fill_manual(values = fill_values) +
+    scale_x_continuous(breaks = scales::pretty_breaks(n = 3)) +
+    labs(x = "Log2(ratio)", y = NULL, fill = NULL, title = title) +
+    theme_classic() +
+    theme(
+      axis.text.y       = element_blank(),
+      axis.ticks.y      = element_blank(),
+      axis.line         = element_blank(),
+      panel.spacing     = unit(0, "lines"),
+      panel.border      = element_blank(),
+      strip.background  = element_blank(),
+      strip.text.y.left = element_text(angle = 0, size = 7, face = "bold",
+                                       margin = margin(r = 4, l = 2)),
+      legend.position   = "bottom",
+      plot.title        = element_text(size = 10)
+    ) +
+    geom_vline(xintercept = -Inf, colour = "grey70", linewidth = 0.3)
+
+  # arrowhead at the clamped end, so the bar reads as "runs off the scale"
+  # rather than as a real value at the panel limit
+  if (show_boundary && any(log2fc_df$is_boundary)) {
+    bd <- log2fc_df %>% dplyr::filter(is_boundary)
+    p <- p +
+      geom_segment(data = bd,
+                   aes(x = Log2Plot * 0.75, xend = Log2Plot,
+                       y = Replicate_Pair, yend = Replicate_Pair),
+                   inherit.aes = FALSE, colour = "black", linewidth = 0.3,
+                   arrow = arrow(length = unit(0.05, "in"), type = "closed")) +
+      geom_text(data = bd,
+                aes(x = Log2Plot * 0.5, y = Replicate_Pair,
+                    label = ifelse(Log2Ratio < 0, "0 reads after", "0 reads before")),
+                inherit.aes = FALSE, colour = "black",
+                size = 2.2, fontface = "italic", vjust = -1)
+  }
+
+  if (any(log2fc_df$low_coverage)) {
+    lbl_df <- log2fc_df %>%
+      dplyr::filter(low_coverage) %>%
+      distinct(cluster, Replicate_Pair) %>%
+      mutate(x = 0)
+    p <- p + geom_text(data = lbl_df,
+                       aes(x = x, y = Replicate_Pair, label = low_coverage_label),
+                       inherit.aes = FALSE, colour = "black",
+                       size = 2.5, fontface = "italic")
+  }
+
+  if (!is.null(xlim)) p <- p + coord_cartesian(xlim = xlim)
+  p
+}
+```
+
+## 5.7 Dense per-sample heatmap (independent panels)
+
+```{r fn-dense}
+#' One patchwork panel per sample, faceted by cluster.
+#' Pass log2fc_df to append a fold-change bar panel on the right.
+plot_fiberseq_dense <- function(plot_df, plot_range, sample_order,
+                                vlines = NULL, vline_colors = NULL,
+                                fill_color = TF_FILL,
+                                binding_sites = NULL,
+                                title = "Clustered Fiber-seq: dense per-cell view",
+                                log2fc_df = NULL,
+                                log2fc_title = "Fold change",
+                                log2fc_palette = twist_palette,
+                                log2fc_width = 0.5,
+                                log2fc_xlim = NULL,
+                                raster = TRUE, raster_dpi = 300,
+                                xlab = NULL) {
+
+  chr  <- as.character(seqnames(plot_range))
+  xlab <- xlab %||% paste0("Genomic coordinate (", chr, ")")
+
+  plot_df <- plot_df %>%
+    dplyr::filter(Sample %in% sample_order) %>%
+    mutate(Sample = factor(Sample, levels = sample_order))
+
+  plot_xlim <- c(start(plot_range), end(plot_range))
+  if (!is.null(vlines) && is.null(vline_colors)) {
+    vline_colors <- rep("black", length(vlines))
+  }
+
+  make_sample_panel <- function(s) {
+
+    df_s  <- plot_df %>% dplyr::filter(Sample == s)
+    col_s <- .resolve_fill(s, fill_color)
+
+    rect_layer <- geom_rect(
+      data = df_s,
+      aes(xmin = pmax(start, plot_xlim[1]),
+          xmax = pmin(end,   plot_xlim[2]),
+          ymin = local_index - 0.45,
+          ymax = local_index + 0.45),
+      fill = col_s, colour = NA
+    )
+    if (raster) {
+      rect_layer <- ggrastr::rasterise(rect_layer, dpi = raster_dpi, dev = "ragg_png")
+    }
+
+    sample_label <- data.frame(
+      x = mean(plot_xlim), y = Inf, label = s,
+      cluster = factor(levels(df_s$cluster)[1], levels = levels(df_s$cluster))
+    )
+
+    p <- ggplot(df_s) +
+      rect_layer +
+      facet_grid(cluster ~ ., scales = "free_y", space = "free_y", switch = "y") +
+      coord_cartesian(xlim = plot_xlim, clip = "off") +
+      theme_classic() +
+      theme(
+        axis.text.y       = element_blank(),
+        axis.ticks.y      = element_blank(),
+        axis.line         = element_blank(),
+        panel.spacing     = unit(0, "lines"),
+        strip.background  = element_blank(),
+        strip.text.y.left = element_text(angle = 0, size = 7,
+                                         margin = margin(r = 4, l = 2)),
+        panel.border      = element_blank(),
+        plot.margin       = margin(t = 40, r = 5, b = 5, l = 5)
+      ) +
+      labs(title = NULL, y = NULL, x = xlab) +
+      geom_text(data = sample_label, aes(x = x, y = y, label = label),
+                vjust = -3, size = 3.5, inherit.aes = FALSE)
+
+    if (!is.null(binding_sites)) {
+      bs_labels <- binding_sites %>%
+        mutate(cluster = factor(levels(df_s$cluster)[1],
+                                levels = levels(df_s$cluster)))
+      p <- p +
+        geom_rect(data = binding_sites,
+                  aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = col),
+                  alpha = 1, inherit.aes = FALSE) +
+        scale_fill_identity(guide = "none") +
+        geom_text(data = bs_labels,
+                  aes(x = (xmin + xmax) / 2, y = Inf, label = TF, colour = col),
+                  vjust = -1, size = 3, fontface = "bold",
+                  inherit.aes = FALSE, show.legend = FALSE) +
+        scale_colour_identity(guide = "none")
+    }
+    p
+  }
+
+  plots <- lapply(sample_order, make_sample_panel)
+  n_s   <- length(sample_order)
+
+  if (!is.null(log2fc_df)) {
+    bar_panel <- make_log2fc_panel(log2fc_df, title = log2fc_title,
+                                   palette = log2fc_palette, xlim = log2fc_xlim)
+    wrap_plots(c(plots, list(bar_panel)), nrow = 1) +
+      plot_layout(widths = c(rep(1, n_s), log2fc_width)) +
+      plot_annotation(title = title)
+  } else {
+    wrap_plots(plots, nrow = 1) + plot_annotation(title = title)
+  }
+}
+```
+
+## 5.8 Metaplots
+
+<!-- ==========================================================================
+     OCCUPANCY, both flavours:
+         occupancy(bp) = footprints_covering(bp) / read_coverage(bp) * 100
+     with bp below min_read_cov spanning reads set to NA.
+
+     They differ ONLY in the read-coverage DENOMINATOR:
+       NUCLEOSOME metaplots : normalised over WHOLE-SAMPLE depth, i.e. all of
+                              that sample's reads at each bp across every
+                              cluster, so per-cluster curves share one scale.
+       TF metaplots         : normalised PER CLUSTER, i.e. only reads in the
+                              cluster being drawn.
+     ========================================================================== -->
+
+```{r fn-nuc-metaplot}
+#' Per-cluster nucleosome occupancy, normalised over whole-sample depth
+compute_cluster_metaplot <- function(plot_df, cluster_assignments, plot_range,
+                                     bundles, clusters = NULL,
+                                     min_read_cov = MIN_READ_COV) {
+
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+  pos_vec      <- region_start:region_end
+
+  # denominator: per-bp read coverage from ALL reads of each sample
+  reads_df        <- reads_with_clusters(bundles, cluster_assignments)
+  samples_present <- unique(reads_df$Sample)
+
+  read_cov_by_sample <- setNames(lapply(samples_present, function(s_name) {
+    r <- reads_df[reads_df$Sample == s_name, ]
+    .coverage_vector(r$read_start, r$read_end, region_start, region_end)
+  }), samples_present)
+
+  df <- plot_df
+  if (!is.null(clusters)) {
+    df <- df %>% dplyr::filter(as.character(cluster) %in% as.character(clusters))
+  }
+
+  groups <- df %>% distinct(Sample, cluster)
+
+  purrr::map2_dfr(groups$Sample, groups$cluster, function(s_name, c_name) {
+    # base-R subsetting to avoid NSE name collisions with the column names
+    sub      <- df[df$Sample == s_name & df$cluster == c_name, ]
+    fp_cov   <- .coverage_vector(sub$start, sub$end, region_start, region_end)
+    read_cov <- read_cov_by_sample[[s_name]]
+
+    tibble(Sample = s_name, cluster = c_name, pos = pos_vec,
+           fp_coverage   = fp_cov,
+           read_coverage = read_cov,
+           normalized_occupancy = ifelse(read_cov >= min_read_cov,
+                                         fp_cov / read_cov * 100, NA_real_))
+  })
+}
+
+#' Draw a per-bp occupancy table: one panel per cluster, samples overlaid
+plot_cluster_metaplot <- function(metaplot_df, plot_range,
+                                  clusters = NULL, samples = NULL,
+                                  free_y = FALSE,
+                                  binding_sites = NULL,
+                                  vlines = NULL, vline_colors = NULL,
+                                  sample_colors = NULL,
+                                  title = "Nucleosome footprint metaplot by cluster",
+                                  subtitle = "Occupancy = footprints / read coverage x 100") {
+
+  metaplot_df <- metaplot_df %>% mutate(cluster = as.character(cluster))
+
+  if (!is.null(samples)) {
+    metaplot_df <- metaplot_df %>%
+      dplyr::filter(Sample %in% samples) %>%
+      mutate(Sample = factor(Sample, levels = samples))
+  }
+
+  if (!is.null(clusters)) {
+    clusters    <- as.character(clusters)
+    metaplot_df <- metaplot_df %>%
+      dplyr::filter(cluster %in% clusters) %>%
+      mutate(cluster = factor(cluster, levels = clusters))
+  } else {
+    lvls        <- as.character(sort(as.integer(unique(metaplot_df$cluster))))
+    metaplot_df <- metaplot_df %>% mutate(cluster = factor(cluster, levels = lvls))
+  }
+
+  if (!is.null(vlines) && is.null(vline_colors)) {
+    vline_colors <- rep("black", length(vlines))
+  }
+
+  p <- ggplot(metaplot_df, aes(x = pos, y = normalized_occupancy))
+
+  # motif bands first, on their own identity scales, then hand the fill/colour
+  # scales back to the Sample aesthetics via ggnewscale
+  if (!is.null(binding_sites)) {
+    p <- p +
+      geom_rect(data = binding_sites,
+                aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = col),
+                alpha = 0.15, inherit.aes = FALSE) +
+      scale_fill_identity(guide = "none") +
+      geom_text(data = binding_sites,
+                aes(x = (xmin + xmax) / 2, y = Inf, label = TF, colour = col),
+                vjust = 1.5, size = 3.5, fontface = "bold",
+                inherit.aes = FALSE, show.legend = FALSE) +
+      scale_colour_identity(guide = "none") +
+      ggnewscale::new_scale_fill() +
+      ggnewscale::new_scale_colour()
+  }
+
+  p <- p +
+    geom_area(aes(fill = Sample), position = "identity", alpha = 0.1) +
+    geom_line(aes(colour = Sample), linewidth = 0.8) +
+    facet_wrap(~ cluster, scales = if (free_y) "free_y" else "fixed",
+               ncol = 1, strip.position = "right") +
+    coord_cartesian(xlim = c(start(plot_range), end(plot_range))) +
+    theme_classic() +
+    labs(title = title, subtitle = subtitle,
+         x = "Genomic coordinate", y = "Occupancy %") +
+    theme(legend.position  = "bottom",
+          strip.background = element_blank(),
+          strip.text       = element_text(face = "bold"),
+          panel.spacing    = unit(0.2, "lines"))
+
+  p <- p + if (!is.null(sample_colors)) {
+    list(scale_colour_manual(values = sample_colors),
+         scale_fill_manual(values   = sample_colors))
+  } else {
+    list(scale_colour_brewer(palette = "Set1"),
+         scale_fill_brewer(palette   = "Set1"))
+  }
+
+  if (!is.null(vlines)) {
+    for (i in seq_along(vlines)) {
+      p <- p + geom_vline(xintercept = vlines[i], linetype = "dashed",
+                          linewidth = 0.4, alpha = 0.5, colour = vline_colors[i])
+    }
+  }
+  p
+}
+```
+
+```{r fn-tf-metaplot}
+#' Load TF footprint files and inherit each footprint's cluster from its
+#' parent read's NUCLEOSOME cluster.
+#'
+#' A TF footprint is kept only if (a) its blockTq quality passes
+#' score_threshold, (b) it is no wider than max_width, (c) it overlaps
+#' plot_range, and (d) its read was assigned a cluster upstream.
+build_tf_metaplot_data <- function(tf_files, cluster_assignments, plot_range,
+                                   score_threshold = TF_SCORE_THR,
+                                   max_width = TF_MAX_WIDTH) {
+
+  missing <- tf_files[!file.exists(tf_files)]
+  if (length(missing) > 0) {
+    stop("TF file(s) not found:\n", paste(missing, collapse = "\n"))
+  }
+
+  region_chrom <- as.character(seqnames(plot_range))
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+
+  clust_lookup <- cluster_assignments %>% select(Sample, unique_id, cluster)
+
+  tf_df <- imap_dfr(tf_files, function(path, s_name) {
+
+    raw_fps <- read_fiberhmm_bed(path)$footprints
+
+    # blockTq is fiberHMM's tf.QQQ quality byte. blockEl / blockEr are
+    # edge-sharpness bytes and must NOT be used as a quality score.
+    fps <- raw_fps %>%
+      transmute(
+        Sample    = s_name,
+        unique_id = paste0(s_name, "_", read_name),
+        chrom,
+        start     = fp_start,
+        end       = fp_end,
+        width     = fp_width,
+        score     = if ("blockTq" %in% names(raw_fps)) raw_fps$blockTq
+                    else rep(NA_integer_, nrow(raw_fps))
+      )
+
+    if (!is.null(score_threshold)) {
+      if (all(is.na(fps$score))) {
+        warning(sprintf("%s: score_threshold ignored -- no blockTq column", s_name))
+      } else {
+        fps <- fps %>% dplyr::filter(score >= score_threshold)
+      }
+    }
+    if (!is.null(max_width)) fps <- fps %>% dplyr::filter(width <= max_width)
+
+    fps %>% dplyr::filter(chrom == region_chrom,
+                          start <= region_end, end >= region_start)
+  })
+
+  tf_df %>% inner_join(clust_lookup, by = c("Sample", "unique_id"))
+}
+
+#' Per-bp TF occupancy.
+#' pool_clusters = FALSE : one curve per (sample, cluster), denominator = that
+#'                         cluster's reads
+#' pool_clusters = TRUE  : one curve per sample, denominator = all reads (or
+#'                         all reads in `clusters`, if given)
+compute_tf_metaplot <- function(tf_df, cluster_assignments, plot_range,
+                                bundles, clusters = NULL, pool_clusters = FALSE,
+                                min_read_cov = MIN_READ_COV) {
+
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+  pos_vec      <- region_start:region_end
+
+  reads_df <- reads_with_clusters(bundles, cluster_assignments)
+  df       <- tf_df
+
+  if (!is.null(clusters)) {
+    df       <- df       %>% dplyr::filter(as.character(cluster) %in% as.character(clusters))
+    reads_df <- reads_df %>% dplyr::filter(as.character(cluster) %in% as.character(clusters))
+  }
+
+  fp_cov <- function(sub) .coverage_vector(sub$start,      sub$end,      region_start, region_end)
+  rd_cov <- function(sub) .coverage_vector(sub$read_start, sub$read_end, region_start, region_end)
+  to_occ <- function(fp, rd) ifelse(rd >= min_read_cov, fp / rd * 100, NA_real_)
+
+  if (pool_clusters) {
+    purrr::map_dfr(unique(df$Sample), function(s_name) {
+      fp <- fp_cov(df[df$Sample == s_name, ])
+      rd <- rd_cov(reads_df[reads_df$Sample == s_name, ])
+      tibble(Sample = s_name, pos = pos_vec,
+             fp_coverage = fp, read_coverage = rd,
+             normalized_occupancy = to_occ(fp, rd))
+    })
+  } else {
+    groups <- df %>% distinct(Sample, cluster)
+    purrr::map2_dfr(groups$Sample, groups$cluster, function(s_name, c_name) {
+      fp <- fp_cov(df[df$Sample == s_name & df$cluster == c_name, ])
+      rd <- rd_cov(reads_df[reads_df$Sample == s_name & reads_df$cluster == c_name, ])
+      tibble(Sample = s_name, cluster = c_name, pos = pos_vec,
+             fp_coverage = fp, read_coverage = rd,
+             normalized_occupancy = to_occ(fp, rd))
+    })
+  }
+}
+
+#' Thin wrapper: per-cluster TF panel
+plot_tf_metaplot <- function(tf_metaplot_df, plot_range, ...,
+                             title = "TF footprint metaplot by cluster",
+                             subtitle = "Occupancy = TF footprints / read coverage x 100 (per cluster)") {
+  plot_cluster_metaplot(tf_metaplot_df, plot_range, ...,
+                        title = title, subtitle = subtitle)
+}
+
+#' Single panel, clusters already pooled
+plot_tf_metaplot_overall <- function(tf_metaplot_df, plot_range,
+                                     samples = NULL,
+                                     binding_sites = NULL,
+                                     vlines = NULL, vline_colors = NULL,
+                                     sample_colors = NULL,
+                                     title = "TF footprint metaplot (all clusters)",
+                                     subtitle = "Occupancy = TF footprints / read coverage x 100",
+                                     xlab = "Genomic coordinate") {
+
+  if (!is.null(samples)) {
+    tf_metaplot_df <- tf_metaplot_df %>%
+      dplyr::filter(Sample %in% samples) %>%
+      mutate(Sample = factor(Sample, levels = samples))
+  }
+  if (!is.null(vlines) && is.null(vline_colors)) {
+    vline_colors <- rep("black", length(vlines))
+  }
+
+  p <- ggplot(tf_metaplot_df, aes(x = pos, y = normalized_occupancy))
+
+  if (!is.null(binding_sites)) {
+    p <- p +
+      geom_rect(data = binding_sites,
+                aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = col),
+                alpha = 0.15, inherit.aes = FALSE) +
+      scale_fill_identity(guide = "none") +
+      geom_text(data = binding_sites,
+                aes(x = (xmin + xmax) / 2, y = Inf, label = TF, colour = col),
+                vjust = 1.5, size = 3.5, fontface = "bold",
+                inherit.aes = FALSE, show.legend = FALSE) +
+      scale_colour_identity(guide = "none") +
+      ggnewscale::new_scale_fill() +
+      ggnewscale::new_scale_colour()
+  }
+
+  p <- p +
+    geom_area(aes(fill = Sample), position = "identity", alpha = 0.1) +
+    geom_line(aes(colour = Sample), linewidth = 0.8) +
+    coord_cartesian(xlim = c(start(plot_range), end(plot_range))) +
+    theme_classic() +
+    labs(title = title, subtitle = subtitle, x = xlab, y = "Occupancy %") +
+    theme(legend.position = "bottom")
+
+  p <- p + if (!is.null(sample_colors)) {
+    list(scale_colour_manual(values = sample_colors),
+         scale_fill_manual(values   = sample_colors))
+  } else {
+    list(scale_colour_brewer(palette = "Set1"),
+         scale_fill_brewer(palette   = "Set1"))
+  }
+
+  if (!is.null(vlines)) {
+    for (i in seq_along(vlines)) {
+      p <- p + geom_vline(xintercept = vlines[i], linetype = "dashed",
+                          linewidth = 0.4, alpha = 0.5, colour = vline_colors[i])
+    }
+  }
+  p
+}
+
+#' Average replicates of a per-bp metaplot table into one curve per condition.
+#'
+#' Replaces merge_reps() / merge_snai_reps(), which were defined five times in
+#' the old document with three different output label conventions (C5).
+average_replicates <- function(df, keep_timepoint = FALSE) {
+  df %>%
+    mutate(
+      .tf   = ifelse(grepl("TWIST1", Sample), "TWIST1", "SNAI"),
+      .trt  = ifelse(grepl("DMSO",   Sample), "DMSO",   "dTag"),
+      .time = stringr::str_extract(Sample, "\\d+min"),
+      condition = if (keep_timepoint) paste(.tf, .trt, .time, sep = "_")
+                  else                paste(.tf, .trt, sep = "_")
+    ) %>%
+    group_by(condition, pos) %>%
+    summarise(normalized_occupancy = mean(normalized_occupancy, na.rm = TRUE),
+              .groups = "drop") %>%
+    dplyr::rename(Sample = condition)
+}
+```
+
+```{r fn-pooled-and-midpoint}
+#' Pool a set of clusters into ONE occupancy curve per sample.
+#' denominator = "cluster" : normalise over reads in those clusters only
+#' denominator = "all"     : normalise over every read in the region
+compute_pooled_cluster_metaplot <- function(plot_df, cluster_assignments, plot_range,
+                                            bundles, clusters,
+                                            min_read_cov = MIN_READ_COV,
+                                            denominator = c("cluster", "all")) {
+
+  denominator  <- match.arg(denominator)
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+  pos_vec      <- region_start:region_end
+
+  df <- plot_df %>%
+    dplyr::filter(as.integer(as.character(cluster)) %in% as.integer(clusters))
+
+  reads_df_all <- reads_with_clusters(bundles, cluster_assignments)
+  reads_df     <- if (denominator == "cluster") {
+    reads_df_all %>%
+      dplyr::filter(as.integer(as.character(cluster)) %in% as.integer(clusters))
+  } else reads_df_all
+
+  purrr::map_dfr(unique(df$Sample), function(s_name) {
+    fp <- .coverage_vector(df$start[df$Sample == s_name],
+                           df$end[df$Sample == s_name],
+                           region_start, region_end)
+    rd <- .coverage_vector(reads_df$read_start[reads_df$Sample == s_name],
+                           reads_df$read_end[reads_df$Sample == s_name],
+                           region_start, region_end)
+    tibble(Sample = s_name, pos = pos_vec,
+           fp_coverage = fp, read_coverage = rd,
+           normalized_occupancy = ifelse(rd >= min_read_cov, fp / rd * 100, NA_real_))
+  })
+}
+
+#' Nucleosome MIDPOINT density per bin (positioning/phasing rather than
+#' occupancy), smoothed with a rolling mean.
+compute_midpoint_metaplot <- function(plot_df, cluster_assignments, plot_range,
+                                      bundles, clusters = NULL,
+                                      bin_width = 10L, smooth_k = 5L,
+                                      min_read_cov = MIN_READ_COV) {
+
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+
+  df <- plot_df
+  if (!is.null(clusters)) {
+    df <- df %>% dplyr::filter(as.integer(as.character(cluster)) %in% as.integer(clusters))
+  }
+  df <- df %>%
+    mutate(midpoint = (start + end) / 2) %>%
+    dplyr::filter(midpoint >= region_start, midpoint <= region_end)
+
+  reads_df <- reads_with_clusters(bundles, cluster_assignments)
+  if (!is.null(clusters)) {
+    reads_df <- reads_df %>%
+      dplyr::filter(as.integer(as.character(cluster)) %in% as.integer(clusters))
+  }
+
+  bins <- seq(region_start, region_end - bin_width, by = bin_width)
+
+  purrr::map_dfr(unique(df$Sample), function(s_name) {
+
+    r <- reads_df %>% dplyr::filter(Sample == s_name)
+
+    bin_counts <- df %>%
+      dplyr::filter(Sample == s_name) %>%
+      mutate(bin = floor((midpoint - region_start) / bin_width) * bin_width + region_start) %>%
+      dplyr::count(bin, name = "n_midpoints")
+
+    # denominator: reads spanning each bin CENTRE
+    bin_cov <- purrr::map_int(bins, function(b) {
+      centre <- b + bin_width / 2
+      sum(r$read_start <= centre & r$read_end >= centre)
+    })
+
+    tibble(bin = bins, read_coverage = bin_cov) %>%
+      left_join(bin_counts, by = "bin") %>%
+      mutate(
+        n_midpoints          = tidyr::replace_na(n_midpoints, 0L),
+        normalized_occupancy = ifelse(read_coverage >= min_read_cov,
+                                      n_midpoints / read_coverage * 100, NA_real_)
+      ) %>%
+      arrange(bin) %>%
+      mutate(normalized_occupancy = zoo::rollmean(normalized_occupancy,
+                                                  k = smooth_k, fill = NA,
+                                                  align = "center"),
+             Sample = s_name)
+  })
+}
+```
+
+## 5.9 ATAC-seq signal tracks
+
+```{r fn-atac}
+#' Tidy per-bp bigWig signal restricted to plot_range, one row per (Sample, bp)
+compute_atac_signal <- function(atac_files, plot_range) {
+
+  missing <- atac_files[!file.exists(atac_files)]
+  if (length(missing) > 0) {
+    stop("bigWig file(s) not found:\n", paste(missing, collapse = "\n"))
+  }
+
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+  pos_vec      <- region_start:region_end
+
+  imap_dfr(atac_files, function(path, s_name) {
+    gr  <- rtracklayer::import.bw(path, which = plot_range)
+    sig <- numeric(length(pos_vec))          # gaps stay 0, correct for bigWig
+    if (length(gr) > 0) {
+      s <- pmax(start(gr), region_start) - region_start + 1L
+      e <- pmin(end(gr),   region_end)   - region_start + 1L
+      for (i in which(e >= s)) sig[s[i]:e[i]] <- mcols(gr)$score[i]
+    }
+    tibble(Sample = s_name, pos = pos_vec, signal = sig)
+  })
+}
+
+#' Standalone ATAC track, same visual conventions as the metaplots
+plot_atac_signal <- function(atac_df, plot_range,
+                             samples = NULL, facet = FALSE,
+                             binding_sites = NULL,
+                             vlines = NULL, vline_colors = NULL,
+                             sample_colors = NULL,
+                             title = "ATAC-seq signal", subtitle = NULL,
+                             xlab = NULL) {
+
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+  chr          <- as.character(seqnames(plot_range))
+  xlab         <- xlab %||% paste0("Genomic coordinate (", chr, ")")
+
+  df <- atac_df %>% dplyr::filter(pos >= region_start, pos <= region_end)
+  if (!is.null(samples)) {
+    df <- df %>%
+      dplyr::filter(Sample %in% samples) %>%
+      mutate(Sample = factor(Sample, levels = samples))
+  }
+  if (!is.null(vlines) && is.null(vline_colors)) {
+    vline_colors <- rep("black", length(vlines))
+  }
+
+  p <- ggplot(df, aes(x = pos, y = signal))
+
+  if (!is.null(binding_sites)) {
+    p <- p +
+      geom_rect(data = binding_sites,
+                aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = col),
+                alpha = 0.15, inherit.aes = FALSE) +
+      scale_fill_identity(guide = "none") +
+      geom_text(data = binding_sites,
+                aes(x = (xmin + xmax) / 2, y = Inf, label = TF, colour = col),
+                vjust = 1.5, size = 3.5, fontface = "bold",
+                inherit.aes = FALSE, show.legend = FALSE) +
+      scale_colour_identity(guide = "none") +
+      ggnewscale::new_scale_fill() +
+      ggnewscale::new_scale_colour()
+  }
+
+  p <- p +
+    geom_area(aes(fill = Sample), position = "identity", alpha = 0.1) +
+    geom_line(aes(colour = Sample), linewidth = 0.8) +
+    coord_cartesian(xlim = c(region_start, region_end)) +
+    theme_classic() +
+    labs(title = title, subtitle = subtitle, x = xlab, y = "ATAC signal") +
+    theme(legend.position  = "bottom",
+          strip.background = element_blank(),
+          strip.text       = element_text(face = "bold"))
+
+  if (facet) p <- p + facet_wrap(~ Sample, ncol = 1, scales = "free_y",
+                                 strip.position = "right")
+
+  p <- p + if (!is.null(sample_colors)) {
+    list(scale_colour_manual(values = sample_colors),
+         scale_fill_manual(values   = sample_colors))
+  } else {
+    list(scale_colour_brewer(palette = "Set1"),
+         scale_fill_brewer(palette   = "Set1"))
+  }
+
+  if (!is.null(vlines)) {
+    for (i in seq_along(vlines)) {
+      p <- p + geom_vline(xintercept = vlines[i], linetype = "dashed",
+                          linewidth = 0.4, alpha = 0.5, colour = vline_colors[i])
+    }
+  }
+  p
+}
+```
+
+## 5.10 Linked dense heatmap (all samples in one coordinate space)
+
+<!-- ==========================================================================
+     Like plot_fiberseq_dense(), but every sample gets a horizontal "lane"
+     inside ONE shared ggplot coordinate space rather than a separate patchwork
+     panel. That is what makes the DMSO -> dTag cluster ribbons possible: a
+     polygon cannot span two independent patchwork viewports.
+
+     CLUSTER ROW HEIGHTS are proportional to that cluster's share of that
+     sample's reads, so every lane fills the same total height regardless of
+     depth -- exactly what facet_grid(scales = "free_y", space = "free_y")
+     shows in plot_fiberseq_dense(). Because the shares differ between two
+     linked samples, the connector is a TRAPEZOID, and its taper is the visual
+     statement of how the cluster's share shifts between conditions.
+
+     The genomic x axis is suppressed: each lane has its own local coordinate
+     block, so one shared axis would be meaningless. A small "start-end" label
+     is drawn under each lane instead. binding_sites and vlines are redrawn
+     once per lane.
+     ========================================================================== -->
+
+```{r fn-linked}
+plot_fiberseq_dense_linked <- function(plot_df, plot_range, sample_order,
+                                       link_pairs = NULL,
+                                       fill_color = TF_FILL,
+                                       binding_sites = NULL,
+                                       binding_site_alpha = 1,
+                                       binding_site_linewidth = 0.6,
+                                       n_label_tiers = 3,
+                                       label_tier_gap = NULL,
+                                       label_gap = NULL,
+                                       vlines = NULL, vline_colors = NULL,
+                                       link_fill = "grey50", link_alpha = 0.18,
+                                       link_linetype = "22", link_color = "grey30",
+                                       lane_gap_frac = 0.15,
+                                       lane_height = 100,
+                                       cluster_gap = 0,
+                                       cluster_box = FALSE,
+                                       cluster_box_color = "black",
+                                       cluster_box_linewidth = 0.4,
+                                       show_cluster_labels = TRUE,
+                                       atac_df = NULL,          # compute_atac_signal() output
+                                       atac_height = NULL,      # NULL = 10% of lane_height
+                                       atac_gap = NULL,         # NULL =  5% of lane_height
+                                       atac_ylim = NULL,        # NULL = shared max per scale group
+                                       atac_scale_groups = NULL,# defaults to link_pairs
+                                       atac_color = NULL,       # NULL = reuse fill_color
+                                       atac_fill_alpha = 0.25,
+                                       sample_label_gap = NULL,
+                                       sample_display_labels = NULL,
+                                       label_groups = NULL,
+                                       group_label_gap = NULL,
+                                       # decoration switches, for stacking several
+                                       # panels that share one set of headers
+                                       show_binding_labels = TRUE,
+                                       show_lane_underline = TRUE,
+                                       show_range_label = TRUE,
+                                       margin_top = NULL,
+                                       margin_bottom = 5,
+                                       title = "Clustered Fiber-seq: linked cluster view",
+                                       raster = TRUE, raster_dpi = 300,
+                                       xlab = NULL) {
+
+  chr          <- as.character(seqnames(plot_range))
+  xlab         <- xlab %||% paste0("Genomic coordinate (", chr, ")")
+  region_start <- start(plot_range)
+  region_end   <- end(plot_range)
+  region_width <- region_end - region_start + 1
+
+  plot_df <- plot_df %>%
+    dplyr::filter(Sample %in% sample_order) %>%
+    mutate(Sample = factor(Sample, levels = sample_order))
+
+  n_s       <- length(sample_order)
+  gap_width <- region_width * lane_gap_frac
+  lane_x0   <- setNames((seq_len(n_s) - 1) * (region_width + gap_width), sample_order)
+
+  # ---- vertical layout, all relative to lane_height so the ATAC track, the
+  #      motif label tiers and the sample name never collide -----------------
+  has_atac         <- !is.null(atac_df)
+  atac_gap         <- atac_gap         %||% (lane_height * 0.05)
+  atac_height      <- atac_height      %||% (lane_height * 0.10)
+  label_gap        <- label_gap        %||% (lane_height * 0.05)
+  label_tier_gap   <- label_tier_gap   %||% (lane_height * 0.08)
+  sample_label_gap <- sample_label_gap %||% (lane_height * 0.05)
+  group_label_gap  <- group_label_gap  %||% (lane_height * 0.12)
+
+  atac_top       <- if (has_atac) lane_height + atac_gap + atac_height else lane_height
+  labels_base    <- atac_top + label_gap                                # tier-0 anchor
+  # With show_binding_labels = FALSE there is no text above the lanes, so the
+  # label tiers must not reserve their height -- otherwise a stacked panel
+  # carries ~30 units of empty headroom it never uses.
+  show_bs_labels <- !is.null(binding_sites) && show_binding_labels
+  labels_top     <- if (show_bs_labels) {
+    labels_base + (n_label_tiers - 1) * label_tier_gap                  # top tier
+  } else atac_top
+  sample_label_y <- labels_top + sample_label_gap
+  group_label_y  <- sample_label_y + group_label_gap
+
+  # ---- per (Sample, cluster) band geometry: share of that sample's reads ----
+  band_stats <- plot_df %>%
+    group_by(Sample, cluster) %>%
+    summarise(n_reads = max(local_index), .groups = "drop") %>%
+    group_by(Sample) %>%
+    arrange(Sample, cluster) %>%
+    mutate(
+      idx          = row_number(),
+      n_clust      = n(),
+      avail_height = lane_height - cluster_gap * (n_clust - 1),
+      height       = avail_height * n_reads / sum(n_reads),
+      cum_before   = dplyr::lag(cumsum(height), default = 0) + (idx - 1) * cluster_gap,
+      top          = lane_height - cum_before,
+      bottom       = top - height
+    ) %>%
+    ungroup()
+
+  # ---- one rectangle per footprint ------------------------------------------
+  plot_df2 <- plot_df %>%
+    left_join(band_stats %>% select(Sample, cluster, n_reads, top, bottom),
+              by = c("Sample", "cluster")) %>%
+    mutate(
+      band_h   = top - bottom,
+      y_center = bottom + (local_index - 0.5) / n_reads * band_h,
+      y_half   = 0.45 / n_reads * band_h,
+      x0       = lane_x0[as.character(Sample)],
+      xmin     = x0 + pmax(start, region_start) - region_start,
+      xmax     = x0 + pmin(end,   region_end)   - region_start,
+      ymin     = y_center - y_half,
+      ymax     = y_center + y_half,
+      fill_hex = vapply(as.character(Sample), .resolve_fill,
+                        character(1), fill_color = fill_color)
+    )
+
+  # ---- link geometry: shaded trapezoid + dashed top/bottom edges -------------
+  link_polys <- NULL
+  link_edges <- NULL
+  if (!is.null(link_pairs) && length(link_pairs) > 0) {
+
+    bad <- base::setdiff(unlist(link_pairs), sample_order)
+    if (length(bad) > 0) {
+      stop("link_pairs reference sample(s) not in sample_order: ",
+           paste(bad, collapse = ", "))
+    }
+
+    link_geo <- purrr::map_dfr(seq_along(link_pairs), function(i) {
+      sA <- link_pairs[[i]][1]; sB <- link_pairs[[i]][2]
+      bA <- band_stats %>% dplyr::filter(Sample == sA)
+      bB <- band_stats %>% dplyr::filter(Sample == sB)
+      common <- base::intersect(as.character(bA$cluster), as.character(bB$cluster))
+      if (length(common) == 0) {
+        warning(sprintf("No shared clusters between '%s' and '%s'; link skipped.", sA, sB))
+      }
+      purrr::map_dfr(common, function(cl) {
+        rA <- bA[as.character(bA$cluster) == cl, ]
+        rB <- bB[as.character(bB$cluster) == cl, ]
+        tibble(link_id = paste(sA, sB, cl, sep = "__"), cluster = cl,
+               xA = lane_x0[sA] + region_width, xB = lane_x0[sB],
+               topA = rA$top, botA = rA$bottom, topB = rB$top, botB = rB$bottom)
+      })
+    })
+
+    link_polys <- purrr::pmap_dfr(link_geo, function(link_id, cluster, xA, xB,
+                                                     topA, botA, topB, botB) {
+      tibble(link_id = link_id, x = c(xA, xB, xB, xA), y = c(botA, botB, topB, topA))
+    })
+    link_edges <- bind_rows(
+      link_geo %>% transmute(edge_id = paste0(link_id, "_top"),
+                             x1 = xA, y1 = topA, x2 = xB, y2 = topB),
+      link_geo %>% transmute(edge_id = paste0(link_id, "_bottom"),
+                             x1 = xA, y1 = botA, x2 = xB, y2 = botB)
+    )
+  }
+
+  p <- ggplot()
+
+  # ---- ATAC track, drawn first so everything layers on top -------------------
+  if (has_atac) {
+
+    atac_plot_df <- atac_df %>% dplyr::filter(Sample %in% sample_order)
+
+    # samples in the same scale group share a y maximum, so a DMSO/dTag pair is
+    # visually comparable. Defaults to the link_pairs grouping.
+    scale_groups <- atac_scale_groups %||% link_pairs
+    group_lookup <- character(0)
+    if (!is.null(scale_groups)) {
+      for (i in seq_along(scale_groups)) group_lookup[scale_groups[[i]]] <- paste0("grp", i)
+    }
+    ungrouped <- base::setdiff(sample_order, names(group_lookup))
+    group_lookup[ungrouped] <- ungrouped
+    atac_plot_df$scale_group <- group_lookup[as.character(atac_plot_df$Sample)]
+
+    if (is.null(atac_ylim)) {
+      group_range <- atac_plot_df %>%
+        group_by(scale_group) %>%
+        summarise(y_lo = 0, y_hi = max(signal, na.rm = TRUE), .groups = "drop")
+      atac_plot_df <- atac_plot_df %>% left_join(group_range, by = "scale_group")
+    } else {
+      atac_plot_df <- atac_plot_df %>% mutate(y_lo = atac_ylim[1], y_hi = atac_ylim[2])
+    }
+
+    atac_fill_lookup <- atac_color %||% fill_color
+    baseline_y       <- lane_height + atac_gap
+
+    atac_plot_df <- atac_plot_df %>%
+      mutate(
+        x0       = lane_x0[as.character(Sample)],
+        x        = x0 + pos - region_start,
+        sig_clip = pmin(pmax(signal, y_lo), y_hi),
+        y        = baseline_y + (sig_clip - y_lo) / (y_hi - y_lo) * atac_height,
+        col_hex  = vapply(as.character(Sample), .resolve_fill,
+                          character(1), fill_color = atac_fill_lookup)
+      )
+
+    baseline_df   <- tibble(x    = lane_x0[sample_order],
+                            xend = lane_x0[sample_order] + region_width,
+                            y    = baseline_y)
+    atac_label_df <- tibble(x = lane_x0[sample_order] + region_width * 0.02,
+                            y = atac_top, label = "ATAC")
+
+    atac_layer <- geom_ribbon(data = atac_plot_df,
+                              aes(x = x, ymin = baseline_y, ymax = y,
+                                  group = Sample, fill = col_hex),
+                              alpha = atac_fill_alpha, inherit.aes = FALSE)
+    if (raster) atac_layer <- ggrastr::rasterise(atac_layer, dpi = raster_dpi,
+                                                 dev = "ragg_png")
+
+    p <- p +
+      geom_segment(data = baseline_df, aes(x = x, xend = xend, y = y, yend = y),
+                   colour = "grey80", linewidth = 0.3, inherit.aes = FALSE) +
+      atac_layer +
+      scale_fill_identity(guide = "none") +
+      geom_line(data = atac_plot_df,
+                aes(x = x, y = y, group = Sample, colour = col_hex),
+                linewidth = 0.4, inherit.aes = FALSE) +
+      scale_colour_identity(guide = "none") +
+      geom_text(data = atac_label_df, aes(x = x, y = y, label = label),
+                hjust = 0, vjust = 0, size = 2.3, colour = "grey40",
+                fontface = "italic", inherit.aes = FALSE)
+  }
+
+  # ---- motif guides, with labels staggered across n_label_tiers ---------------
+  # show_binding_labels = FALSE keeps the dashed guides but stops them at the
+  # top of the lanes and draws no text, so a stacked panel can carry the
+  # vertical alignment cues without repeating the motif names.
+  if (!is.null(binding_sites)) {
+    bs_all <- purrr::map_dfr(sample_order, function(s) {
+      binding_sites %>%
+        arrange(xmin) %>%
+        mutate(tier     = (row_number() - 1) %% n_label_tiers,
+               x_center = (xmin + xmax) / 2,
+               x        = lane_x0[s] + x_center - region_start,
+               label_y  = if (show_bs_labels) labels_base + tier * label_tier_gap
+                          else lane_height)
+    })
+    p <- p +
+      geom_segment(data = bs_all,
+                   aes(x = x, xend = x, y = 0, yend = label_y, colour = col),
+                   linetype = "dashed", linewidth = binding_site_linewidth,
+                   alpha = binding_site_alpha, inherit.aes = FALSE)
+    if (show_bs_labels) {
+      p <- p + geom_text(data = bs_all,
+                         aes(x = x, y = label_y, label = TF, colour = col),
+                         vjust = -0.1, size = 2.5, inherit.aes = FALSE,
+                         show.legend = FALSE)
+    }
+    p <- p + scale_colour_identity(guide = "none")
+  }
+
+  if (!is.null(link_polys)) {
+    p <- p +
+      geom_polygon(data = link_polys, aes(x = x, y = y, group = link_id),
+                   fill = link_fill, alpha = link_alpha, inherit.aes = FALSE) +
+      geom_segment(data = link_edges, aes(x = x1, y = y1, xend = x2, yend = y2),
+                   linetype = link_linetype, colour = link_color,
+                   linewidth = 0.4, inherit.aes = FALSE)
+  }
+
+  rect_layer <- geom_rect(data = plot_df2,
+                          aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+                          fill = plot_df2$fill_hex, colour = NA)
+  if (raster) rect_layer <- ggrastr::rasterise(rect_layer, dpi = raster_dpi,
+                                               dev = "ragg_png")
+  p <- p + rect_layer
+
+  if (cluster_box) {
+    box_df <- purrr::map_dfr(sample_order, function(s) {
+      band_stats %>% dplyr::filter(Sample == s) %>%
+        mutate(xmin = lane_x0[s], xmax = lane_x0[s] + region_width)
+    })
+    p <- p + geom_rect(data = box_df,
+                       aes(xmin = xmin, xmax = xmax, ymin = bottom, ymax = top),
+                       fill = NA, colour = cluster_box_color,
+                       linewidth = cluster_box_linewidth, inherit.aes = FALSE)
+  }
+
+  if (!is.null(vlines)) {
+    if (is.null(vline_colors)) vline_colors <- rep("black", length(vlines))
+    vl_df <- purrr::map_dfr(seq_along(vlines), function(i) {
+      purrr::map_dfr(sample_order, function(s) {
+        tibble(x = lane_x0[s] + vlines[i] - region_start, colour = vline_colors[i])
+      })
+    })
+    p <- p +
+      geom_segment(data = vl_df, aes(x = x, xend = x, y = 0, yend = lane_height,
+                                     colour = colour),
+                   linetype = "dashed", linewidth = 0.4, alpha = 0.5,
+                   inherit.aes = FALSE) +
+      scale_colour_identity(guide = "none")
+  }
+
+  # ---- per-lane label + underline (e.g. "DMSO" / "dTag") ---------------------
+  lane_label_text <- if (!is.null(sample_display_labels)) {
+    sample_display_labels[sample_order]
+  } else sample_order
+
+  # Drawing an EMPTY label still expands the y range to sample_label_y, so a
+  # panel with blanked names kept its headroom. Skip the layers entirely when
+  # there is nothing to show.
+  if (show_lane_underline) {
+    lane_underlines <- tibble(x    = lane_x0[sample_order],
+                              xend = lane_x0[sample_order] + region_width,
+                              y    = sample_label_y)
+    p <- p + geom_segment(data = lane_underlines,
+                          aes(x = x, xend = xend, y = y, yend = y),
+                          colour = "black", linewidth = 0.4, inherit.aes = FALSE)
+  }
+  if (any(nzchar(lane_label_text))) {
+    lane_labels <- tibble(x = lane_x0[sample_order] + region_width / 2,
+                          y = sample_label_y, label = lane_label_text)
+    p <- p + geom_text(data = lane_labels, aes(x = x, y = y, label = label),
+                       vjust = -0.3, size = 3.5, inherit.aes = FALSE)
+  }
+
+  # ---- group label spanning several lanes ------------------------------------
+  if (!is.null(label_groups)) {
+    group_df <- imap_dfr(label_groups, function(members, glabel) {
+      bad <- base::setdiff(members, sample_order)
+      if (length(bad) > 0) {
+        warning("label_groups entry '", glabel, "' references sample(s) not in ",
+                "sample_order: ", paste(bad, collapse = ", "), " -- skipping.")
+        return(NULL)
+      }
+      tibble(label = glabel,
+             x0 = min(lane_x0[members]),
+             x1 = max(lane_x0[members]) + region_width)
+    })
+    p <- p +
+      geom_segment(data = group_df,
+                   aes(x = x0, xend = x1, y = group_label_y, yend = group_label_y),
+                   colour = "black", linewidth = 0.4, inherit.aes = FALSE) +
+      geom_text(data = group_df,
+                aes(x = (x0 + x1) / 2, y = group_label_y, label = label),
+                vjust = -0.3, size = 3.8, inherit.aes = FALSE)
+  }
+
+  # Repeated under every lane, so worth switching off on all but the bottom
+  # panel of a stack.
+  if (show_range_label) {
+    range_labels <- tibble(x = lane_x0[sample_order] + region_width / 2, y = 0,
+                           label = paste0(comma(region_start), "-", comma(region_end)))
+    p <- p + geom_text(data = range_labels, aes(x = x, y = y, label = label),
+                       vjust = 2.2, size = 2.3, colour = "grey40", inherit.aes = FALSE)
+  }
+
+  if (show_cluster_labels) {
+    lbl <- band_stats %>%
+      mutate(x = lane_x0[as.character(Sample)], y = (top + bottom) / 2)
+    p <- p + geom_text(data = lbl, aes(x = x, y = y, label = cluster),
+                       hjust = 1.3, size = 2.8, inherit.aes = FALSE)
+  }
+
+  p +
+    coord_cartesian(clip = "off") +
+    theme_classic() +
+    theme(axis.text = element_blank(), axis.ticks = element_blank(),
+          axis.line = element_blank(), panel.grid = element_blank(),
+          plot.margin = margin(
+            t = margin_top %||% (if (!is.null(label_groups)) 50
+                                 else if (has_atac) 40 else 20),
+            r = 5, b = margin_bottom, l = 20)) +
+    labs(title = title, x = xlab, y = NULL)
+}
+```
+
+## 5.11 MSP geometry and the open / closed summary
+
+<!-- ==========================================================================
+     For one enhancer, collapse the k-means clusters into "open" and "closed"
+     groups and compute log2FC(dTag / DMSO) of the % of reads in each group,
+     per replicate pair.
+
+     TWO WAYS TO DEFINE THE GROUPS
+
+       (A) MANUAL   pass open_clusters and closed_clusters as integer vectors.
+
+       (B) AUTO     pass msp_files + motif_range. A cluster is "open" if, among
+                    its MSPs overlapping the motif:
+                        mean_msp_width >= min_msp_width      AND
+                        width_before   >= min_width_before   AND
+                        width_after    >= min_width_after    AND
+                        n_msp          >= min_n_msp
+                    Every other cluster becomes "closed" (the complement, so no
+                    cluster is left unclassified).
+
+     ON THE THRESHOLDS : for the same pool of overlapping
+     MSPs these three widths satisfy
+         mean_msp_width = width_before + width_after + motif_width
+     so with a small motif and 300 / 150 / 150 the mean_msp_width test is
+     already implied by the other two and adds nothing. It is kept because it
+     is harmless and self-documenting, and because it would matter for a very
+     asymmetric overhang. In the methods, describe the criterion as "at least
+     150 bp of accessible MSP on each side of the motif".
+
+     clusters with fewer than min_n_msp motif-overlapping
+     MSPs are called "closed" by default rather than trusted on sparse data.
+     The function messages which clusters this affected -- read those messages.
+
+     The output always carries a `clusters` column recording which cluster IDs
+     went into that row's group, so the result is self-documenting even though
+     the classification is data-driven.
+     ========================================================================== -->
+
+```{r fn-msp}
+#' Mean MSP geometry around a motif, per cluster
+#'
+#' @param motif_range  a GRanges, or c(start, end) plus an explicit `chrom`.
+#'   MSP .bed files pool footprints from several PCR amplicons, so filtering on
+#'   numeric coordinates alone can match the wrong locus -- chrom is mandatory.
+compute_msp_motif_stats <- function(msp_files, cluster_assignments_perrep,
+                                    motif_range, chrom = NULL) {
+
+  if (methods::is(motif_range, "GRanges")) {
+    chrom       <- as.character(seqnames(motif_range))
+    motif_start <- start(motif_range)
+    motif_end   <- end(motif_range)
+  } else {
+    if (is.null(chrom)) {
+      stop("compute_msp_motif_stats: provide `chrom` (or pass motif_range as a ",
+           "GRanges). MSP bed files pool multiple amplicons, so filtering on ",
+           "coordinates alone risks matching the wrong locus.")
+    }
+    motif_start <- motif_range[1]
+    motif_end   <- motif_range[2]
+  }
+
+  # FIX B1: this used to re-read the file with readLines() and attach chrom by
+  #         ROW POSITION. read_fiberhmm_bed() drops malformed rows, so one bad
+  #         line shifted every chromosome assignment after it -- silently
+  #         corrupting the amplicon filter and therefore the open/closed call.
+  #         read_fiberhmm_bed() now carries `chrom` through directly.
+  msps <- imap_dfr(msp_files, function(path, s_name) {
+    read_fiberhmm_bed(path)$footprints %>%
+      transmute(unique_id = paste0(s_name, "_", read_name),
+                chrom, msp_start = fp_start, msp_end = fp_end)
+  })
+
+  target_chrom <- chrom
+  stats <- msps %>%
+    dplyr::filter(chrom == target_chrom,
+                  msp_end >= motif_start, msp_start <= motif_end) %>%
+    inner_join(cluster_assignments_perrep %>% dplyr::select(unique_id, cluster),
+               by = "unique_id") %>%
+    mutate(msp_width    = msp_end - msp_start + 1L,
+           width_before = motif_start - msp_start,   # accessible bp 5' of motif
+           width_after  = msp_end - motif_end) %>%   # accessible bp 3' of motif
+    group_by(cluster) %>%
+    summarise(mean_msp_width = mean(msp_width),
+              width_before   = mean(width_before),
+              width_after    = mean(width_after),
+              n_msp          = dplyr::n(),
+              .groups = "drop") %>%
+    mutate(cluster = as.integer(as.character(cluster)))
+
+  # keep clusters with zero overlapping MSPs as explicit NA rows
+  all_clusters <- sort(unique(as.integer(as.character(cluster_assignments_perrep$cluster))))
+  tibble(cluster = all_clusters) %>% left_join(stats, by = "cluster")
+}
+```
+
+```{r fn-openclosed}
+compute_openclosed_log2fc <- function(cluster_assignments_perrep,
+                                      comparisons,
+                                      enhancer_name,
+                                      open_clusters    = NULL,
+                                      closed_clusters  = NULL,
+                                      msp_files        = NULL,
+                                      motif_range      = NULL,
+                                      chrom            = NULL,
+                                      min_msp_width    = 300,
+                                      min_width_before = 150,
+                                      min_width_after  = 150,
+                                      min_n_msp        = 20) {
+
+  manual_mode <- !is.null(open_clusters) || !is.null(closed_clusters)
+  auto_mode   <- !is.null(msp_files)     || !is.null(motif_range)
+
+  if (manual_mode && auto_mode) {
+    stop("Provide EITHER open_clusters/closed_clusters (manual) OR ",
+         "msp_files/motif_range (auto), not both.")
+  }
+  if (!manual_mode && !auto_mode) {
+    stop("Provide either open_clusters & closed_clusters, or msp_files & motif_range.")
+  }
+  if (manual_mode && (is.null(open_clusters) || is.null(closed_clusters))) {
+    stop("Manual mode requires BOTH open_clusters and closed_clusters.")
+  }
+  if (auto_mode && (is.null(msp_files) || is.null(motif_range))) {
+    stop("Auto mode requires BOTH msp_files and motif_range.")
+  }
+
+  if (auto_mode) {
+    msp_stats    <- compute_msp_motif_stats(msp_files, cluster_assignments_perrep,
+                                            motif_range, chrom = chrom)
+    all_clusters <- sort(unique(as.integer(as.character(cluster_assignments_perrep$cluster))))
+
+    is_open <- !is.na(msp_stats$mean_msp_width) & msp_stats$mean_msp_width >= min_msp_width &
+               !is.na(msp_stats$width_before)   & msp_stats$width_before   >= min_width_before &
+               !is.na(msp_stats$width_after)    & msp_stats$width_after    >= min_width_after &
+               !is.na(msp_stats$n_msp)          & msp_stats$n_msp          >= min_n_msp
+
+    open_clusters   <- as.integer(as.character(msp_stats$cluster[is_open]))
+    closed_clusters <- base::setdiff(all_clusters, open_clusters)
+
+    message(sprintf("[%s] auto-classified from MSP geometry: open = {%s}, closed = {%s}",
+                    enhancer_name,
+                    paste(sort(open_clusters),   collapse = ","),
+                    paste(sort(closed_clusters), collapse = ",")))
+
+    low_n <- msp_stats$cluster[!is.na(msp_stats$n_msp) & msp_stats$n_msp < min_n_msp]
+    if (length(low_n) > 0) {
+      message("  note: cluster(s) ", paste(sort(low_n), collapse = ","),
+              " had < ", min_n_msp, " motif-overlapping MSPs -- called 'closed' ",
+              "by default rather than trusted on sparse data (see Q6).")
+    }
+  }
+
+  ca <- cluster_assignments_perrep %>%
+    mutate(group = case_when(
+      as.integer(as.character(cluster)) %in% open_clusters   ~ "open",
+      as.integer(as.character(cluster)) %in% closed_clusters ~ "closed",
+      TRUE ~ NA_character_
+    )) %>%
+    dplyr::filter(!is.na(group))
+
+  # denominator = ALL reads in that sample. In auto mode open + closed is the
+  # complete set, so this is the same thing. In manual mode with unassigned
+  # clusters it is NOT -- the percentages will not sum to 100.
+  total_per_sample <- cluster_assignments_perrep %>%
+    dplyr::count(Sample, name = "total_reads")
+
+  pct_wide <- ca %>%
+    dplyr::count(Sample, group, name = "n_reads") %>%
+    left_join(total_per_sample, by = "Sample") %>%
+    mutate(percent = 100 * n_reads / total_reads) %>%
+    select(Sample, group, percent) %>%
+    pivot_wider(names_from = Sample, values_from = percent, values_fill = 0)
+
+  result <- imap_dfr(comparisons, function(pair, label) {
+
+    num <- pair[["numerator"]]
+    den <- pair[["denominator"]]
+
+    missing <- base::setdiff(c(num, den), names(pct_wide))
+    if (length(missing) > 0) {
+      stop("compute_openclosed_log2fc: sample(s) not found: ",
+           paste(missing, collapse = ", "))
+    }
+
+    # Q4: the degraded TF is inferred from the numerator's sample name.
+    # Warn rather than silently defaulting everything unmatched to SNAI.
+    tf_lab <- if (grepl("TWIST1", num)) "TWIST1" else if (grepl("SNAI", num)) "SNAI" else {
+      warning("Numerator '", num, "' matches neither TWIST1 nor SNAI; labelling SNAI.")
+      "SNAI"
+    }
+
+    tibble(
+      enhancer       = enhancer_name,
+      Replicate_Pair = label,
+      TF             = tf_lab,
+      group          = pct_wide$group,
+      Log2Ratio      = log2(pct_wide[[num]] / pct_wide[[den]])
+    )
+  })
+
+  cluster_str      <- c(open   = paste(sort(open_clusters),   collapse = ","),
+                        closed = paste(sort(closed_clusters), collapse = ","))
+  result$clusters  <- cluster_str[result$group]
+  result
+}
+```
+
+## 5.12 Convenience wrappers used by the per-enhancer sections
+
+```{r fn-wrappers}
+#' Build bundles, merge replicates, cluster, and split back out -- cached.
+#'
+#' Returns list(bundles, bundles_merged, ca_merged, ca_perrep).
+#' `cache_name` becomes <ROBJ_DIR>/<cache_name>.rds
+run_clustering <- function(key, samples, cluster_range, k, cache_name,
+                           rebuild = REBUILD_CLUSTERS) {
+
+  out <- cache_rds(cache_name, {
+    files   <- enh_files(key, samples, "footprint")
+    bundles <- build_all_bundles(files, cluster_range)
+
+    merged     <- merge_replicate_bundles(bundles, merge_groups_for(samples))
+    ca_merged  <- cluster_reads(merged, k = k, seed = KMEANS_SEED)
+    ca_perrep  <- split_cluster_assignments(ca_merged)
+
+    list(bundles        = bundles,
+         bundles_merged = merged,
+         ca_merged      = ca_merged,
+         ca_perrep      = ca_perrep,
+         kmeans_info    = attr(ca_merged, "kmeans_info"),
+         meta           = list(key = key, k = k, seed = KMEANS_SEED,
+                               minset = ENH[[key]]$minset,
+                               cluster_range = as.character(cluster_range),
+                               samples = samples,
+                               R_version = R.version.string,
+                               run_date  = Sys.Date()))
+  }, rebuild = rebuild)
+
+  # Print the fit quality every time, cached or not. Two things to watch:
+  # a cluster with very few reads is not a real class, and a low prop_between
+  # means the partition is not carrying much of the variance.
+  ki <- out$kmeans_info
+  if (!is.null(ki)) {
+    message(sprintf(
+      "  %s (%s): %s reads x %d bp, k = %d\n    init: %s\n    tot.withinss = %s | between/total = %.3f | %d iterations\n    cluster sizes: %s",
+      enh_label(key), cache_name, format(ki$n_reads, big.mark = ","),
+      ki$n_positions, ki$k, ki$init_method,
+      format(round(ki$tot_withinss), big.mark = ","),
+      ki$prop_between, ki$iterations,
+      paste(ki$cluster_sizes, collapse = ", ")))
+    tiny <- which(ki$cluster_sizes < 0.01 * ki$n_reads)
+    if (length(tiny) > 0) {
+      warning(enh_label(key), ": cluster(s) ", paste(tiny, collapse = ", "),
+              " hold under 1% of reads. Consider a smaller k.")
+    }
+  }
+  out
+}
+
+#' The linked DMSO/dTag heatmap, with LINKED_STYLE applied.
+#' `pairs` is a named list: "group label" = c(DMSO sample, dTag sample).
+linked_heatmap <- function(plot_df_merged, plot_range, pairs, atac_df,
+                           binding_sites, title, fill_color = TF_FILL) {
+
+  sample_order <- unlist(pairs, use.names = FALSE)
+
+  do.call(plot_fiberseq_dense_linked, c(
+    list(
+      plot_df               = plot_df_merged,
+      plot_range            = plot_range,
+      sample_order          = sample_order,
+      atac_df               = atac_df,
+      link_pairs            = unname(pairs),
+      sample_display_labels = setNames(
+        ifelse(grepl("DMSO", sample_order), "DMSO", "dTag"), sample_order),
+      label_groups          = pairs,
+      fill_color            = fill_color,
+      binding_sites         = binding_sites,
+      title                 = title
+    ),
+    LINKED_STYLE
+  ))
+}
+
+#' TF metaplot for one condition pair, replicate-averaged
+tf_panel <- function(meta_avg, plot_range, tf, binding_sites, title) {
+  samples <- paste0(tf, c("_DMSO", "_dTag"))
+  plot_tf_metaplot_overall(
+    meta_avg, plot_range,
+    samples       = samples,
+    sample_colors = META_COLORS[samples],
+    binding_sites = binding_sites,
+    subtitle      = "",
+    title         = title
+  )
+}
+```
+
+## 5.13 Cluster stability check (opt-in)
+
+<!-- ==========================================================================
+     WHY THIS EXISTS
+
+     Two runs of the previous pipeline differing ONLY in the order the bundles
+     were stacked (same reads, same k, same seed) disagreed on 11.4% of reads
+     at Enh 1: one cluster dissolved entirely and another was assembled from
+     thirds of three others. nstart = 25 was not finding a stable optimum.
+
+     The canonical row order in cluster_reads() makes a run reproducible, but
+     reproducible is not the same as stable -- it only guarantees you get the
+     SAME answer every time. This chunk asks the harder question: does the
+     partition survive changing the seed?
+
+     HOW TO READ IT
+       ARI >= 0.9   the partition is a property of the data; k is supportable
+       ARI 0.7-0.9  broadly stable, but expect some clusters to shuffle
+       ARI < 0.7    the partition is substantially an artefact of the seed.
+                    Do not rest a claim on individual cluster identities at
+                    this k -- either lower k, or report only the pooled
+                    open/closed split, which is far more robust than the
+                    individual clusters because it collapses exactly the
+                    boundaries that are moving.
+
+     Clusters a fixed subsample so every seed sees identical rows. This is a
+     diagnostic, not the analysis. Set eval = TRUE to run it; it is slow.
+     ========================================================================== -->
+
+```{r cluster-stability, eval = FALSE}
+#' Recluster the same reads under several seeds and report pairwise agreement
+cluster_stability <- function(bundles, k, seeds = c(1, 42, 123, 2024, 7),
+                              subsample = 20000L) {
+
+  mat <- do.call(rbind, map(bundles, bundle_to_matrix))
+  mat <- mat[order(rownames(mat), method = "radix"), , drop = FALSE]
+
+  if (!is.null(subsample) && nrow(mat) > subsample) {
+    set.seed(1L)                                   # same rows for every seed
+    mat <- mat[sort(sample.int(nrow(mat), subsample)), , drop = FALSE]
+  }
+
+  fits <- purrr::map(seeds, function(s) {
+    set.seed(s)
+    kmeans(mat, centers = k, nstart = KMEANS_NSTART, iter.max = KMEANS_ITER_MAX)
+  })
+  names(fits) <- paste0("seed", seeds)
+
+  pairs <- utils::combn(seq_along(seeds), 2)
+  ari   <- purrr::map_dfr(seq_len(ncol(pairs)), function(i) {
+    a <- pairs[1, i]; b <- pairs[2, i]
+    tibble(seed_a = seeds[a], seed_b = seeds[b],
+           ARI    = adjusted_rand(fits[[a]]$cluster, fits[[b]]$cluster))
+  })
+
+  wss <- purrr::map_dbl(fits, "tot.withinss")
+  list(
+    ari      = ari,
+    withinss = wss,
+    summary  = tibble(k = k, n = nrow(mat),
+                      mean_ARI = mean(ari$ARI),
+                      min_ARI  = min(ari$ARI),
+                      withinss_cv = sd(wss) / mean(wss))
+  )
+}
+
+# Enh 1 at the k actually used
+stab <- cluster_stability(enh1$bundles_merged, k = ENH$enh4$k)
+print(stab$summary)
+print(stab$ari)
+
+# Sweep k, to see whether a coarser partition is better determined
+sweep_k <- purrr::map_dfr(c(4, 6, 8, 10, 12), function(kk) {
+  cluster_stability(enh1$bundles_merged, k = kk, seeds = c(1, 42, 123))$summary
+})
+print(sweep_k)
+```
+
+# 6. Per-enhancer analyses
+
+<!-- ==========================================================================
+     Each section follows the same shape:
+       (a) cluster        run_clustering() -> bundles / merged / assignments
+       (b) heatmap        linked_heatmap() + make_log2fc_panel()
+       (c) open/closed    compute_openclosed_log2fc(), assigned to a NAMED
+                          object (never appended to a global -- see C4)
+       (d) TF metaplots   build_tf_metaplot_data() -> compute_tf_metaplot()
+
+     Every title and filename comes from enh_label() / fig_name(), so the paper
+     names in section 3 are the single source of truth.
+     ========================================================================== -->
+
+## 6.1 Enh 1 (internal: enh4, chr20)
+
+<!-- Clustered jointly across the TWIST1 and SNAI motifs.
+     Q1: this is the ONE enhancer analysed on the `min1` fiberHMM calls. -->
+
+```{r enh1-cluster}
+key <- "enh4"
+
+comparisons_5min <- list(
+  "TWIST1 Rep 1"  = c(numerator = "TWIST1_rep1_dTag5min", denominator = "TWIST1_rep1_DMSO5min"),
+  "TWIST1 Rep 2"  = c(numerator = "TWIST1_rep2_dTag5min", denominator = "TWIST1_rep2_DMSO5min"),
+  "SNAI1/2 Rep 1" = c(numerator = "SNAI_rep1_dTag5min",   denominator = "SNAI_rep1_DMSO5min"),
+  "SNAI1/2 Rep 2" = c(numerator = "SNAI_rep2_dTag5min",   denominator = "SNAI_rep2_DMSO5min")
+)
+
+enh1 <- run_clustering(
+  key           = key,
+  samples       = BOTH_SAMPLES,
+  cluster_range = enh_gr(key, "cluster"),
+  k             = ENH[[key]]$k,                 # 12
+  cache_name    = "enh4_k12"
+)
+```
+
+```{r enh1-heatmap, fig.width = 6, fig.height = 6}
+plot_range <- enh_gr(key, "plot")
+
+pairs_5min <- list(
+  "SNAI1/2 depletion" = c("SNAI_DMSO_5min",   "SNAI_dTag_5min"),
+  "TWIST1 depletion"  = c("TWIST1_DMSO_5min", "TWIST1_dTag_5min")
+)
+sample_order <- unlist(pairs_5min, use.names = FALSE)
+
+atac_df        <- compute_atac_signal(atac_for(sample_order), plot_range)
+plot_df_merged <- prepare_plot_data(enh1$bundles_merged, enh1$ca_merged, plot_range)
+
+# Q3: Enh 1 alone used 110 rather than the default 30, with no stated reason.
+# Both live in the config chunk now so the asymmetry is visible.
+log2fc_df <- compute_log2fc_df(enh1$ca_perrep, comparisons_5min,
+                               min_reads = MIN_READS_FC_ENH1)
+
+p_heat <- linked_heatmap(plot_df_merged, plot_range,
+                         pairs         = pairs_5min,
+                         atac_df       = atac_df,
+                         binding_sites = enh_motifs(key, "motifs"),
+                         title         = enh_label(key))
+p_heat
+ggsave(fig_name(key, "heatmap_linked"), p_heat,
+       width = 6, height = 6, device = cairo_pdf)
+```
+
+```{r enh1-log2fc, fig.width = 5, fig.height = 6}
+p_snai  <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("SNAI",   Replicate_Pair)),
+                             title = "SNAI",   palette = snai_palette)
+p_twist <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("TWIST1", Replicate_Pair)),
+                             title = "TWIST1", palette = twist_palette)
+
+(p_snai | p_twist)
+ggsave(fig_name(key, "clusterFC"), (p_snai | p_twist), width = 5, height = 6)
+```
+
+```{r enh1-openclosed}
+# MSP files: DMSO 5 min only -- accessibility is defined in the untreated state
+msp_files <- enh_files(key, only(BOTH_SAMPLES, "DMSO5min"), "msp")
+
+enh1_summary_snai <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh1$ca_perrep,
+  comparisons = comparisons_5min[grepl("SNAI", names(comparisons_5min))],
+  enhancer_name = enh_label(key),
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$snai$motif
+)
+
+enh1_summary_twist <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh1$ca_perrep,
+  comparisons = comparisons_5min[grepl("TWIST1", names(comparisons_5min))],
+  enhancer_name = enh_label(key),
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$twist1$motif
+)
+```
+
+```{r enh1-tf, fig.width = 6, fig.height = 10}
+tf_range <- enh_gr(key, "tf_plot")
+tf_bs    <- enh_motifs(key, "motifs_tf")
+
+tf_df <- cache_rds(
+  sprintf("tf_df_%s_thr%dw%d", enh_slug(key), TF_SCORE_THR, TF_MAX_WIDTH),
+  build_tf_metaplot_data(enh_files(key, only(BOTH_SAMPLES, "1min"), "tf"),
+                         enh1$ca_perrep, tf_range,
+                         score_threshold = TF_SCORE_THR, max_width = TF_MAX_WIDTH)
+)
+
+# all reads (clusters pooled), replicates averaged
+tf_all <- compute_tf_metaplot(tf_df, enh1$ca_perrep, tf_range,
+                              bundles = enh1$bundles, pool_clusters = TRUE) %>%
+  average_replicates()
+
+# accessible reads only: cluster 1
+tf_acc <- compute_tf_metaplot(tf_df, enh1$ca_perrep, tf_range,
+                              bundles = enh1$bundles,
+                              clusters = enh_accessible(key),
+                              pool_clusters = TRUE) %>%
+  average_replicates()
+
+p1 <- tf_panel(tf_all, tf_range, "TWIST1", tf_bs, enh_label(key, "- all reads"))
+p2 <- tf_panel(tf_acc, tf_range, "TWIST1", tf_bs, enh_label(key, "- cluster 1"))
+p3 <- tf_panel(tf_all, tf_range, "SNAI",   tf_bs, enh_label(key, "- all reads"))
+p4 <- tf_panel(tf_acc, tf_range, "SNAI",   tf_bs, enh_label(key, "- cluster 1"))
+
+p_atac <- plot_atac_signal(compute_atac_signal(ATAC_BW["SNAI_DMSO"], tf_range),
+                           tf_range, binding_sites = tf_bs, title = enh_label(key))
+
+ggarrange(p_atac, p1, p2, p3, p4, nrow = 5, align = "hv", legend = "right",
+          heights = c(0.7, 1, 1, 1, 1))
+ggsave(fig_name(key, "TFmetaplot_all_and_accessible"), width = 6, height = 10)
+```
+
+```{r enh1-tf-qc, eval = FALSE}
+# QC only (not a paper figure): per-replicate TWIST1 curves with the individual
+# footprint peaks marked, before replicate averaging.
+tf_overall_reps <- compute_tf_metaplot(tf_df, enh1$ca_perrep, tf_range,
+                                       bundles = enh1$bundles, pool_clusters = TRUE)
+plot_tf_metaplot_overall(
+  tf_overall_reps, tf_range,
+  samples      = only(TWIST1_SAMPLES, "1min"),
+  vlines       = c(17169874, 17169902, 17169943, 17169979, 17169750),
+  vline_colors = c("black", "black", "black", "black", "purple"),
+  title        = enh_label(key)
+)
+```
+
+## 6.2 Enh 2 (internal: enh10, chr11)
+
+<!-- Three accessible peaks are clustered SEPARATELY, each on its own local
+     window, because "is this molecule open" is a local question:
+       peak 1  TWIST1 motif
+       peak 2  SNAI motif   <- this clustering is the one reused in section 7
+       peak 3  E-box
+     All three are drawn over the same wide plot_range so the panels align. -->
+
+```{r enh2-common}
+key <- "enh10"
+
+comparisons_5min <- list(
+  "TWIST1 Rep 1"  = c(numerator = "TWIST1_rep1_dTag5min", denominator = "TWIST1_rep1_DMSO5min"),
+  "TWIST1 Rep 2"  = c(numerator = "TWIST1_rep2_dTag5min", denominator = "TWIST1_rep2_DMSO5min"),
+  "SNAI1/2 Rep 1" = c(numerator = "SNAI_rep1_dTag5min",   denominator = "SNAI_rep1_DMSO5min"),
+  "SNAI1/2 Rep 2" = c(numerator = "SNAI_rep2_dTag5min",   denominator = "SNAI_rep2_DMSO5min")
+)
+
+# named list form used by the open/closed summaries
+comparisons_oc <- list(
+  "SNAI R1 5m (dTag/DMSO)"   = c(numerator = "SNAI_rep1_dTag5min",   denominator = "SNAI_rep1_DMSO5min"),
+  "SNAI R2 5m (dTag/DMSO)"   = c(numerator = "SNAI_rep2_dTag5min",   denominator = "SNAI_rep2_DMSO5min"),
+  "TWIST1 R1 5m (dTag/DMSO)" = c(numerator = "TWIST1_rep1_dTag5min", denominator = "TWIST1_rep1_DMSO5min"),
+  "TWIST1 R2 5m (dTag/DMSO)" = c(numerator = "TWIST1_rep2_dTag5min", denominator = "TWIST1_rep2_DMSO5min")
+)
+
+plot_range   <- enh_gr(key, "plot")
+pairs_5min   <- list(
+  "SNAI1/2 depletion" = c("SNAI_DMSO_5min",   "SNAI_dTag_5min"),
+  "TWIST1 depletion"  = c("TWIST1_DMSO_5min", "TWIST1_dTag_5min")
+)
+sample_order <- unlist(pairs_5min, use.names = FALSE)
+atac_df      <- compute_atac_signal(atac_for(sample_order), plot_range)
+
+msp_files    <- enh_files(key, only(BOTH_SAMPLES, "DMSO5min"), "msp")
+```
+
+### 6.2.1 Peak 1 (TWIST1 motif)
+
+```{r enh2-peak1-cluster}
+enh2p1 <- run_clustering(
+  key           = key,
+  samples       = BOTH_SAMPLES,
+  cluster_range = enh_gr(key, "cluster", peak = "peak1"),
+  k             = ENH[[key]]$k,                  # 10
+  cache_name    = "enh10peak1_k10"
+)
+```
+
+```{r enh2-peak1-heatmap, fig.width = 10, fig.height = 8}
+plot_df_merged <- prepare_plot_data(enh2p1$bundles_merged, enh2p1$ca_merged, plot_range)
+log2fc_df      <- compute_log2fc_df(enh2p1$ca_perrep, comparisons_5min)
+
+p_heat <- linked_heatmap(plot_df_merged, plot_range,
+                         pairs         = pairs_5min,
+                         atac_df       = atac_df,
+                         binding_sites = enh_motifs(key, "motifs"),
+                         title         = enh_label(key, "peak 1"))
+p_heat
+ggsave(fig_name(key, "heatmap_linked", "peak1"), p_heat,
+       width = 10, height = 8, device = cairo_pdf)
+```
+
+```{r enh2-peak1-log2fc, fig.width = 5, fig.height = 6}
+p_snai  <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("SNAI",   Replicate_Pair)),
+                             title = "SNAI",   palette = snai_palette,  xlim = c(-0.8, 0.8))
+p_twist <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("TWIST1", Replicate_Pair)),
+                             title = "TWIST1", palette = twist_palette, xlim = c(-2, 2))
+(p_snai | p_twist)
+ggsave(fig_name(key, "clusterFC", "peak1"), (p_snai | p_twist), width = 5, height = 6)
+```
+
+```{r enh2-peak1-1min-vs-5min, fig.width = 8, fig.height = 6}
+# TWIST1 only: does the 1 min vs 5 min SsDddA labelling change the picture?
+pairs_time <- list(
+  "5 minutes SsDddA" = c("TWIST1_DMSO_5min", "TWIST1_dTag_5min"),
+  "1 minute SsDddA"  = c("TWIST1_DMSO_1min", "TWIST1_dTag_1min")
+)
+order_time <- unlist(pairs_time, use.names = FALSE)
+
+p_time <- do.call(plot_fiberseq_dense_linked, c(
+  list(
+    plot_df      = plot_df_merged,
+    plot_range   = plot_range,
+    sample_order = order_time,
+    atac_df      = compute_atac_signal(atac_for(order_time), plot_range),
+    # the extra middle link visualises the 5min-dTag -> 1min-DMSO step
+    link_pairs   = list(c("TWIST1_DMSO_5min", "TWIST1_dTag_5min"),
+                        c("TWIST1_DMSO_1min", "TWIST1_dTag_1min"),
+                        c("TWIST1_dTag_5min", "TWIST1_DMSO_1min")),
+    sample_display_labels = c(TWIST1_DMSO_5min = "DMSO 5 min",
+                              TWIST1_dTag_5min = "dTag 5 min",
+                              TWIST1_DMSO_1min = "DMSO 1 min",
+                              TWIST1_dTag_1min = "dTag 1 min"),
+    label_groups  = pairs_time,
+    fill_color    = c(TWIST1 = "darkblue"),
+    binding_sites = enh_motifs(key, "motifs"),
+    title         = enh_label(key, "peak 1 - TWIST1, 1 min vs 5 min")
+  ),
+  LINKED_STYLE
+))
+p_time
+ggsave(fig_name(key, "heatmap_TWIST1_1min_vs_5min", "peak1"), p_time,
+       width = 8, height = 6, device = cairo_pdf)
+```
+
+```{r enh2-peak1-openclosed}
+enh2_peak1_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh2p1$ca_perrep,
+  comparisons   = comparisons_oc,
+  enhancer_name = "Enh 2 peak 1",
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$peak1$motif        # TWIST1
+)
+```
+
+```{r enh2-peak1-tf, fig.width = 12, fig.height = 6}
+tf_range <- enh_gr(key, "tf_plot")
+tf_bs    <- enh_motifs(key, "motifs_tf")
+
+tf_df <- cache_rds(
+  sprintf("tf_df_%s_peak1_thr%dw%d", enh_slug(key), TF_SCORE_THR, TF_MAX_WIDTH),
+  build_tf_metaplot_data(enh_files(key, only(BOTH_SAMPLES, "1min"), "tf"),
+                         enh2p1$ca_perrep, tf_range,
+                         score_threshold = TF_SCORE_THR, max_width = TF_MAX_WIDTH)
+)
+
+tf_all <- compute_tf_metaplot(tf_df, enh2p1$ca_perrep, tf_range,
+                              bundles = enh2p1$bundles, pool_clusters = TRUE) %>%
+  average_replicates()
+
+tf_acc <- compute_tf_metaplot(tf_df, enh2p1$ca_perrep, tf_range,
+                              bundles = enh2p1$bundles,
+                              clusters = enh_accessible(key, "peak1"),
+                              pool_clusters = TRUE) %>%
+  average_replicates()
+
+p1 <- tf_panel(tf_all, tf_range, "TWIST1", tf_bs, enh_label(key, "- all reads"))
+p2 <- tf_panel(tf_acc, tf_range, "TWIST1", tf_bs, enh_label(key, "peak 1 - clusters 1,2"))
+p_atac <- plot_atac_signal(compute_atac_signal(ATAC_BW["SNAI_DMSO"], tf_range),
+                           tf_range, binding_sites = tf_bs,
+                           title = enh_label(key, "ATAC signal"))
+
+ggarrange(p_atac, p1, p2, nrow = 3, align = "hv", legend = "right",
+          heights = c(0.7, 1, 1))
+ggsave(fig_name(key, "TFmetaplot_TWIST1_all_and_accessible", "peak1"),
+       width = 12, height = 6, device = cairo_pdf)
+```
+
+```{r enh2-atac-wide, fig.width = 10, fig.height = 2}
+atac_wide <- compute_atac_signal(ATAC_BW["SNAI_DMSO"], enh_gr(key, "tf_plot"))
+p_atac_wide <- plot_atac_signal(atac_wide, enh_gr(key, "tf_plot"),
+                                binding_sites = enh_motifs(key, "motifs_tf"),
+                                title = enh_label(key, "ATAC signal"))
+p_atac_wide
+ggsave(fig_name(key, "ATAC_wide"), p_atac_wide, width = 10, height = 2)
+```
+
+### 6.2.2 Peak 2 (SNAI motif)
+
+```{r enh2-peak2-cluster}
+enh2p2 <- run_clustering(
+  key           = key,
+  samples       = BOTH_SAMPLES,
+  cluster_range = enh_gr(key, "cluster", peak = "peak2"),
+  k             = ENH[[key]]$k,
+  cache_name    = "enh10peak2_k10"
+)
+```
+
+```{r enh2-peak2-heatmap, fig.width = 10, fig.height = 8}
+plot_df_merged <- prepare_plot_data(enh2p2$bundles_merged, enh2p2$ca_merged, plot_range)
+log2fc_df      <- compute_log2fc_df(enh2p2$ca_perrep, comparisons_5min)
+
+p_heat <- linked_heatmap(plot_df_merged, plot_range,
+                         pairs         = pairs_5min,
+                         atac_df       = atac_df,
+                         binding_sites = enh_motifs(key, "motifs"),
+                         title         = enh_label(key, "peak 2"))
+p_heat
+ggsave(fig_name(key, "heatmap_linked", "peak2"), p_heat,
+       width = 10, height = 8, device = cairo_pdf)
+
+p_snai  <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("SNAI",   Replicate_Pair)),
+                             title = "SNAI",   palette = snai_palette,  xlim = c(-0.8, 0.8))
+p_twist <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("TWIST1", Replicate_Pair)),
+                             title = "TWIST1", palette = twist_palette, xlim = c(-2, 2))
+(p_snai | p_twist)
+ggsave(fig_name(key, "clusterFC", "peak2"), (p_snai | p_twist), width = 5, height = 6)
+```
+
+```{r enh2-peak2-openclosed}
+enh2_peak2_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh2p2$ca_perrep,
+  comparisons   = comparisons_oc,
+  enhancer_name = "Enh 2 peak 2",
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$peak2$motif        # SNAI
+)
+```
+
+```{r enh2-peak2-tf, fig.width = 12, fig.height = 4.5}
+tf_range <- enh_gr(key, "tf_plot")
+tf_bs    <- enh_motifs(key, "motifs_tf")
+
+tf_df <- cache_rds(
+  sprintf("tf_df_%s_peak2_thr%dw%d", enh_slug(key), TF_SCORE_THR, TF_MAX_WIDTH),
+  build_tf_metaplot_data(enh_files(key, only(BOTH_SAMPLES, "1min"), "tf"),
+                         enh2p2$ca_perrep, tf_range,
+                         score_threshold = TF_SCORE_THR, max_width = TF_MAX_WIDTH)
+)
+
+tf_all <- compute_tf_metaplot(tf_df, enh2p2$ca_perrep, tf_range,
+                              bundles = enh2p2$bundles, pool_clusters = TRUE) %>%
+  average_replicates()
+tf_acc <- compute_tf_metaplot(tf_df, enh2p2$ca_perrep, tf_range,
+                              bundles = enh2p2$bundles,
+                              clusters = enh_accessible(key, "peak2"),
+                              pool_clusters = TRUE) %>%
+  average_replicates()
+
+p1 <- tf_panel(tf_all, tf_range, "SNAI", tf_bs, enh_label(key, "- all reads"))
+p2 <- tf_panel(tf_acc, tf_range, "SNAI", tf_bs, enh_label(key, "peak 2 - open clusters"))
+
+ggarrange(p1, p2, nrow = 2, align = "hv", common.legend = TRUE, legend = "right")
+ggsave(fig_name(key, "TFmetaplot_SNAI_all_and_accessible", "peak2"),
+       width = 12, height = 4.5, device = cairo_pdf)
+```
+
+### 6.2.3 Peak 3 (E-box)
+
+```{r enh2-peak3-cluster}
+enh2p3 <- run_clustering(
+  key           = key,
+  samples       = BOTH_SAMPLES,
+  cluster_range = enh_gr(key, "cluster", peak = "peak3"),
+  k             = ENH[[key]]$k,
+  cache_name    = "enh10peak3_k10"
+)
+```
+
+```{r enh2-peak3-heatmap, fig.width = 10, fig.height = 8}
+plot_df_merged <- prepare_plot_data(enh2p3$bundles_merged, enh2p3$ca_merged, plot_range)
+log2fc_df      <- compute_log2fc_df(enh2p3$ca_perrep, comparisons_5min)
+
+p_heat <- linked_heatmap(plot_df_merged, plot_range,
+                         pairs         = pairs_5min,
+                         atac_df       = atac_df,
+                         binding_sites = enh_motifs(key, "motifs"),
+                         title         = enh_label(key, "peak 3"))
+p_heat
+ggsave(fig_name(key, "heatmap_linked", "peak3"), p_heat,
+       width = 10, height = 8, device = cairo_pdf)
+
+p_snai  <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("SNAI",   Replicate_Pair)),
+                             title = "SNAI",   palette = snai_palette,  xlim = c(-0.8, 0.8))
+p_twist <- make_log2fc_panel(log2fc_df %>% dplyr::filter(grepl("TWIST1", Replicate_Pair)),
+                             title = "TWIST1", palette = twist_palette, xlim = c(-2, 2))
+(p_snai | p_twist)
+ggsave(fig_name(key, "clusterFC", "peak3"), (p_snai | p_twist),
+       width = 5, height = 6, device = cairo_pdf)
+```
+
+```{r enh2-peak3-openclosed}
+enh2_peak3_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh2p3$ca_perrep,
+  comparisons   = comparisons_oc,
+  enhancer_name = "Enh 2 peak 3",
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$peak3$motif        # E-box
+)
+```
+
+### 6.2.4 Enh 2: opening across the three peaks
+
+```{r enh2-peak-summary, fig.width = 4, fig.height = 3}
+peak_levels <- c("Enh 2 peak 1", "Enh 2 peak 2", "Enh 2 peak 3")
+
+df_plot <- bind_rows(enh2_peak1_summary, enh2_peak2_summary, enh2_peak3_summary) %>%
+  dplyr::filter(group == "open") %>%
+  mutate(
+    enhancer    = factor(enhancer, levels = peak_levels),
+    peak_label  = sub("^Enh 2 ", "", as.character(enhancer)),
+    TF          = factor(TF, levels = c("TWIST1", "SNAI")),
+    facet_label = factor(ifelse(TF == "TWIST1", "TWIST1 depletion", "SNAI1/2 depletion"),
+                         levels = c("SNAI1/2 depletion", "TWIST1 depletion"))
+  )
+
+df_mean <- df_plot %>%
+  group_by(enhancer, peak_label, TF, facet_label) %>%
+  summarise(mean_log2fc = mean(Log2Ratio, na.rm = TRUE), .groups = "drop")
+
+p_enh2_peaks <- ggplot(df_mean, aes(x = peak_label, y = mean_log2fc, fill = TF)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6,
+           colour = "black", linewidth = 0.2) +
+  # FIX B6: geom_point has no `linewidth`; the outline width is `stroke`
+  geom_point(data = df_plot, aes(x = peak_label, y = Log2Ratio, fill = TF),
+             position = position_dodge(width = 0.7),
+             shape = 21, size = 1.5, colour = "black", stroke = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, colour = "black") +
+  scale_fill_manual(values = TF_FILL) +
+  facet_wrap(~ facet_label, ncol = 1, scales = "free_y") +
+  labs(x = NULL, fill = NULL,
+       y = "log2(dTag/DMSO) of % reads in accessible clusters (+/- 150 bp of motif)") +
+  theme_classic() +
+  theme(legend.position  = "none",
+        axis.text.x      = element_text(angle = 45, hjust = 1),
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold"))
+
+p_enh2_peaks
+ggsave(fig_name(key, "openclosed_by_peak"), p_enh2_peaks,
+       width = 4, height = 3, device = cairo_pdf)
+```
+
+### 6.2.5 Enh 2: all three peak clusterings in one stacked figure
+
+<!-- ==========================================================================
+     The same reads and the same window drawn three times, clustered on a
+     different peak each time: peak 1 (TWIST1) top, peak 2 (SNAI) middle,
+     peak 3 (E-box) bottom.
+
+     ATAC track, motif names, lane names and the DMSO/dTag group bars appear on
+     the TOP panel only. The lower two keep the dashed motif guides so the eye
+     can carry a vertical line down all three blocks, but with the label text
+     blanked.
+
+     Alignment: all three panels use the same plot_range and the same
+     sample_order, so lane_x0 is identical and the columns line up exactly.
+     Nothing here needs a new function -- it is the existing linked heatmap
+     called three times with different decoration.
+
+     The decoration is controlled by three switches on
+     plot_fiberseq_dense_linked(): show_binding_labels, show_lane_underline and
+     show_range_label, plus margin_top / margin_bottom. All default to the old
+     behaviour, so no other figure changes. Turning the labels off also
+     RECLAIMS their space -- an empty label still expanded the y range, so the
+     lower blocks used to carry ~30 units of unused headroom each.
+     ========================================================================== -->
+
+```{r enh2-stacked-peaks, fig.width = 10, fig.height = 18}
+key         <- "enh10"
+stack_range <- enh_gr(key, "plot")
+
+stack_pairs <- list(
+  "SNAI1/2 depletion" = c("SNAI_DMSO_5min",   "SNAI_dTag_5min"),
+  "TWIST1 depletion"  = c("TWIST1_DMSO_5min", "TWIST1_dTag_5min")
+)
+stack_order <- unlist(stack_pairs, use.names = FALSE)
+stack_atac  <- compute_atac_signal(atac_for(stack_order), stack_range)
+
+stack_motifs <- enh_motifs(key, "motifs")
+
+#' One block of the stack.
+#' @param clust  a run_clustering() result (enh2p1 / enh2p2 / enh2p3)
+#' @param decorate TRUE only for the top block: ATAC, motif names, lane names,
+#'   DMSO/dTag group bars. The lower blocks keep the dashed motif guides for
+#'   vertical alignment but draw no header at all.
+#' @param show_xlab TRUE only for the bottom block
+stack_block <- function(clust, title, decorate = FALSE, show_xlab = FALSE) {
+
+  pdf_merged <- prepare_plot_data(clust$bundles_merged, clust$ca_merged, stack_range)
+
+  do.call(plot_fiberseq_dense_linked, c(
+    list(
+      plot_df       = pdf_merged,
+      plot_range    = stack_range,
+      sample_order  = stack_order,
+      link_pairs    = unname(stack_pairs),
+      fill_color    = TF_FILL,
+      title         = title,
+      binding_sites = stack_motifs,
+      atac_df       = if (decorate) stack_atac  else NULL,
+      label_groups  = if (decorate) stack_pairs else NULL,
+      sample_display_labels = if (decorate) {
+        setNames(ifelse(grepl("DMSO", stack_order), "DMSO", "dTag"), stack_order)
+      } else NULL,
+
+      # header drawn once, on the top block only
+      show_binding_labels = decorate,   # guides stay, motif names do not
+      show_lane_underline = decorate,   # the bare black rule above the lanes
+      # the coordinate caption is identical in all 12 lanes -- bottom row only
+      show_range_label    = show_xlab,
+
+      # blocks 2 and 3 need no headroom, so pull them up under the one above
+      margin_top    = if (decorate) NULL else 2,
+      margin_bottom = if (show_xlab) 5 else 0,
+
+      # "" is not NULL, so %||% leaves it alone and the axis title is blank
+      xlab = if (show_xlab) NULL else ""
+    ),
+    LINKED_STYLE
+  ))
+}
+
+p_peak1 <- stack_block(enh2p1, "Clustered on peak 1 (TWIST1 motif)", decorate = TRUE)
+p_peak2 <- stack_block(enh2p2, "Clustered on peak 2 (SNAI1/2 motif)")
+p_peak3 <- stack_block(enh2p3, "Clustered on peak 3 (E-box)", show_xlab = TRUE)
+
+# Top block is taller because it alone carries the ATAC track, the motif names
+# and the group bars. Blocks 2 and 3 now occupy almost exactly their lane
+# height, so 1.35 / 1 / 1 keeps the three read blocks the same physical size.
+p_enh2_stack <- (p_peak1 / p_peak2 / p_peak3) +
+  plot_layout(heights = c(1.35, 1, 1)) +
+  plot_annotation(title = enh_label(key))
+
+p_enh2_stack
+ggsave(fig_name(key, "heatmap_linked_all3peaks_stacked"), p_enh2_stack,
+       width = 10, height = 15, limitsize = FALSE, device = cairo_pdf)
+```
+
+```{r enh2-stacked-peaks-with-fc, eval = FALSE, fig.width = 14, fig.height = 18}
+# Variant: same stack with the per-cluster log2FC bars alongside each block.
+# Each row is (heatmap | SNAI bars | TWIST1 bars); patchwork nests fine.
+fc_pair <- function(clust) {
+  d <- compute_log2fc_df(clust$ca_perrep, comparisons_5min)
+  (make_log2fc_panel(d %>% dplyr::filter(grepl("SNAI",   Replicate_Pair)),
+                     title = "SNAI",   palette = snai_palette,  xlim = c(-0.8, 0.8)) |
+   make_log2fc_panel(d %>% dplyr::filter(grepl("TWIST1", Replicate_Pair)),
+                     title = "TWIST1", palette = twist_palette, xlim = c(-2, 2)))
+}
+
+row1 <- (p_peak1 | fc_pair(enh2p1)) + plot_layout(widths = c(5, 2))
+row2 <- (p_peak2 | fc_pair(enh2p2)) + plot_layout(widths = c(5, 2))
+row3 <- (p_peak3 | fc_pair(enh2p3)) + plot_layout(widths = c(5, 2))
+
+p_enh2_stack_fc <- (row1 / row2 / row3) + plot_layout(heights = c(1.35, 1, 1))
+ggsave(fig_name(key, "heatmap_linked_all3peaks_stacked_withFC"), p_enh2_stack_fc,
+       width = 14, height = 18, limitsize = FALSE, device = cairo_pdf)
+```
+
+## 6.3 SNAI1/2-only enhancers (Enh 3, Enh 4, Enh 5, Enh 6)
+
+<!-- These four are analysed with the SNAI1/2 degron samples only, so they all
+     share one comparison set and one two-lane heatmap layout. -->
+
+```{r snai-only-common}
+comparisons_snai <- list(
+  "Rep1" = c(numerator = "SNAI_rep1_dTag5min", denominator = "SNAI_rep1_DMSO5min"),
+  "Rep2" = c(numerator = "SNAI_rep2_dTag5min", denominator = "SNAI_rep2_DMSO5min")
+)
+
+# open/closed summaries use the same two pairs but labelled for the figure
+comparisons_snai_oc <- list(
+  "SNAI R1 5m (dTag/DMSO)" = c(numerator = "SNAI_rep1_dTag5min", denominator = "SNAI_rep1_DMSO5min"),
+  "SNAI R2 5m (dTag/DMSO)" = c(numerator = "SNAI_rep2_dTag5min", denominator = "SNAI_rep2_DMSO5min")
+)
+
+pairs_snai   <- list("SNAI1/2 depletion" = c("SNAI_DMSO_5min", "SNAI_dTag_5min"))
+order_snai   <- unlist(pairs_snai, use.names = FALSE)
+
+#' Heatmap + log2FC bar for a two-lane SNAI-only enhancer
+snai_heatmap_panel <- function(clust, key, peak = NULL, plot_range,
+                               title, fc_xlim = NULL) {
+
+  atac_df        <- compute_atac_signal(atac_for(order_snai), plot_range)
+  plot_df_merged <- prepare_plot_data(clust$bundles_merged, clust$ca_merged, plot_range)
+  log2fc_df      <- compute_log2fc_df(clust$ca_perrep, comparisons_snai)
+
+  p_heat <- linked_heatmap(plot_df_merged, plot_range,
+                           pairs         = pairs_snai,
+                           atac_df       = atac_df,
+                           binding_sites = enh_motifs(key, "motifs", peak = peak),
+                           title         = title,
+                           fill_color    = c(SNAI = "darkred"))
+
+  p_bar <- make_log2fc_panel(log2fc_df, title = "log2FC",
+                             palette = snai_palette, xlim = fc_xlim) +
+    theme(legend.position = "right")
+
+  (p_heat | p_bar) + plot_layout(widths = c(5, 1))
+}
+
+#' All-reads vs accessible-reads TF metaplots + ATAC, for a SNAI-only enhancer
+snai_tf_figure <- function(clust, key, tf_range, cache_tag,
+                           accessible = enh_accessible(key)) {
+
+  tf_bs <- enh_motifs(key, "motifs_tf")
+
+  tf_df <- cache_rds(
+    sprintf("tf_df_%s_thr%dw%d", cache_tag, TF_SCORE_THR, TF_MAX_WIDTH),
+    build_tf_metaplot_data(enh_files(key, only(SNAI_SAMPLES, "1min"), "tf"),
+                           clust$ca_perrep, tf_range,
+                           score_threshold = TF_SCORE_THR, max_width = TF_MAX_WIDTH)
+  )
+
+  tf_all <- compute_tf_metaplot(tf_df, clust$ca_perrep, tf_range,
+                                bundles = clust$bundles, pool_clusters = TRUE) %>%
+    average_replicates()
+  tf_acc <- compute_tf_metaplot(tf_df, clust$ca_perrep, tf_range,
+                                bundles = clust$bundles, clusters = accessible,
+                                pool_clusters = TRUE) %>%
+    average_replicates()
+
+  p1 <- tf_panel(tf_all, tf_range, "SNAI", tf_bs, enh_label(key, "- all reads"))
+  p2 <- tf_panel(tf_acc, tf_range, "SNAI", tf_bs,
+                 enh_label(key, paste0("- cluster ", paste(accessible, collapse = ","))))
+  p_atac <- plot_atac_signal(compute_atac_signal(ATAC_BW["SNAI_DMSO"], tf_range),
+                             tf_range, binding_sites = tf_bs, title = enh_label(key))
+
+  ggarrange(p_atac, p1, p2, nrow = 3, align = "hv", legend = "right",
+            heights = c(0.7, 1, 1))
+}
+```
+
+### 6.3.1 Enh 3 (internal: enh8, chr20) -- peak 1, SNAI motif
+
+```{r enh3-peak1, fig.width = 10, fig.height = 6}
+key <- "enh8"
+
+enh3p1 <- run_clustering(
+  key           = key,
+  samples       = SNAI_SAMPLES,
+  cluster_range = enh_gr(key, "cluster", peak = "peak1"),
+  k             = ENH[[key]]$k,
+  cache_name    = "ENH8peak1_k10"
+)
+
+p <- snai_heatmap_panel(enh3p1, key, peak = "peak1",
+                        plot_range = enh_gr(key, "plot"),
+                        title      = enh_label(key))
+p
+ggsave(fig_name(key, "heatmap_linked", "peak1"), p,
+       width = 10, height = 6, device = cairo_pdf)
+```
+
+```{r enh3-peak1-openclosed}
+msp_files <- enh_files(key, only(SNAI_SAMPLES, "DMSO5min"), "msp")
+
+enh3_peak1_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh3p1$ca_perrep,
+  comparisons   = comparisons_snai_oc,
+  enhancer_name = "Enh 3 peak 1",
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$peak1$motif        # SNAI
+)
+```
+
+```{r enh3-tf, fig.width = 12, fig.height = 6}
+tf_range <- enh_gr(key, "tf_plot")
+snai_tf_figure(enh3p1, key, tf_range, cache_tag = "Enh3_peak1")
+ggsave(fig_name(key, "TFmetaplot_all_and_accessible", "peak1"),
+       width = 12, height = 6)
+```
+
+```{r enh3-atac-wide, fig.width = 10, fig.height = 2}
+r <- enh_gr(key, "atac_plot")
+p_atac_wide <- plot_atac_signal(compute_atac_signal(ATAC_BW["SNAI_DMSO"], r), r,
+                                binding_sites = enh_motifs(key, "motifs_tf"),
+                                title = enh_label(key, "ATAC signal"))
+p_atac_wide
+ggsave(fig_name(key, "ATAC_wide"), p_atac_wide, width = 10, height = 2)
+```
+
+### 6.3.2 Enh 3 -- peak 2 (rightmost peak, TWIST1 motif)
+
+```{r enh3-peak2, fig.width = 10, fig.height = 6}
+enh3p2 <- run_clustering(
+  key           = key,
+  samples       = SNAI_SAMPLES,
+  cluster_range = enh_gr(key, "cluster", peak = "peak2"),
+  k             = ENH[[key]]$k,
+  cache_name    = "ENH8peak2_k10"
+)
+
+p <- snai_heatmap_panel(enh3p2, key, peak = "peak2",
+                        plot_range = enh_gr(key, "plot"),
+                        title      = enh_label(key, "- peak 2"))
+p
+ggsave(fig_name(key, "heatmap_linked", "peak2"), p,
+       width = 10, height = 6, device = cairo_pdf)
+```
+
+```{r enh3-peak2-openclosed}
+enh3_peak2_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh3p2$ca_perrep,
+  comparisons   = comparisons_snai_oc,
+  enhancer_name = "Enh 3 peak 2",
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$peak2$motif        # TWIST1
+)
+```
+
+```{r enh3-peak-summary, fig.width = 4, fig.height = 2.5}
+df_plot <- bind_rows(enh3_peak1_summary, enh3_peak2_summary) %>%
+  dplyr::filter(group == "open") %>%
+  mutate(
+    enhancer    = factor(enhancer, levels = c("Enh 3 peak 1", "Enh 3 peak 2")),
+    TF          = factor(TF, levels = c("TWIST1", "SNAI")),
+    facet_label = factor(ifelse(TF == "TWIST1", "TWIST1 depletion", "SNAI1/2 depletion"),
+                         levels = c("SNAI1/2 depletion", "TWIST1 depletion"))
+  )
+
+df_mean <- df_plot %>%
+  group_by(enhancer, TF, facet_label) %>%
+  summarise(mean_log2fc = mean(Log2Ratio, na.rm = TRUE), .groups = "drop")
+
+p_enh3_peaks <- ggplot(df_mean, aes(x = enhancer, y = mean_log2fc, fill = TF)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6,
+           colour = "black", linewidth = 0.2) +
+  geom_point(data = df_plot, aes(x = enhancer, y = Log2Ratio, fill = TF),
+             position = position_dodge(width = 0.7),
+             shape = 21, size = 1.5, colour = "black", stroke = 0.2) +   # FIX B6
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, colour = "black") +
+  scale_fill_manual(values = TF_FILL) +
+  facet_wrap(~ facet_label, ncol = 1, scales = "free_y") +
+  labs(x = NULL, fill = NULL,
+       y = "log2(dTag/DMSO) of % reads in accessible clusters (+/- 150 bp of SNAI1/2 motif)") +
+  theme_classic() +
+  theme(legend.position  = "none",
+        axis.text.x      = element_text(angle = 45, hjust = 1),
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold"))
+
+p_enh3_peaks
+ggsave(fig_name(key, "openclosed_by_peak"), p_enh3_peaks,
+       width = 4, height = 2.5, device = cairo_pdf)
+```
+
+### 6.3.3 Enh 4 (internal: enh15, chr6)
+
+<!-- NB this is the locus the previous version also titled "ENH4", the same
+     string it used for internal enh4 (= Enh 1). Under the paper naming this
+     locus IS Enh 4, and internal enh4 is Enh 1. -->
+
+```{r enh4-analysis, fig.width = 10, fig.height = 6}
+key <- "enh15"
+
+enh4 <- run_clustering(
+  key           = key,
+  samples       = SNAI_SAMPLES,
+  cluster_range = enh_gr(key, "cluster"),
+  k             = ENH[[key]]$k,
+  cache_name    = "ENH15_k10"
+)
+
+p <- snai_heatmap_panel(enh4, key,
+                        plot_range = enh_gr(key, "plot"),
+                        title      = enh_label(key),
+                        fc_xlim    = c(-0.5, 0.5))
+p
+ggsave(fig_name(key, "heatmap_linked"), p, width = 10, height = 6, device = cairo_pdf)
+```
+
+```{r enh4-openclosed}
+msp_files <- enh_files(key, only(SNAI_SAMPLES, "DMSO5min"), "msp")
+
+enh4_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh4$ca_perrep,
+  comparisons   = comparisons_snai_oc,
+  enhancer_name = enh_label(key),
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$snai$motif
+)
+```
+
+### 6.3.4 Enh 5 (internal: enh30, chr3)
+
+```{r enh5-analysis, fig.width = 10, fig.height = 6}
+key <- "enh30"
+
+enh5 <- run_clustering(
+  key           = key,
+  samples       = SNAI_SAMPLES,
+  cluster_range = enh_gr(key, "cluster"),
+  k             = ENH[[key]]$k,
+  cache_name    = "ENH30_k10"
+)
+
+p <- snai_heatmap_panel(enh5, key,
+                        plot_range = enh_gr(key, "plot"),
+                        title      = enh_label(key))
+p
+ggsave(fig_name(key, "heatmap_linked"), p, width = 10, height = 6, device = cairo_pdf)
+```
+
+```{r enh5-openclosed}
+msp_files <- enh_files(key, only(SNAI_SAMPLES, "DMSO5min"), "msp")
+
+enh5_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh5$ca_perrep,
+  comparisons   = comparisons_snai_oc,
+  enhancer_name = enh_label(key),
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$snai$motif
+)
+```
+
+```{r enh5-tf, fig.width = 12, fig.height = 6}
+tf_range <- enh_gr(key, "tf_plot")
+snai_tf_figure(enh5, key, tf_range, cache_tag = "Enh5")
+ggsave(fig_name(key, "TFmetaplot_all_and_accessible"), width = 12, height = 6)
+```
+
+```{r enh5-atac-wide, fig.width = 10, fig.height = 2}
+r <- enh_gr(key, "atac_plot")
+p_atac_wide <- plot_atac_signal(compute_atac_signal(ATAC_BW["SNAI_DMSO"], r), r,
+                                binding_sites = enh_motifs(key, "motifs_tf"),
+                                title = enh_label(key, "ATAC signal"))
+p_atac_wide
+ggsave(fig_name(key, "ATAC_wide"), p_atac_wide, width = 10, height = 2)
+```
+
+### 6.3.5 Enh 6 (internal: enh33, chr11)
+
+```{r enh6-analysis, fig.width = 10, fig.height = 6}
+key <- "enh33"
+
+enh6 <- run_clustering(
+  key           = key,
+  samples       = SNAI_SAMPLES,
+  cluster_range = enh_gr(key, "cluster"),
+  k             = ENH[[key]]$k,
+  cache_name    = "ENH33_k10"
+)
+
+p <- snai_heatmap_panel(enh6, key,
+                        plot_range = enh_gr(key, "plot"),
+                        title      = enh_label(key))
+p
+ggsave(fig_name(key, "heatmap_linked"), p, width = 10, height = 6, device = cairo_pdf)
+```
+
+```{r enh6-openclosed}
+msp_files <- enh_files(key, only(SNAI_SAMPLES, "DMSO5min"), "msp")
+
+enh6_summary <- compute_openclosed_log2fc(
+  cluster_assignments_perrep = enh6$ca_perrep,
+  comparisons   = comparisons_snai_oc,
+  enhancer_name = enh_label(key),
+  msp_files     = msp_files,
+  chrom         = ENH[[key]]$chrom,
+  motif_range   = ENH[[key]]$peaks$snai$motif
+)
+```
+
+```{r enh6-tf, fig.width = 12, fig.height = 6}
+tf_range <- enh_gr(key, "tf_plot")
+snai_tf_figure(enh6, key, tf_range, cache_tag = "Enh6")
+ggsave(fig_name(key, "TFmetaplot_all_and_accessible"), width = 12, height = 6)
+```
+
+```{r enh6-atac-wide, fig.width = 10, fig.height = 2}
+r <- enh_gr(key, "atac_plot")
+p_atac_wide <- plot_atac_signal(compute_atac_signal(ATAC_BW["SNAI_DMSO"], r), r,
+                                binding_sites = enh_motifs(key, "motifs_tf"),
+                                title = enh_label(key, "ATAC signal"))
+p_atac_wide
+ggsave(fig_name(key, "ATAC_wide"), p_atac_wide, width = 10, height = 2)
+```
+
+# 7. Cross-enhancer summaries
+
+## 7.1 Assemble the open/closed table
+
+<!-- ==========================================================================
+     C4: the previous version grew one global table with
+         all_enhancer_summary_v2 <- bind_rows(all_enhancer_summary_v2, x)
+     spread over eight chunks. Re-running any chunk duplicated its rows and
+     the duplicates then fed straight into the summary bar plot. Everything is
+     bound exactly once, here, from named objects.
+     ========================================================================== -->
+
+```{r summary-assemble}
+open_closed_all <- bind_rows(
+  enh1_summary_snai,    # Enh 1, SNAI motif
+  enh1_summary_twist,   # Enh 1, TWIST1 motif
+  enh2_peak1_summary,   # Enh 2 peak 1 (TWIST1 motif)
+  enh2_peak2_summary,   # Enh 2 peak 2 (SNAI motif)
+  enh2_peak3_summary,   # Enh 2 peak 3 (E-box)
+  enh3_peak1_summary,   # Enh 3 peak 1 (SNAI motif)
+  enh3_peak2_summary,   # Enh 3 peak 2 (TWIST1 motif)
+  enh4_summary,         # Enh 4
+  enh5_summary,         # Enh 5
+  enh6_summary          # Enh 6
+)
+
+stopifnot(!any(duplicated(open_closed_all)))    # guard against the old C4 bug
+
+# which clusters ended up "open" at each locus -- worth eyeballing every run
+open_closed_all %>%
+  dplyr::filter(group == "open") %>%
+  distinct(enhancer, clusters) %>%
+  arrange(enhancer) %>%
+  print(n = Inf)
+```
+
+## 7.2 Chromatin opening on TF degradation, one bar per enhancer
+
+<!-- Each enhancer contributes the peak where the degraded TF actually binds:
+       Enh 1  both motifs (SNAI + TWIST1) were quantified
+       Enh 2  TWIST1 read out at peak 1, SNAI1/2 read out at peak 2
+       Enh 3  the SNAI1/2 peak (peak 1)
+       Enh 4-6  their single SNAI1/2 peak -->
+
+```{r summary-plot, fig.width = 6, fig.height = 4}
+plot_open_summary <- function(summary_df, enhancer_order, ylim = NULL,
+                              tf_colors = TF_FILL) {
+
+  df <- summary_df %>%
+    dplyr::filter(group == "open") %>%
+    mutate(enhancer = factor(enhancer, levels = enhancer_order))
+
+  df_mean <- df %>%
+    group_by(enhancer, TF) %>%
+    summarise(mean_log2fc = mean(Log2Ratio, na.rm = TRUE), .groups = "drop")
+
+  p <- ggplot(df_mean, aes(x = enhancer, y = mean_log2fc, fill = TF)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6,
+             colour = "black", linewidth = 0.2) +
+    geom_point(data = df, aes(x = enhancer, y = Log2Ratio, fill = TF),
+               position = position_dodge(width = 0.7),
+               shape = 21, size = 1.5, colour = "black", stroke = 0.2) +  # FIX B6
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, colour = "black") +
+    scale_fill_manual(values = tf_colors) +
+    labs(x = "Enhancer", fill = NULL,
+         y = "log2(dTag/DMSO) of % reads in accessible clusters (+/- 150 bp of motif)") +
+    theme_classic() +
+    theme(legend.position = "right",
+          axis.text.x     = element_text(angle = 45, hjust = 1))
+
+  if (!is.null(ylim)) p <- p + coord_cartesian(ylim = ylim)
+  p
+}
+
+summary_subset <- open_closed_all %>%
+  dplyr::filter(
+    (enhancer == "Enh 2 peak 1" & TF == "TWIST1") |     # TWIST1 at its own peak
+    (enhancer == "Enh 2 peak 2" & TF == "SNAI")   |     # SNAI1/2 at its own peak
+    enhancer %in% c("Enh 1", "Enh 3 peak 1", "Enh 4", "Enh 5", "Enh 6")
+  ) %>%
+  mutate(enhancer = recode(enhancer,
+                           "Enh 2 peak 1" = "Enh 2",
+                           "Enh 2 peak 2" = "Enh 2",
+                           "Enh 3 peak 1" = "Enh 3"))
+
+p_open <- plot_open_summary(
+  summary_subset,
+  enhancer_order = c("Enh 1", "Enh 2", "Enh 3", "Enh 4", "Enh 5", "Enh 6")
+)
+p_open
+ggsave(fig("summary_open_closed_all_enhancers_v297.pdf"), p_open,
+       width = 6, height = 4)
+```
+
+## 7.3 TF footprint occupancy: all reads vs accessible reads (CMH)
+
+<!-- ==========================================================================
+     SNAI1/2 DMSO vs dTag, 1 min DAF. Plotted: TFAP2A at Enh 2, TFAP2A at
+     Enh 5, NR2F1 at Enh 5. The Enh 1 and Enh 6 sites are kept commented out in
+     `sites` below; enh_config covers all four enhancers.
+
+     LAYOUT  facet_grid(read_set ~ site), row 1 = all reads, row 2 = accessible
+             reads, scales = "free_y" so each ROW gets its own y axis.
+
+     OCCUPANCY (the bars)  same definition as plot_tf_metaplot_overall():
+             per bp   -> TF footprints covering bp / read coverage at bp * 100
+             per site -> mean of that over the motif's bp (bp below
+                         min_read_cov are NA and excluded)
+
+     READ SETS
+       All reads        compute_tf_metaplot(pool_clusters = TRUE): denominator
+                        is every read of that sample.
+       Accessible reads compute_tf_metaplot(clusters = <open set>,
+                        pool_clusters = TRUE): numerator AND denominator are
+                        restricted to that enhancer's open cluster(s), the same
+                        sets used in the per-enhancer TF metaplots above.
+
+     STATISTICS
+       Plotted: Cochran-Mantel-Haenszel on per-read footprint calls, stratified
+         by replicate. For every read FULLY spanning the motif, "is there a TF
+         footprint overlapping the motif?" -> 2 x 2 x 2 table
+         (condition x footprinted x replicate). Note this tests the PERCENTAGE
+         OF READS footprinted -- a per-molecule quantity, close to but not
+         identical to the mean per-bp occupancy drawn as the bars. Both appear
+         in the QC table.
+       Printed only: paired t-test on the per-replicate occupancy values shown
+         as points. n = 2 pairs, df = 1 
+
+     Self-contained: reloads the cached clustering objects and the SNAI 1-min
+     tf .bed files itself, so it only needs sections 1-5 to have been run.
+     ========================================================================== -->
+
+```{r cmh-config}
+# Each enhancer must be paired with the tf .bed set matching the fiberHMM call
+# set it was CLUSTERED on -- Enh 1 is min1, the rest are min3 (reviewer note Q1).
+enh_config <- list(
+  enh4  = list(cache = "enh4_k12",         accessible = enh_accessible("enh4")),
+  # TFAP2A sits inside the peak-2 window, so the SNAI-centred peak-2 clustering
+  # is the correct local accessibility call for it.
+  enh10 = list(cache = "enh10peak2_k10",   accessible = enh_accessible("enh10", "peak2")),
+  enh30 = list(cache = "ENH30_k10",        accessible = enh_accessible("enh30")),
+  enh33 = list(cache = "ENH33_k10",        accessible = enh_accessible("enh33"))
+)
+
+# TF sites to quantify.
+#   NR2F1 at Enh 5 = the two adjacent motifs treated as one window.
+#   TFAP2A at Enh 6 = the site closest to the SNAI motif (8,709,103-8,709,110).
+sites <- tribble(
+  ~enh,     ~TF,       ~motif_start, ~motif_end,
+  "enh10",  "TFAP2A",      12319535,   12319546,
+  "enh30",  "TFAP2A",      69117131,   69117141,
+  "enh30",  "NR2F1",       69117159,   69117175
+# "enh4",   "TWIST1",      17169866,   17169882,
+# "enh33",  "TFAP2A",       8709060,    8709071,
+# "enh33",  "TWIST1",       8709132,    8709147
+)
+
+flank           <- 300L    # bp added around the motif(s) when building tf_df;
+                           # only the motif bp are averaged
+read_set_levels <- c("All reads", "Accessible reads")
+```
+
+```{r cmh-per-read-calls}
+#' Per-read footprint calls: the numerator/denominator for the CMH test
+#'
+#' denominator = reads FULLY spanning the motif (a read stopping inside the
+#'               motif cannot be scored), optionally restricted to `clusters`
+#' numerator   = those reads carrying a TF footprint overlapping the motif
+per_read_calls <- function(tf_df_e, ca_e, bundles_e, tf_files,
+                           motif_start, motif_end, clusters = NULL) {
+
+  reads <- reads_with_clusters(bundles_e, ca_e) %>%
+    dplyr::filter(Sample %in% names(tf_files),
+                  read_start <= motif_start, read_end >= motif_end)
+
+  if (!is.null(clusters)) {
+    reads <- reads %>%
+      dplyr::filter(as.character(cluster) %in% as.character(clusters))
+  }
+
+  fp_ids <- tf_df_e %>%
+    dplyr::filter(start <= motif_end, end >= motif_start) %>%
+    dplyr::pull(unique_id) %>% unique()
+
+  reads %>%
+    transmute(Sample, unique_id,
+              footprinted = factor(ifelse(unique_id %in% fp_ids, "yes", "no"),
+                                   levels = c("yes", "no")))
+}
+```
+
+```{r cmh-quantify}
+res <- purrr::map(unique(sites$enh), function(enh_key) {
+
+  cfg      <- enh_config[[enh_key]]
+  enh_site <- sites %>% dplyr::filter(enh == enh_key)
+  lab      <- enh_label(enh_key)
+
+  message("=== ", enh_key, " -> ", lab, " ===")
+
+  clust     <- readRDS(robj(paste0(cfg$cache, ".rds")))
+  bundles_e <- clust$bundles
+  ca_e      <- clust$ca_perrep
+  tf_files  <- enh_files(enh_key, only(SNAI_SAMPLES, "1min"), "tf")
+
+  # one window covering every site of this enhancer, plus flank
+  win <- GRanges(ENH[[enh_key]]$chrom,
+                 IRanges(min(enh_site$motif_start) - flank,
+                         max(enh_site$motif_end)   + flank))
+
+  tf_df_e <- cache_rds(
+    sprintf("tf_df_occbar_%s_thr%dw%d", enh_key, TF_SCORE_THR, TF_MAX_WIDTH),
+    build_tf_metaplot_data(tf_files, ca_e, win,
+                           score_threshold = TF_SCORE_THR,
+                           max_width       = TF_MAX_WIDTH)
+  )
+
+  # per-bp occupancy for the two read sets (replicates kept separate)
+  meta <- bind_rows(
+    compute_tf_metaplot(tf_df_e, ca_e, win, bundles = bundles_e,
+                        pool_clusters = TRUE, min_read_cov = MIN_READ_COV) %>%
+      mutate(read_set = "All reads"),
+    compute_tf_metaplot(tf_df_e, ca_e, win, bundles = bundles_e,
+                        clusters      = cfg$accessible,
+                        pool_clusters = TRUE, min_read_cov = MIN_READ_COV) %>%
+      mutate(read_set = "Accessible reads")
+  )
+
+  # (a) bars: mean per-bp occupancy over each motif window, per sample
+  occ <- purrr::pmap_dfr(enh_site, function(enh, TF, motif_start, motif_end) {
+    meta %>%
+      dplyr::filter(pos >= motif_start, pos <= motif_end) %>%
+      group_by(Sample, read_set) %>%
+      summarise(occupancy  = mean(normalized_occupancy, na.rm = TRUE),
+                mean_depth = mean(read_coverage),
+                n_bp_used  = sum(!is.na(normalized_occupancy)),
+                .groups    = "drop") %>%
+      mutate(enh = enh, TF = TF, fig_label = lab,
+             motif = sprintf("%s:%d-%d", ENH[[enh_key]]$chrom, motif_start, motif_end),
+             acc_clusters = paste(cfg$accessible, collapse = ","))
+  })
+
+  # (b) per-read calls for the CMH test
+  calls <- purrr::pmap_dfr(enh_site, function(enh, TF, motif_start, motif_end) {
+    bind_rows(
+      per_read_calls(tf_df_e, ca_e, bundles_e, tf_files,
+                     motif_start, motif_end, clusters = NULL) %>%
+        mutate(read_set = "All reads"),
+      per_read_calls(tf_df_e, ca_e, bundles_e, tf_files,
+                     motif_start, motif_end, clusters = cfg$accessible) %>%
+        mutate(read_set = "Accessible reads")
+    ) %>%
+      mutate(enh = enh, TF = TF, fig_label = lab)
+  })
+
+  list(occ = occ, calls = calls)
+})
+
+add_keys <- function(df) {
+  df %>%
+    mutate(
+      condition  = factor(ifelse(grepl("DMSO", Sample), "DMSO", "dTag"),
+                          levels = c("DMSO", "dTag")),
+      replicate  = ifelse(grepl("rep1", Sample), "Rep 1", "Rep 2"),
+      site_label = factor(
+        paste0(TF, "\n", fig_label),
+        levels = unique(paste0(sites$TF, "\n",
+                               purrr::map_chr(sites$enh, enh_label)))),
+      read_set   = factor(read_set, levels = read_set_levels)
+    )
+}
+
+occ_df   <- purrr::map_dfr(res, "occ")   %>% add_keys()
+calls_df <- purrr::map_dfr(res, "calls") %>% add_keys()
+```
+
+```{r cmh-stats}
+# ---- plotted: Cochran-Mantel-Haenszel, strata = replicates ------------------
+cmh_one <- function(df) {
+  tab <- df %>%
+    dplyr::count(replicate, condition, footprinted, name = "n") %>%
+    tidyr::complete(replicate, condition, footprinted, fill = list(n = 0L))
+  arr  <- stats::xtabs(n ~ condition + footprinted + replicate, data = tab)
+  # drop strata with an empty margin -- mantelhaen.test cannot use them
+  keep <- apply(arr, 3, function(m) all(rowSums(m) > 0) && all(colSums(m) > 0))
+  arr  <- arr[, , keep, drop = FALSE]
+  if (dim(arr)[3] < 1) return(NA_real_)
+  tryCatch(stats::mantelhaen.test(arr, exact = FALSE)$p.value,
+           error = function(e) NA_real_)
+}
+
+p_cmh <- calls_df %>%
+  group_by(site_label, read_set) %>%
+  group_modify(~ tibble(n_reads = nrow(.x), p_value = cmh_one(.x))) %>%
+  ungroup() %>%
+  mutate(test = "CMH on per-read footprint calls (strata = replicates)")
+
+# ---- printed only: paired t-test on the per-replicate occupancy values ------
+# n = 2 pairs, df = 1. See reviewer note Q8: do not promote these to a figure.
+p_paired_t <- occ_df %>%
+  select(site_label, read_set, replicate, condition, occupancy) %>%
+  pivot_wider(names_from = condition, values_from = occupancy) %>%
+  group_by(site_label, read_set) %>%
+  summarise(
+    n_pairs = sum(!is.na(DMSO) & !is.na(dTag)),
+    p_value = if (sum(!is.na(DMSO) & !is.na(dTag)) >= 2) {
+      tryCatch(stats::t.test(DMSO, dTag, paired = TRUE)$p.value,
+               error = function(e) NA_real_)
+    } else NA_real_,
+    .groups = "drop"
+  ) %>%
+  mutate(test = "paired t-test (n = replicate pairs)")
+
+# ---- QC: what is behind every bar and every test ---------------------------
+qc <- occ_df %>%
+  select(site_label, motif, read_set, Sample, occupancy,
+         mean_depth, n_bp_used, acc_clusters) %>%
+  left_join(
+    calls_df %>%
+      group_by(site_label, read_set, Sample) %>%
+      summarise(n_reads_spanning      = dplyr::n(),
+                pct_reads_footprinted = 100 * mean(footprinted == "yes"),
+                .groups = "drop"),
+    by = c("site_label", "read_set", "Sample")
+  ) %>%
+  arrange(site_label, read_set, Sample)
+print(qc, n = Inf)
+
+bind_rows(p_cmh      %>% select(site_label, read_set, p_value, test),
+          p_paired_t %>% select(site_label, read_set, p_value, test)) %>%
+  arrange(test, site_label, read_set) %>%
+  print(n = Inf)
+```
+
+```{r cmh-plot, fig.width = 5.5, fig.height = 3.5}
+occ_mean <- occ_df %>%
+  group_by(site_label, read_set, condition) %>%
+  summarise(occupancy = mean(occupancy, na.rm = TRUE), .groups = "drop")
+
+# p-value label height: one per ROW, because facet_grid(scales = "free_y")
+# gives each row a single y axis shared across the panels in that row
+label_y <- occ_df %>%
+  group_by(read_set) %>%
+  summarise(y = max(occupancy, na.rm = TRUE) * 1.12, .groups = "drop")
+
+lbl <- p_cmh %>%
+  left_join(label_y, by = "read_set") %>%
+  mutate(label = ifelse(is.na(p_value), "p = NA",
+                        paste0("p = ", formatC(p_value, format = "g", digits = 3))))
+
+p_occ_cmh <- ggplot(occ_mean, aes(x = condition, y = occupancy, fill = condition)) +
+  geom_col(width = 0.65, colour = "black", linewidth = 0.2) +
+  geom_line(data = occ_df, aes(x = condition, y = occupancy, group = replicate),
+            inherit.aes = FALSE, colour = "grey35", linewidth = 0.3) +
+  geom_point(data = occ_df,
+             aes(x = condition, y = occupancy, fill = condition, shape = replicate),
+             size = 1.8, colour = "black", stroke = 0.3) +
+  geom_text(data = lbl, aes(x = 1.5, y = y, label = label),
+            inherit.aes = FALSE, size = 2.8) +
+  facet_grid(read_set ~ site_label, scales = "free_y") +
+  scale_fill_manual(values = c(DMSO = "#99000D", dTag = "#FC9272")) +
+  scale_shape_manual(values = c("Rep 1" = 21, "Rep 2" = 24)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.18))) +
+  labs(x = NULL, y = "TF footprint occupancy (%)",
+       fill = "SNAI1/2", shape = NULL,
+       title = "TF footprint occupancy at motif, SNAI1/2 DMSO vs dTag (1 min DAF)",
+       subtitle = paste("bars = mean per-bp occupancy over the motif;",
+                        "p = Cochran-Mantel-Haenszel on per-read footprint calls,",
+                        "strata = replicates")) +
+  theme_classic() +
+  theme(legend.position  = "right",
+        strip.background = element_blank(),
+        strip.text       = element_text(face = "bold", size = 8),
+        plot.title       = element_text(size = 9),
+        plot.subtitle    = element_text(size = 7),
+        panel.spacing    = unit(0.4, "lines"))
+
+p_occ_cmh
+ggsave(fig("TFoccupancy_bar_Enh2_Enh5_all_vs_accessible_CMH_v297.pdf"),
+       p_occ_cmh, width = 5.5, height = 3.5)
+```
+
+# 8. Session info
+
+```{r session-info}
+sessionInfo()
+```
