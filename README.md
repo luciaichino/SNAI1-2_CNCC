@@ -70,20 +70,34 @@ codependency analysis enhancers 2 and 3 DAF-seq data
 
 ## ChromBPnet analysis (Figures 1, S1, 4, S3)
 
-run_modisco.py
-run_conversion.sh
-relaxed_modisco.sh
-generate_nonpeaks.sh
-finemo.sh
-extract_cwms.sh
-extract_cwms.py
-convert_chrombpnet_h5_to_npz.py
-chrombpnet_train_snail.sh
-chrombpnet_train_fold_validation.sh
 20_curate_cncc_regions.Rmd
-21_curate_motifs.Rmd
-22_custom_sequence_generation.Rmd
-23_predict_motif_effects.ipynb
+
+21_generate_nonpeaks.sh
+
+22_chrombpnet_train_snail.sh
+
+23_chrombpnet_train_fold_validation.sh
+
+24_convert_chrombpnet_h5_to_npz.py
+
+25_run_conversion.sh
+
+26_run_modisco.py
+
+27_modisco.sh
+
+28_finemo.sh
+
+29_extract_cwms.py
+
+30_extract_cwms.sh
+
+31_curate_motifs.Rmd
+
+32_custom_sequence_generation.Rmd
+
+33_predict_motif_effects.ipynb
+
 
 ## Evolutionary constraint (Figure S1)
 
