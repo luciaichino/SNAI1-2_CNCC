@@ -1,0 +1,267 @@
+---
+title: 'Prepare regions for ChromBPNet model training'
+author: "Kaelan Brennan"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# 1. Introduction
+
+Here, I will prepare ATAC-seq data for ChromBPNet model training for Lucia Ichino's project. 
+
+# 2. Computational Setup
+
+```{r, warning=F, message=F}
+
+#Standard packages
+
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings); library(ggseqlogo)
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools); library(ggpubr); library(BSgenome.Hsapiens.UCSC.hg38); library(parallel)
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit); library(cowplot)
+
+#KNITR Options
+
+setwd("/storage/kaelanb/analysis/lucia/analysis/")
+options(knitr.figure_dir="figures/0_curate_cncc_regions/", java.parameters = "- Xmx6g")
+
+#Sourced code
+
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/knitr_common.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/caching.r")
+
+#Pre-existing variables
+
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+bsgenome <- BSgenome.Hsapiens.UCSC.hg38
+rmsk <- rtracklayer::import("/work/kaelanb/indexes/hg38_rmsk.bed") %>% keepStandardChromosomes(pruning.mode="coarse")
+blacklist <- rtracklayer::import("/work/kaelanb/indexes/hg38-blacklist.v2.bed")
+chrombpnet.blacklisted.gr <- import("/work/kaelanb/public_data/chrombpnet_tutorial/data/downloads/blacklist.bed.gz")
+promoters_txdb <- promoters(genes(TxDb.Hsapiens.UCSC.hg38.knownGene), upstream = 250, downstream = 250) %>% keepStandardChromosomes(pruning.mode="coarse")
+
+```
+
+# 3. Import required data
+
+```{r import}
+
+# Function
+
+check_chromosome_boundaries<-function(gr, resize_boundary, genome=NULL){
+  
+  if(!is.null(genome)){
+    seqlevels(gr)<-seqlevels(genome)
+    seqinfo(gr)<-seqinfo(genome)
+  }
+  
+  key<-data.frame(seqlength_filler=seqlengths(gr), seqnames=names(seqlengths(gr)))
+  gr_merged<-merge(as.data.frame(gr), key, by.x="seqnames", by.y="seqnames") %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+  gr_merged$end_distance<-gr_merged$seqlength_filler-(end(gr_merged)+resize_boundary) #distance from end
+  gr_merged$start_distance<-start(gr_merged)-resize_boundary #distance from start
+  
+  flagged_indexes<-which(gr_merged$end_distance<=0 | gr_merged$start_distance<=0)
+  if(length(flagged_indexes)>0){
+    gr_merged<-gr_merged[-flagged_indexes]
+  }
+  message("Returning GRanges with metadata. We removed ", length(flagged_indexes), " regions.")
+  return(gr_merged)
+}
+
+# Replicate ATAC-seq peaks
+
+lucia_b27_atac_rep1.peaks <- import('/storage/lucia/ATAC/lib1ATAC/peaks_hg38/ATAC_SNAI12_c5946b27_DMSO_rep1_peaks.narrowPeak') %>%
+  check_chromosome_boundaries(., 3000, bsgenome) %>% 
+  keepStandardChromosomes(x = ., pruning.mode = 'coarse') %>%
+  plyranges::filter(!(seqnames %in% c('chrY', 'chrM'))) %>%
+  dplyr::select(-seqlength_filler, -end_distance, -start_distance, -score) %>%
+  unique()
+lucia_b27_atac_rep2.peaks <- import('/storage/lucia/ATAC/lib1ATAC/peaks_hg38/ATAC_SNAI12_c5946b27_DMSO_rep2_peaks.narrowPeak') %>%
+  check_chromosome_boundaries(., 3000, bsgenome) %>% 
+  keepStandardChromosomes(x = ., pruning.mode = 'coarse') %>%
+  plyranges::filter(!(seqnames %in% c('chrY', 'chrM'))) %>%
+  dplyr::select(-seqlength_filler, -end_distance, -start_distance, -score) %>%
+  unique()
+
+lucia_b16_atac_rep1.peaks <- import('/storage/lucia/ATAC/lib1ATAC/peaks_hg38/ATAC_SNAI12_c5946b16_DMSO_rep1_peaks.narrowPeak') %>%
+  check_chromosome_boundaries(., 3000, bsgenome) %>% 
+  keepStandardChromosomes(x = ., pruning.mode = 'coarse') %>%
+  plyranges::filter(!(seqnames %in% c('chrY', 'chrM'))) %>%
+  dplyr::select(-seqlength_filler, -end_distance, -start_distance, -score) %>%
+  unique()
+lucia_b16_atac_rep2.peaks <- import('/storage/lucia/ATAC/lib1ATAC/peaks_hg38/ATAC_SNAI12_c5946b16_DMSO_rep2_peaks.narrowPeak') %>%
+  check_chromosome_boundaries(., 3000, bsgenome) %>% 
+  keepStandardChromosomes(x = ., pruning.mode = 'coarse') %>%
+  plyranges::filter(!(seqnames %in% c('chrY', 'chrM'))) %>%
+  dplyr::select(-seqlength_filler, -end_distance, -start_distance, -score) %>%
+  unique()
+
+# Snail peaks
+
+snail_peaks.gr <- read.table("/storage/kaelanb/analysis/lucia/data/data_forKaelan/s8_lib1_CNCCp4_SNAI2a3029_DMSO_r2_aSNAI2_reltodTag_peaks_minusINPUT_filtered_DISTAL_v6.bed", header = FALSE, sep = "\t") %>%
+  .[,c(1:3)] %>%
+  as.data.frame() %>%
+  dplyr::rename(chr = V1,
+                start = V2,
+                end = V3) %>%
+  dplyr::mutate(peak = (start + end) / 2) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T) %>%
+  dplyr::mutate(signalValue = 0.01,
+                pValue = 0.01,
+                qValue = 0.01)
+
+snail_motifs.gr <- read.table("/storage/lucia/fimo/SNAI2_DBD_jolma2013_fimo/fimo_sorted.bed", header = FALSE, sep = "\t",
+    col.names = c("chr", "start", "end", "name", "score", "strand", "empty", "log_pvalue", "pvalue", "qvalue", "sequence")) %>%
+  dplyr::select(-empty) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = TRUE) %>%
+  check_chromosome_boundaries(., 3000, bsgenome) %>%
+  keepStandardChromosomes(x = ., pruning.mode = "coarse") %>%
+  plyranges::filter(!(seqnames %in% c("chrY", "chrM"))) %>%
+  subsetByOverlaps(., chrombpnet.blacklisted.gr, invert = T) %>%
+  subsetByOverlaps(., blacklist, invert = T)
+
+# Build list
+
+atac.peaks.list <- list(lucia_b16_rep1 = lucia_b16_atac_rep1.peaks,
+                        lucia_b16_rep2 = lucia_b16_atac_rep2.peaks,
+                        lucia_b27_rep1 = lucia_b27_atac_rep1.peaks,
+                        lucia_b27_rep2 = lucia_b27_atac_rep2.peaks)
+
+```
+
+# 4. Format ATAC-seq peaks for model training
+
+```{r format}
+
+accessibility_input_seqlen <- 2114 
+score_val <- 1000
+
+# Extract peaks
+
+acc_peaks.gr<-names(atac.peaks.list) %>%
+  
+  #Import the data
+  lapply(., function(x){
+    gr<-atac.peaks.list[[x]] %>%
+    #gr<-import(atac.peaks.list[[x]]) %>%
+      GenomicRanges::makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = T) %>%
+      GRangesList %>% 
+      unlist(use.names = FALSE) %>%
+      
+      #Resize the center to the peak summit.
+      plyranges::mutate(start = start + peak) %>%
+      GenomicRanges::resize(width = 1, fix = 'start') %>%
+      GenomicRanges::resize(., width = accessibility_input_seqlen, fix = 'center') %>%
+      plyranges::mutate(peak = floor(accessibility_input_seqlen/2)) %>% 
+      
+      #Filter regions that are poor or don't make sense
+      check_chromosome_boundaries(., 3000, bsgenome) %>%
+      plyranges::select(-seqlength_filler, -end_distance, -start_distance) %>%
+      keepStandardChromosomes(x = ., pruning.mode = 'coarse') %>%
+      plyranges::filter(!(seqnames %in% c('chrY', 'chrM'))) %>%
+      
+      #Filter regions that contain N in the genome
+      plyranges::mutate(seq = getSeq(bsgenome, ., as.character=T), name = x) %>%  
+      plyranges::filter(!grepl('N', seq)) %>% #Filter out all regions with N's in them
+      plyranges::select(-seq) %>%
+      
+      #Sort GRanges to work with later commands
+      GenomicRanges::sort(.)
+    
+    #plyranges::write_narrowpeaks(gr, paste0('../data/narrowpeak/', tolower(x), '_peaks.narrowpeak'))
+    return(gr)
+  }) %>%
+  GRangesList %>% 
+  unlist(use.names = FALSE) %>% 
+
+  #Sort GRanges to work with later commands
+  GenomicRanges::sort(.)
+
+# Remove blacklisted regions
+
+acc_peaks.gr <- subsetByOverlaps(acc_peaks.gr, chrombpnet.blacklisted.gr, invert = T)
+acc_peaks.gr <- subsetByOverlaps(acc_peaks.gr, blacklist, invert = T)
+acc_peaks.gr <- acc_peaks.gr %>% unique()
+
+# I do not want to trash regions unnecessarily. So, I will force a minoverlap parameter such that for a peak to be trashed and treated as duplicate, it must overlap 1000 bp, that way only "clones" are removed
+
+acc_peaks.gr <- sort(acc_peaks.gr)
+
+ov <- findOverlaps(acc_peaks.gr, acc_peaks.gr, minoverlap = 1000)
+
+## Remove self-hits
+ov <- ov[queryHits(ov) != subjectHits(ov)]
+
+## Keep only one direction (i < j)
+ov <- ov[queryHits(ov) < subjectHits(ov)]
+
+## Drop the "later" peak in each overlapping pair
+to_drop <- subjectHits(ov)
+
+acc_peaks_min_overlap.gr <- acc_peaks.gr[-unique(to_drop)]
+
+# How many?
+
+length(acc_peaks_min_overlap.gr)
+
+```
+
+# 5. Export region types
+
+```{r export}
+
+plyranges::write_narrowpeaks(acc_peaks_min_overlap.gr, '/storage/kaelanb/analysis/lucia/data/data_forKaelan/20260607_cncc_training_atac_peaks.narrowpeak')
+rtracklayer::export(acc_peaks_min_overlap.gr, "/storage/kaelanb/analysis/lucia/data/data_forKaelan/20260607_cncc_training_atac_peaks.bed")
+
+```
+
+# 6. Generate non-peaks in bash
+
+Bash script recorded here for clarity
+
+```{bash eval=F}
+
+#!/bin/bash
+#$ -cwd
+#$ -N chrombpnet_nonpeaks
+#$ -pe smp 10
+
+# Source conda environment
+
+source /storage/kaelanb/anaconda3/etc/profile.d/conda.sh
+
+# activate chrombpnet
+
+conda activate chrombpnet
+
+chrombpnet prep nonpeaks \
+-g /storage/kaelanb/scripts/chrombpnet/hg38.fa \
+-p /storage/kaelanb/analysis/lucia/data/data_forKaelan/20260607_cncc_training_atac_peaks.narrowpeak \
+-c  /storage/kaelanb/scripts/chrombpnet/hg38.chrom.sizes \
+-fl /storage/kaelanb/scripts/chrombpnet/fold_0.json \
+-br /storage/kaelanb/scripts/chrombpnet/blacklist.bed.gz \
+-o /storage/kaelanb/analysis/lucia/data/data_forKaelan/NONPEAK_20260607_cncc_training_atac_peaks
+
+```
+
+# 7. Session Information
+
+```{r sessioninfo}
+sessionInfo()
+```

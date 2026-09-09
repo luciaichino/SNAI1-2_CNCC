@@ -1,0 +1,427 @@
+---
+title: 'Prepare custom sequences for in silico perturbations'
+author: "Kaelan Brennan"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# 1. Introduction
+
+Here, we will prepare sequences to test with in silico predictions. 
+
+# 2. Computational Setup
+
+```{r, warning=F, message=F}
+
+#Standard packages
+
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings); library(ggseqlogo);
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools); library(ggpubr); library(BSgenome.Hsapiens.UCSC.hg38); library(parallel); library(tidyr); library(tibble); library(ggrastr);
+library(dplyr); library(data.table); library(patchwork); library(readr); library(testit); library(cowplot); library(universalmotif)
+
+setwd("/storage/kaelanb/analysis/lucia/analysis/")
+options(knitr.figure_dir="/storage/kaelanb/analysis/lucia/analysis/figures/1_curate_motifs/", java.parameters = "- Xmx6g")
+
+#Sourced code
+
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/granges_common.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/metapeak_common.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/knitr_common.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/caching.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/metapeak_functions.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/metapeak_extra.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/metapeak_functions_kjb.R")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/metapeak_plotting_functions.R")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/motif_functions.r")
+
+#Pre-existing variables
+
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+bsgenome <- BSgenome.Hsapiens.UCSC.hg38
+rmsk <- rtracklayer::import("/work/kaelanb/indexes/hg38_rmsk.bed") %>% keepStandardChromosomes(pruning.mode="coarse")
+blacklist <- rtracklayer::import("/work/kaelanb/indexes/hg38-blacklist.v2.bed")
+chrombpnet.blacklisted.gr <- import("/work/kaelanb/public_data/chrombpnet_tutorial/data/downloads/blacklist.bed.gz")
+promoters_txdb <- promoters(genes(TxDb.Hsapiens.UCSC.hg38.knownGene), upstream = 250, downstream = 250) %>% keepStandardChromosomes(pruning.mode="coarse")
+
+```
+
+# 3. Import relevant data
+
+```{r import}
+
+# Coverage information
+
+contrib.list <- list(DMSO = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/bw/all_peaks.counts_scores.bw",
+                     dTAG_3h = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_3h/all_peaks/bw/all_peaks.counts_scores.bw",
+                     dTAG_1d = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_1d/all_peaks/bw/all_peaks.counts_scores.bw")
+
+pred.list <- list(DMSO = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/bw/all_peaks_chrombpnet.bw",
+                     dTAG_3h = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_3h/all_peaks/bw/all_peaks_chrombpnet.bw",
+                     dTAG_1d = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_1d/all_peaks/bw/all_peaks_chrombpnet.bw")
+
+obs.list <- list(DMSO = "/storage/kaelanb/analysis/lucia/data/bw/ATAC_DMSO_merged.bw",
+                     dTAG_3h = "/storage/kaelanb/analysis/lucia/data/bw/ATAC_3h_merged.bw",
+                     dTAG_1d = "/storage/kaelanb/analysis/lucia/data/bw/ATAC_1d_merged.bw")
+
+atac_contrib.list <- list(all_peaks_DMSO = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/bw/all_peaks.counts_scores.bw",
+                          all_peaks_dTAG_3h = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_3h/all_peaks/bw/all_peaks.counts_scores.bw",
+                          all_peaks_dTAG_1d = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_1d/all_peaks/bw/all_peaks.counts_scores.bw",
+                          no_prom_DMSO = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks_no_prom/bw/all_peaks_no_prom.counts_scores.bw",
+                          no_prom_dTAG_3h = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks_no_prom/dtag_3h/all_peaks_no_prom/bw/all_peaks_no_prom.counts_scores.bw",
+                          no_prom_dTAG_1d = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks_no_prom/dtag_1d/all_peaks_no_prom/bw/all_peaks_no_prom.counts_scores.bw")
+
+# Motifs
+
+all_curated_cncc_cwms.gr <- readRDS("/storage/kaelanb/analysis/lucia/motifs/all_peaks_curated_cncc_cwms_w_metadata.rdata")
+
+```
+
+# 4. Select motifs and regions of interest
+
+## 4.1. Parse SNAI2 motifs
+
+Here, we are interested in those SNAI2 motifs that have a negative influence on accessibility because we intend to test the predicted effects upon the in silico perturbation of SNAI2.
+
+```{r select}
+
+snai2_motifs.gr <- all_curated_cncc_cwms.gr %>%
+  dplyr::filter(motif_name == "SNAI2") %>%
+  dplyr::filter(DMSO_contrib < 0) %>%
+  dplyr::filter(dTAG_3h_diff_DMSO > 0) %>%
+  dplyr::filter(dTAG_1d_diff_DMSO > 0) %>%
+  dplyr::mutate(obs_dmso = regionSums(resize(.,500,"center"), obs.list$DMSO),
+                obs_3h = regionSums(resize(.,500,"center"), obs.list$dTAG_3h),
+                obs_1d = regionSums(resize(.,500,"center"), obs.list$dTAG_1d),
+                pred_dmso = regionSums(resize(.,500,"center"), pred.list$DMSO),
+                pred_3h = regionSums(resize(.,500,"center"), pred.list$dTAG_3h),
+                pred_1d = regionSums(resize(.,500,"center"), pred.list$dTAG_1d))
+  
+snai2_motifs_parsed.gr <- snai2_motifs.gr %>%
+  dplyr::filter(bound == TRUE) %>%
+  dplyr::filter(obs_3h > obs_dmso & obs_1d > obs_dmso) %>%
+  dplyr::filter(pred_3h > pred_dmso & pred_1d > pred_dmso)
+
+```
+
+## 4.2. Parse Lucia's enhancer regions for SNAI2 motifs
+
+```{r enhancers}
+
+enhancers.gr <- import("/storage/kaelanb/analysis/lucia/data/narrowpeak/regions_bound_distal_UPK27andATAC.bed") %>%
+  dplyr::mutate(unique_id = 1:length(.))
+
+snai2_at_enhancers.gr <- snai2_motifs_parsed.gr %>%
+  subsetByOverlaps(., enhancers.gr, ignore.strand = T)
+
+snai2_at_enhancers.gr$motif_seq <- as.character(reverseComplement(DNAStringSet(snai2_at_enhancers.gr$motif_seq)))
+
+snai2_at_enhancers.gr$motif_seq %>% ggseqlogo()
+
+# High priority regions
+
+priority.gr <- c(GRanges('chr20', IRanges(start = 17168168, end = 17171604), strand = '*', name = 'ENH4'),
+  GRanges('chr20', IRanges(start = 57256219, end = 57260565), strand = '*', name = 'ENH8'),
+  GRanges('chr11', IRanges(start = 12318027, end = 12321872), strand = '*', name = 'ENH10'),
+  GRanges('chr6', IRanges(start = 79609697, end = 79612498), strand = '*', name = 'ENH15'),
+  GRanges('chr3', IRanges(start = 69115593, end = 69118574), strand = '*', name = 'ENH30'),
+  GRanges('chr11', IRanges(start = 8707968, end = 8709964), strand = '*', name = 'ENH33'))
+
+# Bring in previous SNAI2 and correct lengths
+
+previous_snai2.gr <- read.table("/storage/lucia/fimo/SNAI2_DBD_jolma2013_fimo/fimo_sorted.bed", header = FALSE, sep = "\t", col.names = c("chr", "start", "end", "name", "score", "strand", "empty", "log_pvalue", "pvalue", "qvalue", "sequence")) %>%
+    dplyr::select(-empty) %>%
+    makeGRangesFromDataFrame(keep.extra.columns = TRUE) %>%
+    subsetByOverlaps(., priority.gr, ignore.strand = T)
+
+
+pos_snai2 <- previous_snai2.gr %>% as.data.frame() %>% dplyr::filter(strand == "+") %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+pos_snai2 <- resize(pos_snai2, width = width(pos_snai2) - 3, fix = "end") %>% dplyr::mutate(motif_seq = getSeq(bsgenome, ., as.character = T))
+
+neg_snai2 <- previous_snai2.gr %>% as.data.frame() %>% dplyr::filter(strand == "-") %>% makeGRangesFromDataFrame(keep.extra.columns = T)
+neg_snai2 <- resize(neg_snai2, width = width(neg_snai2) - 2, fix = "end")
+neg_snai2 <- resize(neg_snai2, width = width(neg_snai2) - 1, fix = "start") %>% dplyr::mutate(motif_seq = getSeq(bsgenome, ., as.character = T))
+
+previous_snai2.gr <- c(pos_snai2, neg_snai2) %>% dplyr::select(name, motif_seq)
+
+snai2_at_priority.gr <- c(all_curated_cncc_cwms.gr %>%
+                            dplyr::filter(motif_name == "SNAI2") %>%
+                            subsetByOverlaps(., priority.gr, ignore.strand = T) %>%
+                            dplyr::mutate(motif_seq = as.character(reverseComplement(DNAStringSet(.$motif_seq)))),
+                          previous_snai2.gr) %>%
+  dplyr::mutate(motif_name = "SNAI2",
+                priority = TRUE)
+
+# Total SNAI2 to test
+
+snai2_to_test.gr <- c(snai2_at_priority.gr, snai2_at_enhancers.gr)
+
+snai2_to_test.gr %>% .$motif_seq %>% ggseqlogo()
+
+```
+
+## 4.3. Re-calculate coverage info
+
+```{r calc}
+
+snai2_to_test.gr <- snai2_to_test.gr %>%
+  dplyr::mutate(obs_dmso = regionSums(resize(.,500,"center"), obs.list$DMSO),
+                obs_3h = regionSums(resize(.,500,"center"), obs.list$dTAG_3h),
+                obs_1d = regionSums(resize(.,500,"center"), obs.list$dTAG_1d),
+                pred_dmso = regionSums(resize(.,500,"center"), pred.list$DMSO),
+                pred_3h = regionSums(resize(.,500,"center"), pred.list$dTAG_3h),
+                pred_1d = regionSums(resize(.,500,"center"), pred.list$dTAG_1d)) %>%
+  dplyr::mutate(DMSO_contrib = regionSums(., atac_contrib.list$all_peaks_DMSO),
+                dTAG_3h_contrib = regionSums(., atac_contrib.list$all_peaks_dTAG_3h),
+                dTAG_1d_contrib = regionSums(., atac_contrib.list$all_peaks_dTAG_1d)) %>%
+  dplyr::mutate(DMSO_contrib_norm = DMSO_contrib / width(all_curated_cncc_cwms.gr),
+                dTAG_3h_contrib_norm = dTAG_3h_contrib / width(all_curated_cncc_cwms.gr),
+                dTAG_1d_contrib_norm = dTAG_1d_contrib / width(all_curated_cncc_cwms.gr)) %>%
+  dplyr::mutate(dTAG_3h_diff_DMSO = dTAG_3h_contrib - DMSO_contrib,
+                dTAG_1d_diff_DMSO = dTAG_1d_contrib - DMSO_contrib) %>%
+  dplyr::mutate(unique_id = 1:length(.))
+
+```
+
+# 5. Design sequences
+
+## 5.1. Function to generate sequences
+
+Here, I will shuffle the motif until the core GGT pattern is gone, as these are the strongest bases in the SNAI2 motif. I am doing it this way because, since the motif is 7bp long, there just is not enough sequence content to do the dinucleotide shuffling. 
+
+```{r function}
+
+randomize_motif <- function(seq_str, core_patterns = c("GGT"),
+                             bg_freqs = c(A = 0.25, C = 0.25, G = 0.25, T = 0.25),
+                             max_iter = 20000, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+  n <- nchar(seq_str)
+  orig_bases <- strsplit(seq_str, "")[[1]]
+
+  for (i in 1:max_iter) {
+    candidate <- paste(sample(names(bg_freqs), n, replace = TRUE, prob = bg_freqs), collapse = "")
+    cand_bases <- strsplit(candidate, "")[[1]]
+
+    all_positions_differ <- all(cand_bases != orig_bases)
+    contains_core <- any(sapply(core_patterns, function(p) grepl(p, candidate, fixed = TRUE)))
+
+    if (all_positions_differ && !contains_core) {
+      return(candidate)
+    }
+  }
+  warning("Could not generate a fully-different, core-free replacement for ", seq_str,
+          " after ", max_iter, " iterations; returning best-effort candidate")
+  return(candidate)
+}
+
+# Estimate A/C/G/T frequencies from the sequence flanking the motif within its window, to use as a locally-matched background for randomize_motif().
+
+flank_bg_freqs <- function(window_seq, motif_start_in_window, motif_end_in_window) {
+  flank_seq <- paste0(
+    substr(window_seq, 1, motif_start_in_window - 1),
+    substr(window_seq, motif_end_in_window + 1, nchar(window_seq))
+  )
+  counts <- table(factor(strsplit(flank_seq, "")[[1]], levels = c("A", "C", "G", "T")))
+  counts <- counts + 1  # pseudocount so no base ever hits exactly 0
+  as.list(counts / sum(counts))
+}
+
+scramble_snai2_motif <- function(motif_gr, genome, window_size = 2114,
+                                  core = "GGT", seed_base = 42) {
+  stopifnot(length(motif_gr) == 1)
+
+  chrom  <- as.character(seqnames(motif_gr))
+  strnd  <- as.character(strand(motif_gr))
+  m_start <- start(motif_gr)
+  m_end   <- end(motif_gr)
+
+  # Motif center in genomic (+strand) coordinates -- strand doesn't affect
+  # the coordinate system, only which direction the sequence is read.
+  motif_center <- m_start + floor((m_end - m_start) / 2)
+
+  # Build the +strand window
+  half <- floor(window_size / 2)
+  win_start <- motif_center - (half - 1)
+  win_end   <- motif_center + half
+  win_gr <- GRanges(seqnames = chrom, ranges = IRanges(win_start, win_end), strand = "+")
+
+  wt_window_seq <- as.character(getSeq(genome, win_gr))
+  stopifnot("Window sequence is not expected length" = nchar(wt_window_seq) == window_size)
+
+  # Motif position within the +strand window
+  motif_start_in_window <- m_start - win_start + 1
+  motif_end_in_window   <- m_end   - win_start + 1
+  motif_seq_plus <- substr(wt_window_seq, motif_start_in_window, motif_end_in_window)
+
+  # Strand-aware "sense" sequence -- the motif as it's actually read 5'->3'
+  if (strnd == "-") {
+    sense_seq <- as.character(reverseComplement(DNAString(motif_seq_plus)))
+  } else {
+    sense_seq <- motif_seq_plus
+  }
+
+  # Locally-matched background composition (from this window's flanks)
+  bg_freqs <- flank_bg_freqs(wt_window_seq, motif_start_in_window, motif_end_in_window)
+
+  # Replace in sense orientation so "GGT" always refers to the real core
+  sense_scrambled <- randomize_motif(sense_seq, core_patterns = core,
+                                      bg_freqs = unlist(bg_freqs), seed = seed_base)
+
+  # Convert scrambled motif back to +strand orientation for insertion
+  if (strnd == "-") {
+    scrambled_plus <- as.character(reverseComplement(DNAString(sense_scrambled)))
+  } else {
+    scrambled_plus <- sense_scrambled
+  }
+
+  mutant_window_seq <- paste0(
+    substr(wt_window_seq, 1, motif_start_in_window - 1),
+    scrambled_plus,
+    substr(wt_window_seq, motif_end_in_window + 1, nchar(wt_window_seq))
+  )
+  stopifnot(nchar(mutant_window_seq) == window_size)
+
+  # Position of the motif in chrombpnet's cropped 1000bp output space
+  crop <- floor((window_size - 1000) / 2)
+
+  list(
+    chrom = chrom,
+    strand = strnd,
+    genomic_start = m_start,
+    genomic_end = m_end,
+    window_start = win_start,
+    window_end = win_end,
+    motif_start_in_window = motif_start_in_window,
+    motif_end_in_window = motif_end_in_window,
+    motif_start_in_output = motif_start_in_window - crop,
+    motif_end_in_output   = motif_end_in_window - crop,
+    motif_seq_sense_wt = sense_seq,
+    motif_seq_sense_scrambled = sense_scrambled,
+    wt_seq = wt_window_seq,
+    mutant_seq = mutant_window_seq
+  )
+}
+
+# Loop over all SNAI2 motifs, write one combined FASTA (wt + scramble pairs) and one metadata CSV with positions and motif sequences.
+
+process_all_snai2_motifs <- function(snai2_gr, genome, output_dir,
+                                      prefix = "snai2", core = "GGT",
+                                      id_col = "unique_id") {
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  stopifnot("id_col not found in mcols(snai2_gr)" = id_col %in% colnames(mcols(snai2_gr)))
+  ids <- mcols(snai2_gr)[[id_col]]
+  stopifnot("unique_id column has duplicate or missing values" =
+              !any(is.na(ids)) && !any(duplicated(ids)))
+
+  fasta_path <- file.path(output_dir, paste0(prefix, "_scramble_2114bp.fa"))
+  meta_path  <- file.path(output_dir, paste0(prefix, "_scramble_metadata.csv"))
+
+  fasta_lines <- character(0)
+  meta_list <- vector("list", length(snai2_gr))
+
+  for (i in seq_along(snai2_gr)) {
+    uid <- as.character(ids[i])
+    res <- scramble_snai2_motif(snai2_gr[i], genome, core = core, seed_base = 42 + i)
+
+    # FASTA headers are keyed on unique_id so wt/mutant predictions can be
+    # traced back to the same motif -- and to snai2_to_test.gr -- downstream.
+    wt_header       <- paste0("wt_", uid)
+    scramble_header <- paste0("scramble_", uid)
+
+    fasta_lines <- c(fasta_lines,
+                      paste0(">", wt_header), res$wt_seq,
+                      paste0(">", scramble_header), res$mutant_seq)
+
+    # One row per motif, both sequences included, joined by unique_id --
+    # makes it easy to pull predictions for wt/mutant into the same row
+    # for plotting effect sizes.
+    meta_list[[i]] <- data.frame(
+      unique_id = uid,
+      wt_header = wt_header,
+      scramble_header = scramble_header,
+      chrom = res$chrom,
+      strand = res$strand,
+      genomic_start = res$genomic_start,
+      genomic_end = res$genomic_end,
+      window_start = res$window_start,
+      window_end = res$window_end,
+      motif_start_in_window = res$motif_start_in_window,
+      motif_end_in_window = res$motif_end_in_window,
+      motif_start_in_output = res$motif_start_in_output,
+      motif_end_in_output = res$motif_end_in_output,
+      motif_seq_wt = res$motif_seq_sense_wt,
+      motif_seq_scrambled = res$motif_seq_sense_scrambled,
+      wt_seq = res$wt_seq,
+      mutant_seq = res$mutant_seq,
+      stringsAsFactors = FALSE
+    )
+
+    cat(sprintf("[%d/%d] %s | WT: %s -> Scrambled: %s\n",
+                i, length(snai2_gr), uid,
+                res$motif_seq_sense_wt, res$motif_seq_sense_scrambled))
+  }
+
+  writeLines(fasta_lines, con = fasta_path)
+  meta_df <- do.call(rbind, meta_list)
+  write.csv(meta_df, meta_path, row.names = FALSE)
+
+  cat("\nFASTA written to:", fasta_path, "\n")
+  cat("Metadata written to:", meta_path, "\n")
+
+  return(meta_df)
+}
+
+```
+
+## 5.2. Generate sequences and record info
+
+```{r generate}
+
+output_dir <- "/storage/kaelanb/analysis/lucia/analysis/custom_seq/"
+genome <- bsgenome
+
+snai2_metadata <- process_all_snai2_motifs(snai2_to_test.gr, genome, output_dir, prefix = "snai2", id_col = "unique_id")
+
+```
+
+## 5.3. Showcase SNAI2
+
+```{r showcase}
+
+head(snai2_to_test.gr)
+
+
+snai2_to_test.gr %>%
+  dplyr::filter(unique_id == 2 | unique_id == 8 | unique_id == 18 | unique_id == 19 | unique_id == 20 | unique_id == 23 | unique_id == 26)
+
+```
+
+# 6 Conclusions
+
+Here, I have generated sequences where the SNAI2 motif has been computationally mutated. The predictions will be performed in `3_predict_motif_effects.ipynb`
+
+# 7. Session Information
+
+For the purposes of reproducibility, the R/Bioconductor session information is printed below:
+
+```{r sessioninfo}
+sessionInfo()
+```

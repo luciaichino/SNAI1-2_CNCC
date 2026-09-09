@@ -1,0 +1,761 @@
+---
+title: 'Curate motifs from the human CNCC ChromBPNet model'
+author: "Kaelan Brennan"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_document:
+    depth: 3
+    theme: sandstone
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+header-includes:
+- \usepackage{fancyhdr}
+- \usepackage{lipsum}
+- \pagestyle{fancy}
+- \fancyfoot[CO,CE]{1028-02098-001-001}
+- \fancyfoot[LE,RO]{\thepage}
+- \fancypagestyle{plain}{\pagestyle{fancy}}
+editor_options:
+  chunk_output_type: console
+---
+
+# 1. Introduction
+
+Here, I will curate the CWMs of interest from a model trained on DMSO-treated CNCC ATAC-seq data. Three single-task models (DMSO, dTAG-3h, dTAG-1d) were trained across the same region set derived from CNCC ATAC-seq peaks. CWMs were clustered using tfmodisco-lite and were mapped using FINEMO.In this analysis, I will collect them, fix any width issues, remove redundant patterns, and calculate .bw-derived coverage/contribution scores.
+
+# 2. Computational Setup
+
+```{r, warning=F, message=F}
+
+#Standard packages
+
+library(rtracklayer) ; library(GenomicRanges); library(magrittr) ; library(Biostrings); library(ggseqlogo);
+library(ggplot2) ; library(reshape2); library(plyranges); library(Rsamtools); library(ggpubr); library(BSgenome.Hsapiens.UCSC.hg38); library(parallel); library(tidyr); library(tibble); library(ggrastr); library(dplyr); library(data.table); library(patchwork); library(readr); library(testit); library(cowplot); library(universalmotif)
+
+setwd("/storage/kaelanb/analysis/lucia/analysis/")
+options(knitr.figure_dir="/storage/kaelanb/analysis/lucia/analysis/figures/1_curate_motifs/", java.parameters = "- Xmx6g")
+
+#Sourced code
+
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/knitr_common.r")
+source("/storage/kaelanb/analysis/oct4_public_data/scripts/caching.r")
+
+#Pre-existing variables
+
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+bsgenome <- BSgenome.Hsapiens.UCSC.hg38
+rmsk <- rtracklayer::import("/work/kaelanb/indexes/hg38_rmsk.bed") %>% keepStandardChromosomes(pruning.mode="coarse")
+blacklist <- rtracklayer::import("/work/kaelanb/indexes/hg38-blacklist.v2.bed")
+chrombpnet.blacklisted.gr <- import("/work/kaelanb/public_data/chrombpnet_tutorial/data/downloads/blacklist.bed.gz")
+promoters_txdb <- promoters(genes(TxDb.Hsapiens.UCSC.hg38.knownGene), upstream = 250, downstream = 250) %>% keepStandardChromosomes(pruning.mode="coarse")
+
+```
+
+# 3. Import relevant data
+
+```{r import}
+
+# ChromBPNet training regions
+
+cncc_all_peaks.gr <- import('/storage/kaelanb/analysis/lucia/data/data_forKaelan/20260607_cncc_training_atac_peaks.narrowpeak')
+cncc_all_peaks.path <- "/storage/kaelanb/analysis/lucia/data/data_forKaelan/20260607_cncc_training_atac_peaks.narrowpeak"
+
+# Contribution scores
+
+atac_contrib.list <- list(all_peaks_DMSO = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/bw/all_peaks.counts_scores.bw",
+                          all_peaks_dTAG_3h = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_3h/all_peaks/bw/all_peaks.counts_scores.bw",
+                          all_peaks_dTAG_1d = "/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/dtag_1d/all_peaks/bw/all_peaks.counts_scores.bw")
+
+# Observed ATAC-seq data
+
+atac_obs.list <- list(DMSO = "/storage/kaelanb/analysis/lucia/data/bw/ATAC_DMSO_merged.bw",
+                      dTAG_3h = "/storage/kaelanb/analysis/lucia/data/bw/ATAC_3h_merged.bw",
+                      dTAG_1d = "/storage/kaelanb/analysis/lucia/data/bw/ATAC_1d_merged.bw")
+
+```
+
+# 4. Select patterns of interest
+
+Note that patterns are selected from: `/storage/kaelanb/analysis/lucia/model/cncc_all_peaks/modisco/trimmed_logos/` based on prior knowledge of motifs and seqlet counts.
+
+## 4.1. Import patterns of interest
+
+### 4.1.1. Define peak-level information 
+
+```{r level}
+
+region_width <- 1000  #parameters.json informed parameter
+
+peaks.qc <- readr::read_tsv("/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/hitcall/all_peaks/peaks_qc.tsv") %>%
+  dplyr::mutate(peak_center = peak_region_start + region_width / 2) %>%
+  dplyr::select(peak_id, peak_center)
+
+central_width <- 400   # Standard Modisco focus point
+half_central <- central_width / 2
+
+```
+
+### 4.1.2. Import
+
+```{r patterns}
+
+generate_pattern_vec <- function(numbers) {
+  paste0("pos_patterns.pattern_", numbers)
+}
+
+# All peaks
+
+all_pattern.vec <- generate_pattern_vec(c(1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17, 19, 23, 28, 31, 32))
+
+all_cwms.gr <- readr::read_tsv('/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/hitcall/all_peaks/hits_unique.tsv') %>% 
+  dplyr::left_join(peaks.qc, by = "peak_id") %>%
+  dplyr::mutate(hit_center = (start + end) / 2,
+                dist_from_peak_center = abs(hit_center - peak_center)) %>%
+  makeGRangesFromDataFrame(keep.extra.columns = T) %>% 
+  dplyr::filter(motif_name %in% all_pattern.vec | motif_name == "neg_patterns.pattern_6") %>%
+  dplyr::mutate(motif_name = case_when(
+    motif_name == "pos_patterns.pattern_1" ~ "Coordinator",
+    motif_name == "pos_patterns.pattern_2" ~ "TFAP2A",
+    motif_name == "pos_patterns.pattern_3" ~ "SP",
+    motif_name == "pos_patterns.pattern_5" ~ "NR2F",
+    motif_name == "pos_patterns.pattern_6" ~ "CTCF",
+    motif_name == "pos_patterns.pattern_7" ~ "SIX",
+    motif_name == "pos_patterns.pattern_8" ~ "ETV",
+    motif_name == "pos_patterns.pattern_9" ~ "TEAD",
+    motif_name == "pos_patterns.pattern_10" ~ "ASCL1",
+    motif_name == "pos_patterns.pattern_11" ~ "SOX9_4bp",
+    motif_name == "pos_patterns.pattern_13" ~ "SOX9_3bp",
+    motif_name == "pos_patterns.pattern_16" ~ "RFX",
+    motif_name == "pos_patterns.pattern_17" ~ "NRF",
+    motif_name == "pos_patterns.pattern_19" ~ "NFY",
+    motif_name == "pos_patterns.pattern_23" ~ "ZN787",
+    motif_name == "pos_patterns.pattern_28" ~ "ZNF",
+    motif_name == "pos_patterns.pattern_31" ~ "CREB",
+    motif_name == "pos_patterns.pattern_32" ~ "REST",
+    motif_name == "neg_patterns.pattern_6" ~ "SNAI2",
+    TRUE ~ motif_name))
+
+all_cwms.gr$dist_from_peak_center %>% summary()
+
+all_cwms.gr$motif_name %>% table()
+
+all_cwms.gr %>%
+  dplyr::group_by(motif_name) %>%
+  dplyr::summarise(mean_dist = mean(dist_from_peak_center),
+                   median_dist = median(dist_from_peak_center)) %>%
+  as.data.frame()
+
+```
+
+## 4.2. Curate motif redundancy
+
+Prevent motif double-counting and remove palindromic patterns. 
+
+```{r curate}
+
+# Function: kudos Melanie Weilert, Zeitlinger lab
+
+remove_palindromic_motifs_from_bpnet_instances<-function(dfi, pattern_to_filter,
+                                                         chrom_name = 'example_chrom',
+                                                         start_name = 'pattern_start_abs',
+                                                         end_name = 'pattern_end_abs',
+                                                         value_name = 'contrib_weighted',
+                                                         motif_name = 'pattern_name',
+                                                         region_name = 'example_idx',
+                                                         starts.in.df.are.0based = F){
+
+  if(class(dfi)[1]=="GRanges"){
+    dfi.gr<-dfi
+  } else{
+    #Convert to GRanges
+    dfi.gr<-makeGRangesFromDataFrame(dfi, keep.extra.columns = T, starts.in.df.are.0based = starts.in.df.are.0based,
+                                     seqnames.field = chrom_name, start.field = start_name, end.field = end_name)
+  }
+
+  #Subset by motifs
+  dfi_filt.gr<-dfi.gr %>% dplyr::filter(!!rlang::sym(motif_name)==pattern_to_filter)
+
+  #Create islands of overlapping motifs
+  dfi_islands.gr<-GenomicRanges::reduce(dfi_filt.gr, ignore.strand = T)
+  dfi_islands.gr$island_idx<-1:length(dfi_islands.gr)
+
+  #Remap island ids to the motifs
+  dfi_vs_islands.ov<-findOverlaps(dfi_filt.gr, dfi_islands.gr, ignore.strand = T)
+  testit::assert("Motifs overlap redundantly...", (dfi_vs_islands.ov@from %>% unique() %>% length) == (dfi_vs_islands.ov@from %>% length))
+  dfi_filt.gr$island_idx<-dfi_islands.gr$island_idx[dfi_vs_islands.ov@to]
+
+  #For each island id, select motif with the best importance
+  dfi_unique.gr <- dfi_filt.gr %>% as.data.frame %>%
+    dplyr::group_by(island_idx, !!rlang::sym(region_name)) %>% #Group by both island_id and example_idx to keep the same motifs mapped across different task-annotated windows
+    dplyr::slice_max(order_by = !!rlang::sym(value_name), n = 1, with_ties = FALSE) %>% as.data.frame() %>%
+    makeGRangesFromDataFrame(keep.extra.columns = T, starts.in.df.are.0based = F) %>%
+    plyranges::select(-island_idx)
+
+  message(length(dfi_filt.gr)-length(dfi_unique.gr), " palindromic motifs removed of ", length(dfi_filt.gr))
+  return(dfi_unique.gr)
+}
+
+# Import and reduce peaks
+all_peaks.gr <- rtracklayer::import(cncc_all_peaks.path) %>%
+  GenomicRanges::resize(., 2032, fix = "center") %>%
+  GenomicRanges::reduce(., ignore.strand = TRUE) %>%
+  plyranges::mutate(region_id_tmp = 1:length(.))
+
+# Prepare GRanges
+all_cncc_cwms_dedup.gr <- all_cwms.gr %>%
+  plyranges::mutate(
+    start = start(.),
+    end = end(.),
+    region_id_tmp = NA
+  )
+
+# Map motifs to peak regions
+ov <- findOverlaps(all_cncc_cwms_dedup.gr, all_peaks.gr, ignore.strand = TRUE)
+all_cncc_cwms_dedup.gr$region_id_tmp[queryHits(ov)] <- all_peaks.gr$region_id_tmp[subjectHits(ov)]
+
+# Remove motifs outside peaks
+all_cncc_cwms_dedup.gr <- all_cncc_cwms_dedup.gr %>% 
+  plyranges::filter(!is.na(region_id_tmp))
+
+# Deduplicate palindromic motifs per motif name
+all_cncc_cwms_dedup.gr <- lapply(unique(all_cncc_cwms_dedup.gr$motif_name), function(motif) {
+  motifs.gr <- all_cncc_cwms_dedup.gr %>% plyranges::filter(motif_name == motif)
+  motifs_dedup.gr <- remove_palindromic_motifs_from_bpnet_instances(
+    dfi = motifs.gr,
+    pattern_to_filter = motif,
+    chrom_name = "seqnames",
+    start_name = "start",
+    end_name = "end",
+    value_name = "hit_importance",
+    motif_name = "motif_name",
+    region_name = "region_id_tmp",
+    starts.in.df.are.0based = FALSE
+  )
+  message(length(motifs_dedup.gr), " kept from ", length(motifs.gr), " for motif ", motif)
+  return(motifs_dedup.gr)
+}) %>% 
+  as("GRangesList") %>% 
+  unlist() %>%
+  plyranges::select(-region_id_tmp)
+
+```
+
+## 4.3. Summarize so far
+
+```{r sum}
+
+all_cncc_cwms_dedup.gr <- all_cncc_cwms_dedup.gr %>%
+  dplyr::select(-start_untrimmed, -end_untrimmed)
+
+all_cncc_cwms_dedup.gr$motif_name %>% table()
+
+```
+
+## 4.4. Fix motif offset
+
+This is due to the mapping treating + and - strand motifs differently, thus creating a 1bp offfset with respect to strand
+
+```{r offset}
+
+# Function to fix
+
+shift_minus_5p <- function(gr, bp = 1) {
+  idx <- as.character(strand(gr)) == "-"
+  
+  start(gr)[idx] <- start(gr)[idx] + bp
+  end(gr)[idx]   <- end(gr)[idx]   + bp
+  
+  gr
+}
+
+# Fix
+
+all_cncc_cwms_dedup.gr <- all_cncc_cwms_dedup.gr %>%
+  shift_minus_5p(., 1)
+
+```
+
+## 4.5 Remove sub-motifs that are truly part of a larger motif
+
+Motifs may contain sub-components (e.g., the Double-Ebox is actually part of a Coordinator)
+
+  + Coordinator > Double_Ebox
+  + SOX9_4bp > SOX9_3bp
+  + Double_Ebox > SNAI2
+  + Coordinator > SNAI2
+
+```{r submotifs}
+
+sub_pairs <- list(
+  c("SOX9_3bp", "SOX9_4bp"),
+  c("SNAI2", "Coordinator"))
+
+# Write function to prioritize the selected motif
+
+remove_redundant_motif <- function(gr, small, composite) {
+  small.gr <- gr %>% plyranges::filter(motif_name == small)
+  composite.gr <- gr %>% plyranges::filter(motif_name == composite)
+
+  if (length(small.gr) == 0 || length(composite.gr) == 0) {
+    return(gr)
+  }
+
+  small.keep <- small.gr %>%
+    plyranges::filter(
+      !overlapsAny(., composite.gr, ignore.strand = TRUE)
+    )
+
+  removed_n <- length(small.gr) - length(small.keep)
+  message(
+    paste0(
+      small, " motifs removed due to overlap with ",
+      composite, ": ", removed_n
+    )
+  )
+
+  # Return GRanges with redundant small motifs removed
+  c(
+    gr %>% plyranges::filter(motif_name != small),
+    small.keep
+  )
+}
+
+# Remove sub-motifs
+
+for (pair in sub_pairs) {
+  all_curated_cncc_cwms.gr <- remove_redundant_motif(
+    all_cncc_cwms_dedup.gr,
+    small = pair[1],
+    composite = pair[2]
+  )
+}
+
+```
+
+## 4.5. Fix motif lengths
+
+I noticed that REST, Coordinator, and TFAP2A were arbitrarily a bit shorter upon CWM scanning by FINEMO. I will correct them here based on the consensus patterns.
+
+```{r fix}
+
+# REST: extend by 1bp on both the 5' end and the 3' end
+rest_idx <- which(all_curated_cncc_cwms.gr$motif_name == "REST")
+rest_gr <- all_curated_cncc_cwms.gr[rest_idx]
+
+rest_gr <- resize(rest_gr, width = width(rest_gr) + 1, fix = "start")  
+rest_gr <- resize(rest_gr, width = width(rest_gr) + 1, fix = "end")
+
+all_curated_cncc_cwms.gr[rest_idx] <- rest_gr
+
+# Coordinator: extend by 1bp on the 3' end only
+
+coord_idx <- which(all_curated_cncc_cwms.gr$motif_name == "Coordinator")
+coord_gr <- all_curated_cncc_cwms.gr[coord_idx]
+
+coord_gr <- resize(coord_gr, width = width(coord_gr) + 1, fix = "start")
+
+all_curated_cncc_cwms.gr[coord_idx] <- coord_gr
+
+# TFAP2A: shift one bp towards 5'
+
+tfap2a_idx <- which(all_curated_cncc_cwms.gr$motif_name == "TFAP2A")
+tfap2a_gr <- all_curated_cncc_cwms.gr[tfap2a_idx]
+
+tfap2a_gr <- resize(tfap2a_gr, width = width(tfap2a_gr) + 1, fix = "start") 
+tfap2a_gr <- resize(tfap2a_gr, width = width(tfap2a_gr) - 1, fix = "end")
+
+all_curated_cncc_cwms.gr[tfap2a_idx] <- tfap2a_gr
+
+```
+
+# 5. Append useful information
+
+Here, I will include the following annotations:
+
+  + Whether a pattern overlaps an annotated promoter (promoter_ov)
+  + Motif sequence (motif_seq)
+
+Additionally, I will calculate the following genomic signals:
+
+  + ATAC-seq Counts Contribution from DMSO treatment
+  + ATAC-seq Counts Contribution from SNAI2 dTAG treatment for 3h
+  + ATAC-seq Counts Contribution from SNAI2 dTAG treatment for 1d
+  + Observed ATAC-seq from all conditions in a 500bp window surrounding the motif
+
+I will also annotate SNAI2 motifs as bound or not based on ChIP-seq data
+
+```{r calc}
+
+# Define functions
+
+check_coverage_argument <- function(cvg, regions=NULL) {
+  if(class(cvg) == "character") {
+    if(is.null(regions)) {
+      cvg <- rtracklayer::import(cvg, as="RleList")
+    } else {
+      stopifnot(file.exists(cvg))
+      cvg <- rtracklayer::import(cvg, which=regions, as="RleList")
+    }
+  } 
+  cvg
+}
+
+regionSums <- function(regions, cvg) {
+  cvg <- check_coverage_argument(cvg, regions)
+  seqlevels(regions) <- names(cvg)
+  oo <- order(regions)
+  regions <- regions[oo]
+  ans <- unlist(
+           viewSums(
+             #Views(cvg, as(regions, "GRangesList"))
+             Views(cvg, split(regions, seqnames(regions)))
+           ), use.names=FALSE)
+  ans[oo] <- ans  # restore original order
+  ans
+}
+
+# Calculate
+
+all_curated_cncc_cwms.gr <- all_curated_cncc_cwms.gr %>%
+  dplyr::mutate(promoter_ov = overlapsAny(., promoters_txdb)) %>%
+  dplyr::mutate(motif_seq = getSeq(bsgenome, ., as.character = T)) %>%
+  dplyr::mutate(DMSO_obs_atac = regionSums(resize(., 500, "center"), atac_obs.list$DMSO),
+                dTAG_3h_obs_atac = regionSums(resize(., 500, "center"), atac_obs.list$dTAG_3h),
+                dTAG_1d_obs_atac = regionSums(resize(., 500, "center"), atac_obs.list$dTAG_1d)) %>%
+  dplyr::mutate(DMSO_contrib = regionSums(., atac_contrib.list$all_peaks_DMSO),
+                dTAG_3h_contrib = regionSums(., atac_contrib.list$all_peaks_dTAG_3h),
+                dTAG_1d_contrib = regionSums(., atac_contrib.list$all_peaks_dTAG_1d)) %>%
+  dplyr::mutate(DMSO_contrib_norm = DMSO_contrib / width(all_curated_cncc_cwms.gr),
+                dTAG_3h_contrib_norm = dTAG_3h_contrib / width(all_curated_cncc_cwms.gr),
+                dTAG_1d_contrib_norm = dTAG_1d_contrib / width(all_curated_cncc_cwms.gr)) %>%
+  dplyr::mutate(dTAG_3h_diff_DMSO = dTAG_3h_contrib - DMSO_contrib,
+                dTAG_1d_diff_DMSO = dTAG_1d_contrib - DMSO_contrib)
+
+# Add SNAI2 binding information
+
+all_curated_cncc_cwms.gr <- all_curated_cncc_cwms.gr %>%
+  plyranges::mutate(
+    bound = dplyr::case_when(motif_name == "SNAI2" ~ overlapsAny(., import("/storage/lucia/SNAI_paper/peaks/s8_lib1_CNCCp4_SNAI2a3029_DMSO_r2_aSNAI2_reltodTag_peaks_minusINPUT_filtered.narrowPeak"), maxgap = 2000), TRUE ~ NA))
+
+# Quick summary
+
+all_curated_cncc_cwms.gr %>%
+  dplyr::group_by(motif_name) %>%
+  dplyr::summarise(DMSO_contrib_mean = mean(DMSO_contrib),
+                   dTAG_3h_contrib_mean = mean(dTAG_3h_contrib),
+                   dTAG_1d_contrib_mean = mean(dTAG_1d_contrib),
+                   DMSO_contrib_median = median(DMSO_contrib),
+                   dTAG_3h_contrib_median = median(dTAG_3h_contrib),
+                   dTAG_1d_contrib_median = median(dTAG_1d_contrib)
+                   ) %>%
+  as.data.frame()
+
+# Export data as RData, bed, and CSV
+
+saveRDS(all_curated_cncc_cwms.gr, "/storage/kaelanb/analysis/lucia/motifs/all_peaks_curated_cncc_cwms_w_metadata.rdata")
+as.data.frame(all_curated_cncc_cwms.gr) %>% readr::write_csv("/storage/kaelanb/analysis/lucia/motifs/all_peaks_curated_cncc_cwms_w_metadata.csv")
+
+## Export as bed for IGV viewing
+
+all_curated_cncc_cwms_w_metadata.bed <- all_curated_cncc_cwms.gr %>%
+  as.data.frame() %>%
+  dplyr::rename(name = motif_name)
+rtracklayer::export(all_curated_cncc_cwms_w_metadata.bed, "/storage/kaelanb/analysis/lucia/motifs/all_peaks_curated_cncc_cwms.bed")
+
+# Summarize motif widths
+
+as.data.frame(all_curated_cncc_cwms.gr) %>%
+  group_by(motif_name) %>%
+  summarise(
+    widths = paste(unique(width), collapse = ", ")
+  )
+
+```
+
+# 6. Plot Summary plots
+
+## 6.1. Write functions
+
+```{r func}
+
+filter_motif_strand_position <- function(df, motif_settings) {
+  
+  df %>%
+    dplyr::rowwise() %>%
+    dplyr::filter(
+      motif_name %in% names(motif_settings),
+      strand == motif_settings[[motif_name]]$strand,
+      position %in% motif_settings[[motif_name]]$positions
+    ) %>%
+    dplyr::ungroup()
+}
+
+```
+
+## 6.2. Get the number and name panel
+
+```{r panel}
+
+# Order by contribution
+
+contrib.order <- all_curated_cncc_cwms.gr %>%
+  dplyr::group_by(motif_name) %>%
+  dplyr::summarise(mean_DMSO = mean(DMSO_contrib)) %>%
+  as.data.frame() %>%
+  dplyr::arrange(mean_DMSO) %>%
+  dplyr::select(motif_name) %>%
+  .$motif_name 
+
+# Count patterns per motif_name
+
+pattern_counts <- all_curated_cncc_cwms.gr %>%
+  as.data.frame() %>%
+  dplyr::count(motif_name, name = "n_patterns")
+
+motif_order <- rev(contrib.order)
+
+label_df <- pattern_counts %>%
+  mutate(
+    motif_name = factor(motif_name, levels = motif_order),
+    label = paste0(motif_name, "\n(n = ", n_patterns, ")")
+  ) %>%
+  arrange(motif_name)
+
+p_labels <- ggplot(label_df, aes(x = 1, y = 1, label = label)) +
+  geom_text(fontface = "plain", size = 3.8) +
+  facet_wrap(~motif_name, ncol = 1, strip.position = "left") +
+  theme_void() +
+  theme(strip.text = element_blank())
+
+```
+
+## 6.3. Plot all CWMS
+
+```{r cwm}
+
+filter_motif_strand_position <- function(df, motif_settings) {
+  
+  df %>%
+    dplyr::rowwise() %>%
+    dplyr::filter(
+      motif_name %in% names(motif_settings),
+      strand == motif_settings[[motif_name]]$strand,
+      position %in% motif_settings[[motif_name]]$positions
+    ) %>%
+    dplyr::ungroup()
+}
+
+# Get info and clean up
+
+cwm_long <- read_tsv("/storage/kaelanb/analysis/lucia/model/snail_modisco_test/all_peaks/hitcall/all_peaks/cwms_long_full.tsv") %>%
+  dplyr::filter(motif_name %in% all_pattern.vec | motif_name == "neg_patterns.pattern_6") %>%
+  dplyr::mutate(motif_name = case_when(
+    motif_name == "pos_patterns.pattern_1" ~ "Coordinator",
+    motif_name == "pos_patterns.pattern_2" ~ "TFAP2A",
+    motif_name == "pos_patterns.pattern_3" ~ "SP",
+    motif_name == "pos_patterns.pattern_5" ~ "NR2F",
+    motif_name == "pos_patterns.pattern_6" ~ "CTCF",
+    motif_name == "pos_patterns.pattern_7" ~ "SIX",
+    motif_name == "pos_patterns.pattern_8" ~ "ETV",
+    motif_name == "pos_patterns.pattern_9" ~ "TEAD",
+    motif_name == "pos_patterns.pattern_10" ~ "ASCL1",
+    motif_name == "pos_patterns.pattern_11" ~ "SOX9_4bp",
+    motif_name == "pos_patterns.pattern_13" ~ "SOX9_3bp",
+    motif_name == "pos_patterns.pattern_16" ~ "RFX",
+    motif_name == "pos_patterns.pattern_17" ~ "NRF",
+    motif_name == "pos_patterns.pattern_19" ~ "NFY",
+    motif_name == "pos_patterns.pattern_23" ~ "ZN787",
+    motif_name == "pos_patterns.pattern_28" ~ "ZNF",
+    motif_name == "pos_patterns.pattern_31" ~ "CREB",
+    motif_name == "pos_patterns.pattern_32" ~ "REST",
+    motif_name == "neg_patterns.pattern_6" ~ "SNAI2",
+    TRUE ~ motif_name))
+
+motif_settings <- list(
+  Coordinator = list(
+    strand = "+",
+    positions = 22:38
+  ),
+  TFAP2A = list(
+    strand = "+",
+    positions = 20:29
+  ),
+  SP = list(
+    strand = "+",
+    positions = 20:30
+  ),
+  NR2F = list(
+    strand = "-",
+    positions = 14:20
+  ),
+  CTCF = list(
+    strand = "-",
+    positions = 22:36
+  ),
+  SIX = list(
+    strand = "-",
+    positions = 25:37
+  ),
+  ETV = list(
+    strand = "+",
+    positions = 17:24
+  ),
+  TEAD = list(
+    strand = "-",
+    positions = 16:23
+  ),
+  ASCL1 = list(
+    strand = "+",
+    positions = 24:31
+  ),
+  SOX9_4bp = list(
+    strand = "-",
+    positions = 17:33
+  ),
+  SOX9_3bp = list(
+    strand = "-",
+    positions = 19:34
+  ),
+  RFX = list(
+    strand = "+",
+    positions = 21:35
+  ),
+  NRF = list(
+    strand = "-",
+    positions = 22:32
+  ),
+  NFY = list(
+    strand = "-",
+    positions = 16:23
+  ),
+  ZN787 = list(
+    strand = "+",
+    positions = 13:25
+  ),
+  ZNF = list(
+    strand = "-",
+    positions = 17:36
+  ),
+  CREB = list(
+    strand = "+",
+    positions = 22:30
+  ),
+  REST = list(
+    strand = "+",
+    positions = 11:29
+  ),
+  SNAI2 = list(
+    strand = "-",
+    positions = 17:23
+  )
+)
+
+cwm_long <- filter_motif_strand_position(cwm_long, motif_settings)
+
+# Format
+
+library(tidyverse)
+
+motif_list <- cwm_long %>%
+  arrange(position) %>%
+  group_by(motif_name) %>%
+  group_split(.keep = TRUE) %>%
+  set_names(map_chr(., ~ as.character(unique(.x$motif_name)))) %>%
+  map(function(df) {
+    mat <- t(as.matrix(df[, c("A_scaled", "C_scaled", "G_scaled", "T_scaled")]))
+    rownames(mat) <- c("A", "C", "G", "T")
+    mat
+  })
+
+motif_list <- motif_list[rev(contrib.order)]
+
+# Plot
+
+seq.plot <- ggseqlogo(motif_list, method = "custom", ncol = 1, scales = "free") +
+  ylab("Contribution score (motif_scale-corrected)") +
+  theme_cowplot() +
+  ylab("ChromBPNet Counts Contribution") + 
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), strip.background = element_blank(), strip.text = element_blank(), axis.line.x = element_blank())
+
+```
+
+## 6.4. Plot motif contribution summary
+
+```{r summary}
+
+contrib_summary.df <- all_curated_cncc_cwms.gr %>%
+  dplyr::group_by(motif_name) %>%
+  dplyr::summarise(DMSO_contrib_median = mean(DMSO_contrib),
+                   dTAG_3h_contrib_median = mean(dTAG_3h_contrib),
+                   dTAG_1d_contrib_median = mean(dTAG_1d_contrib)) %>%
+  as.data.table() %>%
+  melt.data.table(id.vars = "motif_name", measure.vars = patterns("_contrib_median") ,value.name = 'value', variable.name = 'signal') %>%
+  mutate(signal_type = gsub("_contrib_median", "", signal))
+
+contrib_summary.df$motif_name <- factor(contrib_summary.df$motif_name, levels = contrib.order)
+contrib_summary.df$signal_type <- factor(contrib_summary.df$signal_type, levels = c("DMSO", "dTAG_3h", "dTAG_1d"))
+
+contrib.plot <- ggplot(contrib_summary.df, aes(x = signal_type, y = motif_name, fill = value)) +
+  geom_tile(color = "black", linewidth = 0.5) +
+  ggtitle("Average counts contribution to chromatin accessibility\nacross ChromBPNet-mapped motifs") +
+  scale_fill_gradientn(colours = c("#4C78A8", "#729FCF", "#A9C7E2", "white", "#F2B6A0", "#D9826B", "#B85C4A"),
+                       values = scales::rescale(c(-0.031, -0.02, -0.01, 0, max(contrib_summary.df$value, na.rm = TRUE) / 2, max(contrib_summary.df$value, na.rm = TRUE) * 0.75, max(contrib_summary.df$value, na.rm = TRUE))), name = "ATAC-seq\ncounts contrib.") +
+  theme_cowplot() +
+  scale_x_discrete(position = "top", labels = c("DMSO" = "DMSO", "dTAG_3h" = "dTAG: 3 hours", "dTAG_1d" = "dTAG: 1 day")) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(),
+        axis.ticks = element_blank(), axis.line.x = element_blank(), axis.line.y = element_blank(),
+        axis.text.y = element_text(size = 12, color = "black", face = "italic"), plot.title = element_text(size = 15, face = "bold"))
+
+# Append all
+
+total_summary.plot <- p_labels + seq.plot + contrib.plot + plot_layout(widths = c(1, 4, 6))
+total_summary.plot
+
+ggsave("motif_summary.pdf", plot = total_summary.plot, path = "/storage/kaelanb/analysis/lucia/analysis/figures/1_curate_motifs/", width = 16, height = 12)
+ggsave("motif_summary.png", plot = total_summary.plot, path = "/storage/kaelanb/analysis/lucia/analysis/figures/1_curate_motifs/", width = 16, height = 12)
+
+```
+
+# 7. Quantify Snail dTAG effects
+
+```{r quantify}
+
+snai2_all.tidy <- all_curated_cncc_cwms.gr %>%
+  dplyr::filter(motif_name == "SNAI2") %>%
+  as.data.table() %>%
+   melt.data.table(id.vars = "motif_name", measure.vars = c("DMSO_contrib", "dTAG_3h_contrib", "dTAG_1d_contrib") ,value.name = 'value', variable.name = 'signal')
+
+# Plot
+
+all_peaks.quant <- ggplot(snai2_all.tidy, aes(x = signal, y = value, fill = signal)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(values = c("#8F8F8F", "#9F7ACD", "#442768")) +
+  stat_compare_means(method = "wilcox.test", comparisons = list(c("DMSO_contrib", "dTAG_3h_contrib"), c("DMSO_contrib", "dTAG_1d_contrib"), c("dTAG_3h_contrib", "dTAG_1d_contrib")), paired = TRUE, label = "p.signif", label.y = c(0.25, 0.30, 0.37)) +
+  ylab("ChromBPNet Counts Contribution") +
+  xlab("") + 
+  ggtitle("SNAI2 motif contribution increases upon SNAI2 degradation") +
+  coord_cartesian(ylim = c(-0.3, 0.4)) +
+  theme_cowplot() +
+  theme(legend.position = "none")
+
+all_peaks.quant
+
+ggsave("snai_dtag_quantification_all_peaks.pdf", plot = all_peaks.quant, path = "/storage/kaelanb/analysis/lucia/analysis/figures/1_curate_motifs/", width = 8, height = 12)
+ggsave("snai_dtag_quantification_all_peaks.png", plot = all_peaks.quant, path = "/storage/kaelanb/analysis/lucia/analysis/figures/1_curate_motifs/", width = 8, height = 12)
+
+```
+
+# 8. Conclusions
+
+Motifs have been successfully curated and summarized.
+
+# 9. Session Information
+
+```{r sessioninfo}
+sessionInfo()
+```
