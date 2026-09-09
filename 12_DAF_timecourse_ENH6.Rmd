@@ -1,0 +1,1110 @@
+---
+title: "DAF-seq deamination time course at ENH6 (fiberHMM v2.9.5 / v2.9.7)"
+author: "Lucia Ichino"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: show
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = FALSE, dev = "ragg_png")
+```
+
+<!-- ==========================================================================
+     WHAT THIS DOCUMENT DOES
+
+     Single-molecule (DAF-seq ) analysis of two independent
+     deaminase TIME COURSES at one enhancer, ENH6 (chr11, hg38; internal
+     locus ID ENH33). Footprints are called per read by fiberHMM.
+
+       Time course 1 (tc1)  exp7, Plasmidsaurus  1.5, 2.5, 5, 7.5, 10 min
+       Time course 2 (tc2)  exp9, Plasmidsaurus  0.5, 1, 1.5, 2 min
+       1-min replicates     exp2, PacBio         1 min x 2
+
+     It produces four analyses:
+       1. per-read deamination rate distributions (the time-course QC);
+       2. footprint size distributions, with a 147 bp nucleosome reference;
+       3. per-bp TF occupancy metaplots + the bulk ATAC track;
+       4. a read-level deamination / footprint heatmap, reads grouped by the
+          TF motif they footprint.
+
+     STRUCTURE
+       Section 1  CONFIGURATION  <-- the ONLY place with absolute paths
+       Section 2  Libraries
+       Section 3  Sample and motif registry
+       Section 4  File-path helpers
+       Section 5  Core functions
+       Section 6  Analyses
+       Section 7  Session info
+
+     COORDINATES: BED inputs are 0-based half-open. Every reader below returns
+     1-based inclusive coordinates, so reads, footprints and the (UCSC,
+     1-based) motif coordinates in section 3 all share one axis.
+     ========================================================================== -->
+
+
+# 1. Configuration
+
+<!-- ==========================================================================
+     >>>>>>>>>>>>>>>>  THE ONLY PLACE WITH ABSOLUTE PATHS  <<<<<<<<<<<<<<<<
+
+     Before pushing to GitHub, replace the three strings below with relative
+     paths or environment lookups, e.g.
+
+         DAF_ROOT <- Sys.getenv("DAF_ROOT", "data/fiberHMM")
+         ATAC_DIR <- Sys.getenv("ATAC_DIR", "data/atac")
+         FIG_DIR  <- "figures"
+
+     Nothing else in this document contains a machine-specific path: every
+     input file is built from DAF_ROOT plus the `results_dir` / `sample_dir`
+     columns of the registry in section 3.
+     ========================================================================== -->
+
+```{r config}
+## ---- paths -----------------------------------------------------------------
+DAF_ROOT <- "/Volumes/storage/DAFseq"
+ATAC_DIR <- file.path("...")
+FIG_DIR  <- file.path("...")
+
+## ---- fiberHMM versions -----------------------------------------------------
+# The figures were generated from two different releases; keep both explicit
+# rather than hard-coding them next to each file name.
+FIBERHMM_FP <- "fiberHMM_v2.9.5"   # *.recalled_footprint.bb  (size distributions)
+FIBERHMM_TF <- "fiberHMM_v2.9.7"   # *.recalled_tf.bed, *_footprint.bed, *_deam.bed
+
+## ---- analysis choices ------------------------------------------------------
+TQ_THRESHOLD  <- 0L     # blockTq floor for TF footprints; 0 = keep every call
+MIN_READ_COV  <- 5L     # bp with fewer spanning reads than this are NA
+NUCLEOSOME_BP <- 147L   # reference line / scale-bar length
+DEAM_RATE_COL <- "all_deam_rate"   # or AC_/CC_/GC_/TC_deam_rate
+
+## ---- single-molecule heatmap -----------------------------------------------
+HM_N_PER_GROUP <- 10L    # reads drawn per TF group
+HM_MAX_TF_WIDTH <- 40L   # a TF-scale footprint may not be wider than this (bp)
+HM_SLACK        <- 2L    # bp of slack when asking "does this footprint span the motif?"
+HM_MIN_DEAM     <- 0.15  # reads below this are deprioritised (poor conversion)
+HM_MIN_FP_FRAC  <- 0.30  # reads below this are deprioritised (sparse footprints)
+HM_SEED         <- 1L
+# Physical sizes (linewidths, fonts) are in mm/pt and do NOT shrink with the
+# canvas. Everything in the heatmap is scaled from HM_REF_* to HM_OUT_*, so
+# changing the export size rescales the whole figure consistently.
+HM_OUT_W <- 6; HM_OUT_H <- 5
+HM_REF_W <- 13; HM_REF_H <- 11    # the size the layout was originally tuned at
+HM_RASTER_DPI <- 600
+
+dir.create(FIG_DIR, recursive = TRUE, showWarnings = FALSE)
+
+fig <- function(...) file.path(FIG_DIR, ...)   # figure output path
+```
+
+# 2. Libraries
+
+```{r libraries}
+library(tidyverse)      # dplyr / tidyr / purrr / stringr / ggplot2 / readr
+library(GenomicRanges)
+library(rtracklayer)    # import() for the .bb footprints, import.bw() for ATAC
+library(data.table)     # fread() for the per-read QC metric tables
+library(ggridges)       # footprint size ridgelines
+library(ggnewscale)     # second fill scale for the motif bands
+library(patchwork)      # p1 / p2 composition
+library(ggrastr)        # rasterise the dense deamination ticks
+
+# fiberHMM writes very long BED lines (one block per footprint per read).
+# Only relevant if a file is ever handed to readr as a *connection*.
+Sys.setenv(VROOM_CONNECTION_SIZE = 500072)
+```
+
+# 3. Sample and motif registry
+
+<!-- ==========================================================================
+     One row per sequenced sample. `label` is the ONLY name that reaches a
+     figure; everything else refers to samples by `sample_id`.
+
+     `results_dir` is the path from DAF_ROOT down to the DAF_QC `results`
+     directory, and `sample_dir` the per-sample folder inside it, which is
+     also the file-name stem. Together they cover both trees used here (the
+     Plasmidsaurus time courses and the PacBio replicates) without any
+     per-sample path being typed out.
+     ========================================================================== -->
+
+```{r sample-registry}
+TC1_RESULTS <- "plasmidsaurus_results/exp7_2026_04_18_timecourse/DAF_QC/results"
+TC2_RESULTS <- "plasmidsaurus_results/exp9_2026_04_23_timecourse2/DAF_QC/results"
+PB_RESULTS  <- "DAFseq_pacbio_exp2_andplasmid_fiber/DAF_QC_marlowe/min3/results"
+
+SAMPLES <- tribble(
+  ~sample_id,            ~group,       ~minutes, ~label,                 ~results_dir,  ~sample_dir,
+  "ENH33_30s_tc2",       "tc2",             0.5, "0.5 min",              TC2_RESULTS,   "ENH33_30s_25C",
+  "ENH33_60s_tc2",       "tc2",             1.0, "1 min",                TC2_RESULTS,   "ENH33_60s_25C",
+  "ENH33_90s_tc2",       "tc2",             1.5, "1.5 min",              TC2_RESULTS,   "ENH33_90s_25C",
+  "ENH33_120s_tc2",      "tc2",             2.0, "2 min",                TC2_RESULTS,   "ENH33_120s_25C",
+  "ENH33_90s_tc1",       "tc1",             1.5, "1.5 min",              TC1_RESULTS,   "ENH33_tc_1.5min",
+  "ENH33_150s_tc1",      "tc1",             2.5, "2.5 min",              TC1_RESULTS,   "ENH33_tc_2.5min",
+  "ENH33_5min_tc1",      "tc1",             5.0, "5 min",                TC1_RESULTS,   "ENH33_tc_5min",
+  "ENH33_7.5min_tc1",    "tc1",             7.5, "7.5 min",              TC1_RESULTS,   "ENH33_tc_7.5min",
+  "ENH33_10min_tc1",     "tc1",            10.0, "10 min",               TC1_RESULTS,   "ENH33_tc_10min",
+  "SNAI_rep1_DMSO1min",  "pacbio_rep",      1.0, "1 min (PacBio rep 1)", PB_RESULTS,    "SNAI1FVSNAI2KO_rep1_DMSO1min",
+  "SNAI_rep2_DMSO1min",  "pacbio_rep",      1.0, "1 min (PacBio rep 2)", PB_RESULTS,    "SNAI1FVSNAI2KO_rep2_DMSO1min"
+)
+
+# facet / panel titles, one per group
+GROUP_LABEL <- c(tc1        = "Time course 1 (exp7)",
+                 tc2        = "Time course 2 (exp9)",
+                 pacbio_rep = "1-min replicates")
+
+SAMPLES$group_label <- unname(GROUP_LABEL[SAMPLES$group])
+
+# ---- accessors --------------------------------------------------------------
+# samples_in("tc1", "tc2")            -> both time courses, in that group order
+# samples_id("ENH33_60s_tc2", ...)    -> named samples, in the order given
+samples_in <- function(...) {
+  g <- c(...)
+  SAMPLES %>%
+    dplyr::filter(group %in% g) %>%
+    dplyr::arrange(match(group, g))
+}
+samples_id <- function(...) {
+  ids <- c(...)
+  stopifnot(all(ids %in% SAMPLES$sample_id))
+  SAMPLES[match(ids, SAMPLES$sample_id), ]
+}
+
+# named numeric / character vectors keyed by sample_id
+minutes_of <- function(s) setNames(s$minutes, s$sample_id)
+labels_of  <- function(s, overrides = NULL) {
+  l <- setNames(s$label, s$sample_id)
+  if (!is.null(overrides)) l[names(overrides)] <- overrides
+  l
+}
+# longest time point first: the convention in every stacked panel
+by_time_desc <- function(s) s$sample_id[order(-s$minutes, s$sample_id)]
+```
+
+<!-- ==========================================================================
+     Motif registry. `col` is used in the metaplots, `col_hm` in the
+     single-molecule heatmap (which needs the three TFAP2A sites to be
+     distinguishable, so they get separate shades and unique labels).
+
+     PRDM5 is in_heatmap = FALSE: every candidate read with a genuine PRDM5
+     footprint in the displayed sample turned out to be an R-type (GA-side)
+     read with untrustworthy deamination calls, so the group had no reads
+     left after filtering. Set it back to TRUE once the GA-side decoding
+     issue is resolved.
+     ========================================================================== -->
+
+```{r motif-registry}
+REGION_NAME <- "ENH6"      # internal locus ID is ENH33
+CHROM       <- "chr11"
+
+# counting / size distributions
+LOCUS_RANGE   <- GRanges(CHROM, IRanges(8708345, 8709876))
+# metaplots and ATAC  (an earlier draft used the narrower 8708948-8709250)
+PLOT_RANGE    <- GRanges(CHROM, IRanges(8708900, 8709600))
+# single-molecule heatmap
+HEATMAP_RANGE <- GRanges(CHROM, IRanges(8708850, 8709650))
+
+MOTIFS <- tribble(
+  ~motif_id,   ~TF,       ~xmin,    ~xmax,    ~col,          ~col_hm,      ~in_heatmap, ~hm_order,
+  "TFAP2A_1",  "TFAP2A",  8709060,  8709071,  "orange",      "sienna1",    TRUE,        3L,
+  "SNAI",      "SNAI",    8709103,  8709110,  "magenta3",    "magenta3",   TRUE,        1L,
+  "TWIST1",    "TWIST1",  8709132,  8709147,  "darkred",     "darkred",    TRUE,        2L,
+  "TFAP2A_2",  "TFAP2A",  8709415,  8709427,  "orange",      "sienna2",    TRUE,        4L,
+  "PRDM5",     "PRDM5",   8709453,  8709463,  "orangered2",  "orangered2", FALSE,       NA_integer_,
+  "TFAP2A_3",  "TFAP2A",  8709511,  8709523,  "orange",      "sienna3",    TRUE,        5L
+)
+
+# motif band table for the metaplot / ATAC helpers (display names, may repeat)
+motifs_meta <- function() {
+  MOTIFS %>% dplyr::transmute(TF, xmin, xmax, col) %>% as.data.frame()
+}
+
+# heatmap version: unique labels, own palette, own group order
+motifs_heatmap <- function() {
+  m <- MOTIFS %>% dplyr::filter(in_heatmap) %>% dplyr::arrange(hm_order)
+  data.frame(TF   = factor(m$motif_id, levels = m$motif_id),
+             xmin = m$xmin, xmax = m$xmax, col = m$col_hm,
+             stringsAsFactors = FALSE)
+}
+```
+
+# 4. File paths
+
+```{r path-helpers}
+# ---- fiberHMM output --------------------------------------------------------
+# All DAF_QC trees share one layout:
+#   <DAF_ROOT>/<results_dir>/<sample_dir>/<version>/<sample_dir>.<suffix>
+daf_file <- function(samples, suffix, version = FIBERHMM_TF) {
+  setNames(
+    file.path(DAF_ROOT, samples$results_dir, samples$sample_dir, version,
+              paste0(samples$sample_dir, ".", suffix)),
+    samples$sample_id
+  )
+}
+
+# ---- per-read QC metrics ----------------------------------------------------
+daf_qc_reads <- function(samples) {
+  setNames(
+    file.path(DAF_ROOT, samples$results_dir, samples$sample_dir, "qc", "reads",
+              paste0(samples$sample_dir, ".detailed_seq_metrics.reads.tbl.gz")),
+    samples$sample_id
+  )
+}
+
+# ---- bulk ATAC bigWigs ------------------------------------------------------
+ATAC_BW <- c(ATAC_DMSO = file.path(ATAC_DIR, "ATAC_DMSO_merged.bw"))
+
+# ---- fail early, and say which file --------------------------------------
+check_files <- function(paths, what = "input file") {
+  missing <- unique(paths[!file.exists(paths)])
+  if (length(missing) > 0) {
+    stop(sprintf("%d %s(s) not found:\n  %s", length(missing), what,
+                 paste(missing, collapse = "\n  ")), call. = FALSE)
+  }
+  invisible(paths)
+}
+
+# ---- palettes ---------------------------------------------------------------
+# dark -> light red with increasing incubation: shortest time is darkest
+time_colors <- function(sample_minutes, low = "#67000d", high = "#fcbba1") {
+  times <- sort(unique(sample_minutes))
+  pal   <- setNames(colorRampPalette(c(low, high))(length(times)),
+                    as.character(times))
+  setNames(unname(pal[as.character(sample_minutes)]), names(sample_minutes))
+}
+```
+
+# 5. Core functions
+
+## 5.1 Reading fiberHMM BED files
+
+<!-- ==========================================================================
+     fiberHMM writes one BED12-like line per READ, with one block per
+     footprint. Three flavours appear in this document:
+
+       *.recalled_tf.bed         BED12 + 3 per-block score arrays
+                                 (blockTq / blockEl / blockEr). blockTq is the
+                                 per-footprint quality byte; blockEl / blockEr
+                                 are edge-sharpness bytes, NOT quality, so the
+                                 score filter must use blockTq.
+       *.recalled_footprint.bed  BED12 + 1 reserved column, no block scores.
+       *.recalled_deam.bed       BED12 + 1 column holding a 0/1 deamination
+                                 call per block; here one block == one base.
+
+     WHY NOT rtracklayer::import() for these: its BED parser tries to coerce
+     the list-valued extra columns to a single integer and fails. We parse as
+     plain text. The .bb footprint file IS read with import(), because there
+     only the block widths are needed.
+     ========================================================================== -->
+
+```{r fn-read-bed}
+BED12_PLUS3 <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+                 "thickStart", "thickEnd", "reserved", "blockCount",
+                 "blockSizes", "chromStarts", "blockTq", "blockEl", "blockEr")
+
+BED12_PLUS1 <- c("chrom", "chromStart", "chromEnd", "name", "score", "strand",
+                 "thickStart", "thickEnd", "reserved", "blockCount",
+                 "blockSizes", "chromStarts", "extra")
+
+BED_COL_TYPES <- cols(.default   = col_character(),
+                      chromStart = "i", chromEnd   = "i",
+                      score      = "i", thickStart = "i",
+                      thickEnd   = "i", blockCount = "i")
+
+# comma-separated integer field -> list column of integer vectors
+split_ints <- function(x) lapply(strsplit(x, ","), as.integer)
+
+#' Parse *.recalled_tf.bed (BED12+3)
+#'
+#' @return list(reads, footprints)
+#'   reads      : read_name, read_start, read_end, read_score, strand
+#'                (one row per read -- the denominator for occupancy)
+#'   footprints : read_name, fp_start, fp_end, fp_width, blockTq/El/Er
+read_fiberhmm_tf_bed <- function(path) {
+  raw <- read_tsv(path, col_names = BED12_PLUS3, col_types = BED_COL_TYPES)
+
+  reads_tbl <- raw %>%
+    transmute(read_name  = name,
+              read_start = chromStart + 1L,   # 0-based -> 1-based inclusive
+              read_end   = chromEnd,
+              read_score = score,
+              strand)
+
+  fps_tbl <- raw %>%
+    transmute(read_name   = name,
+              read_start  = chromStart,       # stays 0-based until the offset is added
+              blockSizes  = split_ints(blockSizes),
+              chromStarts = split_ints(chromStarts),
+              blockTq     = split_ints(blockTq),
+              blockEl     = split_ints(blockEl),
+              blockEr     = split_ints(blockEr)) %>%
+    unnest(c(blockSizes, chromStarts, blockTq, blockEl, blockEr)) %>%
+    mutate(fp_start = read_start + chromStarts + 1L,
+           fp_end   = read_start + chromStarts + blockSizes,
+           fp_width = blockSizes) %>%
+    select(read_name, fp_start, fp_end, fp_width, blockTq, blockEl, blockEr)
+
+  list(reads = reads_tbl, footprints = fps_tbl)
+}
+
+#' Parse *.recalled_footprint.bed (BED12+1, no per-block quality)
+#' @return read_name, fp_start, fp_end, fp_width  (1-based inclusive)
+read_footprint_bed <- function(path) {
+  read_tsv(path, col_names = BED12_PLUS1, col_types = BED_COL_TYPES) %>%
+    transmute(read_name   = name,
+              read_start  = chromStart,
+              blockSizes  = split_ints(blockSizes),
+              chromStarts = split_ints(chromStarts)) %>%
+    unnest(c(blockSizes, chromStarts)) %>%
+    mutate(fp_start = read_start + chromStarts + 1L,
+           fp_end   = read_start + chromStarts + blockSizes,
+           fp_width = blockSizes) %>%
+    select(read_name, fp_start, fp_end, fp_width)
+}
+
+#' Parse *.recalled_deam.bed (BED12+1; one block per base, extra = 0/1 call)
+#' @return read_name, pos (1-based), deam
+read_deam_bed <- function(path) {
+  read_tsv(path, col_names = BED12_PLUS1, col_types = BED_COL_TYPES) %>%
+    transmute(read_name   = name,
+              read_start  = chromStart,
+              chromStarts = split_ints(chromStarts),
+              deam        = split_ints(extra)) %>%
+    unnest(c(chromStarts, deam)) %>%
+    mutate(pos = read_start + chromStarts + 1L) %>%
+    select(read_name, pos, deam)
+}
+
+#' Read a (possibly gzipped) QC metrics table.
+#' Some data.table builds delegate gz decompression to R.utils and error out
+#' when it is missing; readr handles .gz natively, so fall back to it.
+read_metrics_table <- function(path) {
+  if (grepl("\\.gz$", path) && !requireNamespace("R.utils", quietly = TRUE)) {
+    as.data.table(read_tsv(path, show_col_types = FALSE, progress = FALSE))
+  } else {
+    fread(path)
+  }
+}
+```
+
+## 5.2 Per-base coverage and TF occupancy
+
+<!-- ==========================================================================
+     For every base pair in the window:
+
+         occupancy(%) = 100 * footprints covering the bp / reads spanning the bp
+
+     counting only footprints with blockTq >= TQ_THRESHOLD, and leaving
+     positions with fewer than MIN_READ_COV spanning reads as NA rather than
+     letting one or two molecules dictate a 0% or 100% value.
+     ========================================================================== -->
+
+```{r fn-occupancy}
+#' Per-base coverage of a set of intervals over a window.
+#' Intervals are clipped to the window, then counted with IRanges::coverage()
+#' (identical to a per-interval loop, but vectorised).
+per_base_coverage <- function(starts, ends, region_start, region_end) {
+  n <- as.integer(region_end - region_start + 1L)
+  if (length(starts) == 0) return(integer(n))
+  s <- pmax(starts, region_start) - region_start + 1L
+  e <- pmin(ends,   region_end)   - region_start + 1L
+  keep <- e >= s
+  if (!any(keep)) return(integer(n))
+  as.integer(coverage(IRanges(s[keep], e[keep]), width = n))
+}
+
+#' Occupancy profile for one sample.
+#' @return Sample, pos, fp_coverage, read_coverage, normalized_occupancy
+occupancy_profile <- function(tf_bed, sample_id, range,
+                              tq_threshold = TQ_THRESHOLD,
+                              min_read_cov = MIN_READ_COV) {
+  rs <- start(range); re <- end(range)
+  obj <- read_fiberhmm_tf_bed(tf_bed)
+
+  # every read overlapping the window (no full-span requirement)
+  reads_overlap <- obj$reads %>%
+    dplyr::filter(read_end >= rs, read_start <= re)
+  message(sample_id, ": ", nrow(reads_overlap), " reads overlapping region")
+  if (nrow(reads_overlap) == 0) return(NULL)
+
+  read_cov <- per_base_coverage(reads_overlap$read_start,
+                                reads_overlap$read_end, rs, re)
+
+  fp_filt <- obj$footprints %>%
+    dplyr::filter(read_name %in% reads_overlap$read_name,
+                  blockTq >= tq_threshold,
+                  fp_end >= rs, fp_start <= re)
+  message(sample_id, ": ", nrow(fp_filt),
+          " footprints passing blockTq >= ", tq_threshold)
+
+  fp_cov <- per_base_coverage(fp_filt$fp_start, fp_filt$fp_end, rs, re)
+
+  data.frame(Sample               = sample_id,
+             pos                  = rs:re,
+             fp_coverage          = fp_cov,
+             read_coverage        = read_cov,
+             normalized_occupancy = ifelse(read_cov >= min_read_cov,
+                                           fp_cov / read_cov * 100, NA_real_))
+}
+
+#' Occupancy profiles for several samples, factor-ordered for faceting.
+build_occupancy <- function(tf_beds, range, sample_order = NULL, ...) {
+  df <- imap_dfr(tf_beds, function(path, sid) {
+    occupancy_profile(path, sid, range, ...)
+  })
+  if (is.null(sample_order)) sample_order <- unique(df$Sample)
+  df$Sample <- factor(df$Sample, levels = sample_order)
+  df
+}
+```
+
+## 5.3 Occupancy metaplots
+
+```{r fn-metaplot}
+#' Faceted occupancy metaplot: one sample per row, motif bands behind.
+#' Motif NAMES are drawn once, on the top facet only; the bands themselves
+#' are drawn on every facet.
+plot_occupancy <- function(df, range, motifs, colors, labels,
+                           title = NULL, y_max = NULL, base_size = 15) {
+  df <- droplevels(df)
+  if (is.null(y_max)) {
+    y_max <- suppressWarnings(max(df$normalized_occupancy, na.rm = TRUE))
+    if (!is.finite(y_max)) y_max <- 1
+  }
+
+  motif_labels <- motifs
+  motif_labels$Sample <- factor(levels(df$Sample)[1], levels = levels(df$Sample))
+
+  ggplot(df, aes(x = pos, y = normalized_occupancy)) +
+    geom_rect(data = motifs,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = col),
+              alpha = 0.15, inherit.aes = FALSE) +
+    scale_fill_identity(guide = "none") +
+    geom_text(data = motif_labels,
+              aes(x = (xmin + xmax) / 2, y = Inf, label = TF, color = col),
+              vjust = 1.5, size = 3.5, fontface = "bold",
+              inherit.aes = FALSE, show.legend = FALSE) +
+    scale_color_identity(guide = "none") +
+    # second fill/colour scale, for the occupancy curves themselves
+    new_scale_fill() +
+    new_scale_color() +
+    geom_area(aes(fill = Sample), position = "identity", alpha = 0.15) +
+    geom_line(aes(color = Sample), linewidth = 0.8) +
+    scale_fill_manual(values = colors) +
+    scale_color_manual(values = colors) +
+    facet_wrap(~ Sample, ncol = 1, scales = "fixed", strip.position = "right",
+               labeller = labeller(Sample = labels)) +
+    coord_cartesian(xlim = c(start(range), end(range)), ylim = c(0, y_max)) +
+    theme_classic(base_size = base_size) +
+    theme(legend.position  = "none",
+          plot.title       = element_text(size = base_size + 2, face = "bold"),
+          axis.title       = element_text(size = base_size),
+          axis.text        = element_text(size = base_size - 2),
+          strip.text.y     = element_text(size = base_size, face = "bold", angle = 0),
+          strip.background = element_blank()) +
+    labs(title = title,
+         x = paste0("Genomic coordinate (", as.character(seqnames(range)), ")"),
+         y = "Occupancy %")
+}
+
+# Honest overall title: with TQ_THRESHOLD = 0 nothing is actually filtered.
+metaplot_title <- function(tq = TQ_THRESHOLD) {
+  if (tq > 0) sprintf("TF footprints (blockTq >= %d)", tq)
+  else        "TF footprints (all fiberHMM calls)"
+}
+```
+
+## 5.4 ATAC-seq signal tracks
+
+```{r fn-atac}
+#' Expand bigWig intervals to a per-base signal vector over a window.
+compute_atac_signal <- function(atac_files, range) {
+  check_files(atac_files, "bigWig")
+  rs <- start(range); re <- end(range); pos_vec <- rs:re
+
+  imap_dfr(atac_files, function(path, sid) {
+    gr  <- import.bw(path, which = range)
+    sig <- numeric(length(pos_vec))
+    if (length(gr) > 0) {
+      s <- pmax(start(gr), rs) - rs + 1L
+      e <- pmin(end(gr),   re) - rs + 1L
+      for (i in which(e >= s)) sig[s[i]:e[i]] <- mcols(gr)$score[i]
+    }
+    tibble(Sample = sid, pos = pos_vec, signal = sig)
+  })
+}
+
+plot_atac_signal <- function(atac_df, range, motifs = NULL,
+                             sample_colors = NULL, facet = FALSE,
+                             title = "ATAC-seq signal", subtitle = NULL) {
+  rs <- start(range); re <- end(range)
+  df <- atac_df %>% dplyr::filter(pos >= rs, pos <= re)
+
+  p <- ggplot(df, aes(x = pos, y = signal))
+
+  if (!is.null(motifs)) {
+    p <- p +
+      geom_rect(data = motifs,
+                aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = col),
+                alpha = 0.15, inherit.aes = FALSE) +
+      scale_fill_identity(guide = "none") +
+      geom_text(data = motifs,
+                aes(x = (xmin + xmax) / 2, y = Inf, label = TF, color = col),
+                vjust = 1.5, size = 3.5, fontface = "bold",
+                inherit.aes = FALSE, show.legend = FALSE) +
+      scale_color_identity(guide = "none") +
+      new_scale_fill() +
+      new_scale_color()
+  }
+
+  p <- p +
+    geom_area(aes(fill = Sample), position = "identity", alpha = 0.1) +
+    geom_line(aes(color = Sample), linewidth = 0.8) +
+    coord_cartesian(xlim = c(rs, re)) +
+    theme_classic() +
+    labs(title = title, subtitle = subtitle,
+         x = paste0("Genomic coordinate (", as.character(seqnames(range)), ")"),
+         y = "ATAC signal") +
+    theme(legend.position  = "bottom",
+          strip.background = element_blank(),
+          strip.text       = element_text(face = "bold"))
+
+  if (facet) p <- p + facet_wrap(~ Sample, ncol = 1, scales = "free_y",
+                                 strip.position = "right")
+  if (!is.null(sample_colors)) {
+    p <- p + scale_color_manual(values = sample_colors) +
+             scale_fill_manual(values = sample_colors)
+  } else {
+    p <- p + scale_color_brewer(palette = "Set1") +
+             scale_fill_brewer(palette = "Set1")
+  }
+  p
+}
+```
+
+## 5.5 Single-molecule deamination heatmap
+
+<!-- ==========================================================================
+     Reads are grouped by which TF motif they carry a footprint over, a few
+     representative reads are drawn per group, and each read becomes one line
+     carrying four tracks:
+
+       grey backbone    the read
+       blue segments    general (nucleosome-scale) footprints
+       coloured bars    TF-scale footprints, coloured by the motif they cover
+       dark ticks       individual deaminated bases (accessible DNA)
+
+     A read qualifies for a motif when it has a TF-scale footprint spanning
+     that motif (within HM_SLACK bp) that is neither wider than
+     HM_MAX_TF_WIDTH nor narrower than half the motif. Candidates are
+     shuffled, then ordered so unused / well-converted / well-covered reads
+     come first, with blockTq breaking ties.
+
+     The PDF: a vector PDF stores every deamination tick as its own path, so
+     ~50 reads x thousands of bases is 10,000+ objects and Illustrator
+     crawls. Only the high-count layers are rasterised; text, motif boxes and
+     the scale bar stay real vector objects, so labels remain editable.
+     ========================================================================== -->
+
+```{r fn-heatmap-pick}
+#' Fraction of the window covered by ANY footprint, per read.
+#' Approximate: overlapping blocks double count, which is fine for ranking.
+footprint_coverage_fraction <- function(footprints, rs, re) {
+  footprints %>%
+    dplyr::filter(fp_end >= rs, fp_start <= re) %>%
+    mutate(a = pmax(fp_start, rs), b = pmin(fp_end, re)) %>%
+    group_by(read_name) %>%
+    summarise(footprint_frac = sum(b - a + 1) / (re - rs), .groups = "drop")
+}
+
+#' Mean deamination rate per read across the window.
+read_deamination_rate <- function(deam, rs, re) {
+  deam %>%
+    dplyr::filter(pos >= rs, pos <= re) %>%
+    group_by(read_name) %>%
+    summarise(deam_rate = mean(deam), .groups = "drop")
+}
+
+#' Pick representative reads for each motif.
+#' @return TF (factor, motif order), read_name, y (numeric; first row on top)
+pick_reads_per_motif <- function(tf_footprints, footprints, deam, motifs, rs, re,
+                                 n_per_group = HM_N_PER_GROUP,
+                                 max_width   = HM_MAX_TF_WIDTH,
+                                 slack       = HM_SLACK,
+                                 min_deam    = HM_MIN_DEAM,
+                                 min_frac    = HM_MIN_FP_FRAC,
+                                 seed        = HM_SEED) {
+  set.seed(seed)
+  cov_frac  <- footprint_coverage_fraction(footprints, rs, re)
+  deam_rate <- read_deamination_rate(deam, rs, re)
+
+  used   <- character(0)
+  picked <- vector("list", nrow(motifs))
+
+  for (i in seq_len(nrow(motifs))) {
+    xmin <- motifs$xmin[i]; xmax <- motifs$xmax[i]
+    site_width <- xmax - xmin
+
+    best <- tf_footprints %>%
+      dplyr::filter(fp_start <= xmin + slack, fp_end >= xmax - slack,
+                    fp_width <= max_width, fp_width >= site_width * 0.5) %>%
+      group_by(read_name) %>%
+      summarise(blockTq = max(blockTq), .groups = "drop") %>%
+      left_join(cov_frac,  by = "read_name") %>%
+      left_join(deam_rate, by = "read_name") %>%
+      mutate(footprint_frac = coalesce(footprint_frac, 0),
+             deam_rate      = coalesce(deam_rate, 0),
+             already_used   = read_name %in% used,
+             low_conversion = deam_rate < min_deam,
+             low_coverage   = footprint_frac < min_frac) %>%
+      slice_sample(prop = 1) %>%                      # shuffle for variety
+      arrange(already_used, low_conversion, low_coverage, desc(blockTq)) %>%
+      slice_head(n = n_per_group)
+
+    if (nrow(best) == 0) {
+      warning("no read passed the filters for motif '",
+              as.character(motifs$TF[i]), "'", call. = FALSE)
+    }
+    used <- c(used, best$read_name)
+    picked[[i]] <- tibble(TF = as.character(motifs$TF[i]),
+                          read_name = best$read_name)
+  }
+
+  picked <- bind_rows(picked)
+  picked$TF <- factor(picked$TF, levels = as.character(motifs$TF))
+  picked <- arrange(picked, TF)
+
+  # Numeric y, NOT a factor: the motif annotation strip needs y values above
+  # the last read, so every layer must share one continuous y scale.
+  picked$y <- rev(seq_len(nrow(picked)))
+  picked
+}
+
+#' Colour each TF footprint by the first motif it overlaps (grey if none).
+assign_motif_color <- function(tf_sel, motifs, default = "grey50") {
+  col <- rep(NA_character_, nrow(tf_sel))
+  for (i in seq_len(nrow(motifs))) {
+    hit <- is.na(col) & tf_sel$fp_end >= motifs$xmin[i] &
+                        tf_sel$fp_start <= motifs$xmax[i]
+    col[hit] <- as.character(motifs$col[i])
+  }
+  ifelse(is.na(col), default, col)
+}
+```
+
+```{r fn-heatmap-plot}
+plot_single_molecule_heatmap <- function(picked, deam, footprints, tf_footprints,
+                                         motifs, rs, re,
+                                         title = NULL, subtitle = NULL,
+                                         nucleosome_bp = NUCLEOSOME_BP,
+                                         out_w = HM_OUT_W, out_h = HM_OUT_H,
+                                         ref_w = HM_REF_W, ref_h = HM_REF_H,
+                                         raster_dpi = HM_RASTER_DPI) {
+
+  s <- min(out_w / ref_w, out_h / ref_h)     # shrink factor (<1 when smaller)
+
+  lwd_backbone <- 1.1  * s
+  lwd_fp       <- 2.2  * s
+  lwd_tf       <- 2.2  * s
+  lwd_tick     <- 0.35 * s
+  tick_half_h  <- 0.22                        # tick half-height, in read rows
+  fontsize_lab <- max(1.8, 6  * s)
+  fontsize_grp <- max(2.0, 8  * s)
+  fontsize_ttl <- max(6,   13 * s)
+
+  sel <- picked$read_name
+  y_of <- dplyr::select(picked, read_name, y)
+
+  deam_sel <- deam %>%
+    dplyr::filter(read_name %in% sel, deam == 1, pos >= rs, pos <= re) %>%
+    left_join(y_of, by = "read_name")
+
+  fp_sel <- footprints %>%
+    dplyr::filter(read_name %in% sel, fp_end >= rs, fp_start <= re) %>%
+    mutate(fp_start = pmax(fp_start, rs), fp_end = pmin(fp_end, re)) %>%
+    left_join(y_of, by = "read_name")
+
+  tf_sel <- tf_footprints %>%
+    dplyr::filter(read_name %in% sel, fp_end >= rs, fp_start <= re) %>%
+    mutate(fp_start = pmax(fp_start, rs), fp_end = pmin(fp_end, re)) %>%
+    left_join(y_of, by = "read_name")
+  tf_sel$site_col <- assign_motif_color(tf_sel, motifs)
+
+  group_bounds <- picked %>%
+    group_by(TF) %>%
+    summarise(y_min = min(y) - 0.5, y_mid = mean(y),
+              col = as.character(motifs$col[match(TF[1], motifs$TF)]),
+              .groups = "drop")
+
+  # motif strip above the reads: box + leader line + staggered label
+  n_reads <- nrow(picked)
+  motif_ann <- motifs %>%
+    arrange(xmin) %>%
+    mutate(tier    = row_number() %% 3,
+           box_y0  = n_reads + 0.6 * s + 0.4,
+           box_y1  = box_y0 + 0.7 * s,
+           label_y = box_y1 + 0.3 * s + tier * (0.9 * s),
+           mid     = (xmin + xmax) / 2)
+
+  # nucleosome-size scale bar below the reads
+  scale_x1 <- re - 40L - nucleosome_bp
+  scale_x2 <- scale_x1 + nucleosome_bp
+  scale_y  <- -0.9
+  tick_h   <- 0.18
+
+  ggplot() +
+    # ---- vector layers (cheap, stay editable) -------------------------------
+    geom_segment(data = data.frame(x = scale_x1, xend = scale_x2, y = scale_y),
+                 aes(x = x, xend = xend, y = y, yend = y),
+                 color = "black", linewidth = 0.8 * s, inherit.aes = FALSE) +
+    geom_segment(data = data.frame(x = c(scale_x1, scale_x2)),
+                 aes(x = x, xend = x, y = scale_y - tick_h, yend = scale_y + tick_h),
+                 color = "black", linewidth = 0.8 * s, inherit.aes = FALSE) +
+    annotate("text", x = (scale_x1 + scale_x2) / 2, y = scale_y - 0.55,
+             label = paste0(nucleosome_bp, " bp (nucleosome)"),
+             size = fontsize_lab, vjust = 1) +
+    geom_rect(data = motifs,
+              aes(xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf, fill = col),
+              alpha = 0.06, inherit.aes = FALSE) +
+    geom_rect(data = motif_ann,
+              aes(xmin = xmin, xmax = xmax, ymin = box_y0, ymax = box_y1, fill = col),
+              alpha = 0.35, inherit.aes = FALSE) +
+    geom_segment(data = motif_ann,
+                 aes(x = mid, xend = mid, y = box_y1, yend = label_y - 0.1 * s,
+                     color = col),
+                 linewidth = 0.4 * s, inherit.aes = FALSE) +
+    geom_text(data = motif_ann,
+              aes(x = mid, y = label_y, label = TF, color = col),
+              fontface = "bold", size = fontsize_lab, inherit.aes = FALSE) +
+    # ---- rasterised layers (O(reads x blocks)) ------------------------------
+    rasterise(geom_segment(data = picked,
+                           aes(x = rs, xend = re, y = y, yend = y),
+                           color = "grey90", linewidth = lwd_backbone),
+              dpi = raster_dpi) +
+    rasterise(geom_segment(data = fp_sel,
+                           aes(x = fp_start, xend = fp_end, y = y, yend = y),
+                           color = "#4472a8", alpha = 0.45, linewidth = lwd_fp),
+              dpi = raster_dpi) +
+    rasterise(geom_segment(data = tf_sel,
+                           aes(x = fp_start, xend = fp_end, y = y, yend = y,
+                               color = site_col),
+                           alpha = 0.9, linewidth = lwd_tf),
+              dpi = raster_dpi) +
+    rasterise(geom_segment(data = deam_sel,
+                           aes(x = pos, xend = pos,
+                               y = y - tick_half_h, yend = y + tick_half_h),
+                           color = "grey30", linewidth = lwd_tick),
+              dpi = raster_dpi) +
+    scale_color_identity() +
+    scale_fill_identity() +
+    # ---- group separators and left-hand labels ------------------------------
+    geom_hline(data = group_bounds, aes(yintercept = y_min),
+               linetype = "dashed", color = "grey50", linewidth = 0.3 * s) +
+    annotate("text", x = rs - 15, y = group_bounds$y_mid,
+             label = as.character(group_bounds$TF), color = group_bounds$col,
+             fontface = "bold", hjust = 1, size = fontsize_grp) +
+    coord_cartesian(xlim = c(rs - 100, re),
+                    ylim = c(-2, max(motif_ann$label_y) + 1), clip = "off") +
+    labs(title = title, subtitle = subtitle,
+         x = paste0(CHROM, " position"), y = NULL) +
+    theme_classic(base_size = fontsize_ttl) +
+    theme(axis.text.y  = element_blank(),
+          axis.ticks.y = element_blank(),
+          plot.margin  = margin(l = 60 * s))
+}
+```
+
+## 5.6 Per-read deamination rates
+
+```{r fn-deam-rates}
+#' Load per-read deamination rates for a set of samples.
+#' @return data.table: one row per read, with sample_id / group / minutes /
+#'   time (ordered factor) / rate
+load_read_deam_rates <- function(samples, rate_col = DEAM_RATE_COL) {
+  files <- daf_qc_reads(samples)
+  check_files(files, "read metrics table")
+
+  dat <- rbindlist(
+    Map(function(f, sid, grp, lab, mins) {
+      d <- read_metrics_table(f)
+      d[, `:=`(sample_id = sid, group = grp, group_label = lab, minutes = mins)]
+    }, files, samples$sample_id, samples$group,
+       samples$group_label, samples$minutes),
+    fill = TRUE)
+
+  if (!rate_col %in% names(dat)) {
+    stop("column '", rate_col, "' not in the metrics tables. Available: ",
+         paste(grep("deam_rate", names(dat), value = TRUE), collapse = ", "),
+         call. = FALSE)
+  }
+
+  dat[, rate := as.numeric(get(rate_col))]
+  dat <- dat[is.finite(rate)]
+
+  # shared, numerically ordered time levels across every panel
+  lv <- paste0(sort(unique(dat$minutes)), " min")
+  dat[, time := factor(paste0(minutes, " min"), levels = lv)]
+  dat[, group_label := factor(group_label, levels = unique(samples$group_label))]
+  dat[]
+}
+
+#' One density panel per time course, coloured by incubation time.
+plot_deam_by_group <- function(dat, xlim = c(0, 1), title = NULL) {
+  ggplot(dat, aes(rate, colour = time)) +
+    geom_density(linewidth = 0.9) +
+    facet_wrap(~ group_label, ncol = 1, scales = "free_y") +
+    scale_x_continuous("Deamination rate per read", limits = xlim, expand = c(0, 0)) +
+    scale_y_continuous("Density", expand = expansion(mult = c(0, 0.05))) +
+    scale_colour_viridis_d(end = 0.92, drop = FALSE) +
+    labs(title = title, colour = "Incubation") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank(),
+          strip.background = element_rect(fill = "grey92", colour = NA))
+}
+
+#' All samples overlaid: colour = incubation time, linetype = time course.
+#' Densities are evaluated explicitly on a common grid so the two time courses
+#' are directly comparable.
+plot_deam_overlay <- function(dat, xlim = c(0, 0.8), title = NULL) {
+  dens <- dat[, {
+    d <- density(rate, from = 0, to = 1, n = 512)
+    .(x = d$x, y = d$y)
+  }, by = .(sample_id, group, minutes)]
+
+  dens[, time := factor(paste0(minutes, " min"),
+                        levels = paste0(sort(unique(minutes)), " min"))]
+
+  groups <- sort(unique(dens$group))
+  ltys   <- setNames(rep(c("dashed", "solid", "dotted", "dotdash"),
+                         length.out = length(groups)), groups)
+  gnames <- setNames(as.character(dat$group_label[match(groups, dat$group)]), groups)
+
+  ggplot(dens) +
+    geom_line(aes(x, y, group = sample_id, colour = time, linetype = group),
+              linewidth = 0.85) +
+    scale_x_continuous("Deamination rate per read", limits = xlim, expand = c(0, 0)) +
+    scale_y_continuous("Density", expand = expansion(mult = c(0, 0.05))) +
+    scale_colour_viridis_d(end = 0.9, name = "Incubation") +
+    scale_linetype_manual(values = ltys, labels = gnames, name = NULL) +
+    guides(colour = guide_legend(order = 1), linetype = guide_legend(order = 2)) +
+    labs(title = title) +
+    theme_classic(base_size = 12) +
+    theme(legend.key.width = unit(1.6, "lines"),
+          legend.spacing.y = unit(0.2, "lines"))
+}
+```
+
+# 6. Analyses
+
+<!-- ==========================================================================
+     Each section is self-contained: pick samples from the registry, build the
+     paths, compute, plot, save. Titles and file names come from REGION_NAME
+     and the registry, so they cannot drift from the data being plotted.
+     ========================================================================== -->
+
+## 6.1 Deamination rates
+
+<!-- The primary QC for the time course: the distribution should shift right
+     with increasing incubation. -->
+
+```{r deam-rates-load}
+tc_samples <- samples_in("tc1", "tc2")
+deam_rates <- load_read_deam_rates(tc_samples)
+
+# sanity check: median rate per sample, ordered by time course and time point
+deam_rates[, .(n_reads = .N,
+               median  = round(median(rate), 3),
+               p10     = round(quantile(rate, 0.1), 3),
+               p90     = round(quantile(rate, 0.9), 3)),
+           by = .(group_label, time)][order(group_label, time)]
+```
+
+```{r deam-rates-panels, fig.width = 6, fig.height = 5}
+p_deam_panels <- plot_deam_by_group(
+  deam_rates, xlim = c(0, 1),
+  title = sprintf("Per-read deamination rate, %s deaminase time course", REGION_NAME))
+p_deam_panels
+ggsave(fig("deamination_density_by_timecourse.pdf"), p_deam_panels,
+       width = 6, height = 5)
+```
+
+```{r deam-rates-overlay, fig.width = 5, fig.height = 3}
+p_deam_overlay <- plot_deam_overlay(
+  deam_rates, xlim = c(0, 0.8),
+  title = paste0("Per-read deamination rate - ", REGION_NAME))
+p_deam_overlay
+ggsave(fig("deamination_overlay.pdf"), p_deam_overlay, width = 5, height = 3)
+```
+
+## 6.2 Footprint size distribution (nucleosomes)
+
+<!-- Footprints at or above 147 bp are nucleosome-sized; the shorter mode is
+     TF-scale protection. Read from the .bb files, where only block widths are
+     needed, so rtracklayer::import() is fine here. -->
+
+```{r nucleosome-sizes, fig.width = 7.3, fig.height = 4.5}
+size_samples <- samples_in("tc2", "tc1")
+bb_files     <- daf_file(size_samples, "recalled_footprint.bb", FIBERHMM_FP)
+check_files(bb_files, "footprint bigBed")
+
+# ascending time within each time course, so the ridgelines read bottom-to-top
+size_order <- size_samples$sample_id[order(match(size_samples$group, c("tc2", "tc1")),
+                                           size_samples$minutes)]
+
+footprint_sizes <- imap_dfr(bb_files, function(path, sid) {
+  reads <- import(path, which = LOCUS_RANGE)
+  if (length(reads) == 0) return(NULL)
+  tibble(Sample = sid, width = width(unlist(blocks(reads))))
+}) %>%
+  left_join(dplyr::select(size_samples, sample_id, group_label),
+            by = c("Sample" = "sample_id")) %>%
+  mutate(Sample = factor(Sample, levels = size_order))
+
+# reads and footprints overlapping the locus, per sample
+read_counts <- imap_dfr(bb_files, function(path, sid) {
+  reads <- import(path, which = LOCUS_RANGE)
+  tibble(Sample = sid, n_reads = length(reads),
+         n_footprints = sum(elementNROWS(blocks(reads))))
+}) %>%
+  mutate(Sample = factor(Sample, levels = size_order)) %>%
+  arrange(Sample)
+read_counts
+
+p_sizes <- ggplot(footprint_sizes, aes(x = width, y = Sample, fill = Sample)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.1, rel_min_height = 0.01) +
+  geom_vline(xintercept = NUCLEOSOME_BP, linetype = "dashed", alpha = 0.5) +
+  coord_cartesian(xlim = c(0, 300)) +
+  scale_fill_viridis_d() +
+  scale_y_discrete(labels = labels_of(size_samples)) +
+  facet_wrap(~ group_label, ncol = 2, scales = "free_y") +
+  labs(x = "Footprint size (bp)", y = NULL,
+       title = sprintf("Footprint size distribution over the %s time course",
+                       REGION_NAME),
+       subtitle = sprintf("dashed line: %d bp (nucleosome)", NUCLEOSOME_BP)) +
+  theme_classic() +
+  theme(legend.position = "none")
+
+p_sizes
+ggsave(fig("Nucleosomes_timecourse.pdf"), p_sizes, width = 7.29, height = 4.51)
+```
+
+## 6.3 TF occupancy metaplots and ATAC
+
+```{r metaplot-timecourse, fig.width = 10, fig.height = 8}
+tf_beds_tc <- daf_file(tc_samples, "recalled_tf.bed")
+check_files(tf_beds_tc, "TF BED")
+
+occ_tc <- build_occupancy(tf_beds_tc, PLOT_RANGE,
+                          sample_order = by_time_desc(tc_samples))
+
+colors_tc <- time_colors(minutes_of(tc_samples))
+labels_tc <- labels_of(tc_samples)
+ids_tc1   <- tc_samples$sample_id[tc_samples$group == "tc1"]
+ids_tc2   <- tc_samples$sample_id[tc_samples$group == "tc2"]
+
+p_tc1 <- plot_occupancy(dplyr::filter(occ_tc, Sample %in% ids_tc1), PLOT_RANGE,
+                        motifs_meta(), colors_tc, labels_tc, title = "Time course 1")
+p_tc2 <- plot_occupancy(dplyr::filter(occ_tc, Sample %in% ids_tc2), PLOT_RANGE,
+                        motifs_meta(), colors_tc, labels_tc, title = "Time course 2")
+
+# panel heights proportional to the number of samples in each panel
+p_meta <- (p_tc1 / p_tc2) +
+  plot_layout(heights = c(length(ids_tc1), length(ids_tc2))) +
+  plot_annotation(title = metaplot_title(),
+                  theme = theme(plot.title = element_text(face = "bold", size = 22)))
+p_meta
+ggsave(fig("timecourse_TFmetaplots.pdf"), p_meta, width = 10, height = 8)
+
+# time course 2 on its own (supplementary panel)
+ggsave(fig("timecourse_TFmetaplots_tc2suppl.pdf"), p_tc2, width = 10, height = 4)
+```
+
+```{r metaplot-1min-reps, fig.width = 10, fig.height = 8}
+# the 1-min Plasmidsaurus sample next to the two PacBio DMSO replicates
+rep_ids      <- c("ENH33_60s_tc2", "SNAI_rep1_DMSO1min", "SNAI_rep2_DMSO1min")
+rep_samples  <- samples_id(c(ids_tc1, rep_ids))
+tf_beds_reps <- daf_file(rep_samples, "recalled_tf.bed")
+check_files(tf_beds_reps, "TF BED")
+
+occ_reps <- build_occupancy(tf_beds_reps, PLOT_RANGE,
+                            sample_order = by_time_desc(rep_samples))
+
+colors_reps <- time_colors(minutes_of(rep_samples))
+labels_reps <- labels_of(rep_samples,
+                         overrides = c(ENH33_60s_tc2 = "1 min (Plasmidsaurus)"))
+
+p_reps_tc <- plot_occupancy(dplyr::filter(occ_reps, Sample %in% ids_tc1), PLOT_RANGE,
+                            motifs_meta(), colors_reps, labels_reps,
+                            title = "Time course")
+p_reps_1m <- plot_occupancy(dplyr::filter(occ_reps, Sample %in% rep_ids), PLOT_RANGE,
+                            motifs_meta(), colors_reps, labels_reps,
+                            title = "1 min replicates")
+
+p_meta_reps <- (p_reps_tc / p_reps_1m) +
+  plot_layout(heights = c(length(ids_tc1), length(rep_ids))) +
+  plot_annotation(title = metaplot_title(),
+                  theme = theme(plot.title = element_text(face = "bold", size = 22)))
+p_meta_reps
+ggsave(fig("timecourse_TFmetaplots_with1minreps.pdf"), p_meta_reps,
+       width = 10, height = 8)
+```
+
+```{r atac, fig.width = 10, fig.height = 2}
+atac_df <- compute_atac_signal(ATAC_BW, PLOT_RANGE)
+p_atac  <- plot_atac_signal(atac_df, PLOT_RANGE, motifs = motifs_meta(),
+                            title = REGION_NAME)
+p_atac
+ggsave(fig("ENH33_ATAC_fortc.pdf"), p_atac, width = 10, height = 2)
+```
+
+## 6.4 Single-molecule deamination / footprint heatmap
+
+```{r heatmap-load}
+# any sample_id from the registry works here
+HEATMAP_SAMPLE <- "SNAI_rep1_DMSO1min"
+
+hm_sample <- samples_id(HEATMAP_SAMPLE)
+hm_paths  <- c(deam      = unname(daf_file(hm_sample, "recalled_deam.bed")),
+               footprint = unname(daf_file(hm_sample, "recalled_footprint.bed")),
+               tf        = unname(daf_file(hm_sample, "recalled_tf.bed")))
+check_files(hm_paths, "fiberHMM BED")
+
+deam_all <- read_deam_bed(hm_paths[["deam"]])
+fp_all   <- read_footprint_bed(hm_paths[["footprint"]])
+tf_all   <- read_fiberhmm_tf_bed(hm_paths[["tf"]])$footprints
+
+hm_motifs <- motifs_heatmap()
+hm_rs <- start(HEATMAP_RANGE); hm_re <- end(HEATMAP_RANGE)
+
+picked_reads <- pick_reads_per_motif(tf_all, fp_all, deam_all, hm_motifs,
+                                     hm_rs, hm_re)
+table(picked_reads$TF)
+```
+
+```{r heatmap-plot, fig.width = 6, fig.height = 5}
+p_heatmap <- plot_single_molecule_heatmap(
+  picked        = picked_reads,
+  deam          = deam_all,
+  footprints    = fp_all,
+  tf_footprints = tf_all,
+  motifs        = hm_motifs,
+  rs = hm_rs, re = hm_re,
+  title    = paste0(HEATMAP_SAMPLE, " - DAF-seq deamination footprints"),
+  subtitle = sprintf("%d reads per group, grouped by TF footprint overlap",
+                     HM_N_PER_GROUP))
+p_heatmap
+ggsave(fig(paste0(HEATMAP_SAMPLE, "_deam_heatmap.pdf")), p_heatmap,
+       width = HM_OUT_W, height = HM_OUT_H)
+```
+
+# 7. Session info
+
+```{r session-info}
+sessionInfo()
+```
