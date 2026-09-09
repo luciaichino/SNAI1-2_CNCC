@@ -61,9 +61,14 @@ Code for plotting Fiber-seq data (metaplot and heatmap)
 
 Nucleosome clustering analysis and TF footprint analysis DAFseq data
 
+--- 12_DAF_timecourse_ENH6.Rmd
+
+All analyses of DAF deamination timecourse (deamination rates, single molecule heatmap, 
+nucleosome footprint size, TF metaplots)
+
 ## Figure 6: DAF-seq codependency analysis
 
---- 12_DAFseq_codependency.Rmd
+--- 13_DAFseq_codependency.Rmd
 
 codependency analysis enhancers 2 and 3 DAF-seq data
 
