@@ -1,4 +1,5 @@
-# Enhancer Tuning by Sequence-Dependent Repressors SNAI1 and SNAI2
+# Enhancer Tuning by Sequence-Specific Repressors
+
 
 Code accompanying the analyses in paper **link TBD
 
