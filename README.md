@@ -22,7 +22,8 @@ Counts at CNCC regulatory regions were calculated with bedtools coverage
 
 --- 03_human_chimp_ChIP_motifs_correlation.Rmd
 
-R markdown of correlation analysis between human and chimpanzee ChIP changes and SNAI2 motif changes
+R markdown of correlation analysis between human and chimpanzee ChIP changes and SNAI2 motif changes.
+Data for this script are in folder "data_03_human_chimp"
 
 ## Figure 2/3: SNAI1/2, H3K27ac, ATAC, analyses
 
