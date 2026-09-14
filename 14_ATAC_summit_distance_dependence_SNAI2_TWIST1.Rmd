@@ -1,0 +1,380 @@
+---
+title: "ATAC-seq fold-change at distal summits as a function of distance to TF-motif-bound summits"
+subtitle: "SNAI2 and TWIST1 degron (dTAG) analyses"
+author: "Lucia Ichino"
+date: "2026-07-30"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    theme: flatly
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+```
+
+# About this document
+
+Minimal version of the merged SNAI2 / TWIST1 analysis: only the code required to produce
+the four figures is kept. For each factor:
+
+1. read per-summit Tn5 cut counts (`bedtools coverage -counts`, one BED per sample),
+2. DESeq2 on the summit counts, 3 h dTAG vs DMSO contrast,
+3. define *bound* motifs = FIMO hits within ±100 bp of a ChIP-seq peak summit,
+4. keep distal summits only (`enhancer` / `other_distal` in `data_v4.rds`),
+5. bin summits by distance to the nearest motif-positive summit and plot mean log2FC ± SEM.
+
+The two analyses differ only in their inputs, their DESeq2 design and the figure cosmetics,
+so the shared steps live in one set of helper functions and the inputs are all declared in
+the configuration chunk below.
+
+# Configuration
+
+All paths and all sample orders are here; nothing below this chunk needs editing to run on
+another machine.
+
+```{r config}
+## ---- inputs shared by both analyses ---------------------------------------
+annotation_rds <- ".../data_v4.rds"
+distal_classes <- c("enhancer", "other_distal")
+
+## ---- SNAI2 inputs ----------------------------------------------------------
+snai2_counts_dir <- ".../ATAC_region_summits"
+snai2_peak_file  <- ".../s8_lib1_CNCCp4_SNAI2a3029_DMSO_r2_aSNAI2_reltodTag_peaks_minusINPUT_filtered.narrowPeak"
+snai2_fimo_bed   <- ".../SNAI2_DBD_jolma2013_fimo/fimo_sorted.bed"
+
+# Column order matters: it is what makes the sampleTable below correct.
+snai2_samples <- c(
+  "ATAC_SNAI12_c5946b16_DMSO_rep1", "ATAC_SNAI12_c5946b16_3h_rep1",
+  "ATAC_SNAI12_c5946b16_1d_rep1",   "ATAC_SNAI12_c5946b16_3d_rep1",
+  "ATAC_SNAI12_c5946b27_DMSO_rep1", "ATAC_SNAI12_c5946b27_3h_rep1",
+  "ATAC_SNAI12_c5946b27_1d_rep1",   "ATAC_SNAI12_c5946b27_3d_rep1",
+  "ATAC_SNAI12_c5946b16_DMSO_rep2", "ATAC_SNAI12_c5946b16_3h_rep2",
+  "ATAC_SNAI12_c5946b16_1d_rep2",   "ATAC_SNAI12_c5946b16_3d_rep2",
+  "ATAC_SNAI12_c5946b27_DMSO_rep2", "ATAC_SNAI12_c5946b27_3h_rep2",
+  "ATAC_SNAI12_c5946b27_1d_rep2",   "ATAC_SNAI12_c5946b27_3d_rep2"
+)
+
+## ---- TWIST1 inputs ---------------------------------------------------------
+twist1_counts_dir <- ".../ATAC_region_summitsTW"
+twist1_peak_file  <- ".../lib11_TWIST1_peaks_DMSOintersect_minusINPUT.narrowPeak"
+twist1_fimo_bed   <- ".../coordinator_fimo/fimo_sorted.bed"
+
+twist1_samples <- c(
+  "GSM7213525_TWIST1FV_dTAG0h_r1_ATAC", "GSM7213528_TWIST1FV_dTAG0h_r2_ATAC",
+  "GSM7213526_TWIST1FV_dTAG3h_r1_ATAC", "GSM7213529_TWIST1FV_dTAG3h_r2_ATAC"
+)
+
+## ---- outputs ---------------------------------------------------------------
+fig_dir <- "/Users/luciaichino/Library/CloudStorage/Dropbox/lucia (1)/Lucia 09_05_16/postdoc/Wysocka_lab_personal_folder/SNAI_paper/figures_testing"
+
+fig_snai2         <- file.path(fig_dir, "ATAC_foldchanges_bySNAIdist.pdf")
+fig_snai2_nolabel <- file.path(fig_dir, "ATAC_foldchanges_bySNAIdist_notext.pdf")
+fig_twist1         <- file.path(fig_dir, "ATAC_foldchanges_byTWIST1dist.pdf")
+fig_twist1_nolabel <- file.path(fig_dir, "ATAC_foldchanges_byTWIST1dist_notext.pdf")
+
+fig_width  <- 4
+fig_height <- 3.5
+
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+## ---- analysis parameters ---------------------------------------------------
+motif_flank <- 100   # bp around each ChIP peak summit used to call a motif "bound"
+min_count   <- 5     # DESeq2 pre-filter: counts >= min_count ...
+dist_breaks <- c(0, 1, 300, 600, 800, 1000, 1200, 1400, 1600, 1800, 2000, 3000, Inf)
+x_max       <- 3050  # coord_cartesian upper limit
+```
+
+# Packages
+
+
+```{r libraries}
+library(GenomicRanges)
+library(rtracklayer)
+library(DESeq2)
+library(tidyverse)
+library(ggrepel)
+```
+
+# Helper functions
+
+```{r helpers}
+## Read every *_counts_ATAC_summits.bed in a directory and return one wide table
+## (one column per sample, plus the chr_start_end `region` key).
+read_summit_counts <- function(counts_dir, sample_order) {
+  files <- list.files(counts_dir,
+                      pattern = "_counts_ATAC_summits\\.bed$",
+                      full.names = TRUE)
+  stopifnot(length(files) > 0)
+
+  long_df <- purrr::map_dfr(files, function(f) {
+    df <- readr::read_tsv(f, col_names = FALSE, show_col_types = FALSE)
+    tibble::tibble(
+      region = paste(df$X1, df$X2, df$X3, sep = "_"),
+      sample = sub("_counts.*", "", basename(f)),
+      # last column is always the count from `bedtools coverage -counts`
+      count  = df[[ncol(df)]]
+    )
+  })
+
+  wide <- tidyr::pivot_wider(long_df, names_from = sample, values_from = count)
+  unique(dplyr::select(wide, dplyr::all_of(sample_order), region))
+}
+
+## DESeq2 on the summit counts, returning the 3h-vs-DMSO contrast as a data frame
+## with the region key in column `X` (the column name the downstream code expects).
+deseq_3h_vs_dmso <- function(counts_tbl, sample_order, sample_table, design,
+                             smallest_group_size, min_count = 5) {
+  mat <- as.data.frame(counts_tbl[, sample_order])
+  rownames(mat) <- counts_tbl$region
+  rownames(sample_table) <- sample_order
+
+  dds <- DESeqDataSetFromMatrix(countData = mat,
+                                colData   = sample_table,
+                                design    = design)
+
+  keep <- rowSums(counts(dds) >= min_count) >= smallest_group_size
+  dds  <- dds[keep, ]
+  dds  <- DESeq(dds)
+
+  res <- results(dds, contrast = c("condition", "3h", "DMSO"))
+  res <- res[order(res$padj), ]
+  tibble::rownames_to_column(as.data.frame(res), "X")
+}
+
+## FIMO motif hits restricted to +/- `flank` bp around ChIP-seq peak summits.
+bound_motifs <- function(peak_file, fimo_bed, flank = 100) {
+  peaks_gr <- rtracklayer::import(peak_file, format = "narrowPeak")
+
+  fimo_df <- read.table(fimo_bed, sep = "\t", header = FALSE,
+                        stringsAsFactors = FALSE, comment.char = "#")
+
+  motifs_gr <- GRanges(
+    seqnames = fimo_df$V1,
+    ranges   = IRanges(start = fimo_df$V2 + 1, end = fimo_df$V3),  # BED is 0-based
+    strand   = if (ncol(fimo_df) >= 6) fimo_df$V6 else "*"
+  )
+
+  summit_pos <- start(peaks_gr) + peaks_gr$peak
+  summit_windows <- GRanges(
+    seqnames = seqnames(peaks_gr),
+    ranges   = IRanges(start = summit_pos - flank, end = summit_pos + flank)
+  )
+
+  subsetByOverlaps(motifs_gr, summit_windows)
+}
+
+## `data_v4.rds` -> GRanges of distal regions only.
+load_distal_regions <- function(rds_file, classes) {
+  ann <- readRDS(rds_file)
+  parts <- do.call(rbind, strsplit(as.character(ann$region), "_"))
+  gr <- GRanges(
+    seqnames = parts[, 1],
+    ranges   = IRanges(start = as.numeric(parts[, 2]) + 1,   # region strings are 0-based here
+                       end   = as.numeric(parts[, 3])),
+    classification = ann$classification
+  )
+  gr[gr$classification %in% classes]
+}
+
+## Distal summits + distance from each summit centre to the nearest
+## motif-positive summit centre. Returns a data frame with NA distances dropped.
+distal_summits_with_distance <- function(res_df, distal_gr, motifs_gr) {
+  ## res_df$X is chr_start_end and is already 1-based (it comes from a GRanges),
+  ## so no +1 on start here.
+  coords <- stringr::str_split_fixed(res_df$X, "_", 3)
+
+  res_gr <- GRanges(
+    seqnames = coords[, 1],
+    ranges   = IRanges(start = as.numeric(coords[, 2]),
+                       end   = as.numeric(coords[, 3])),
+    log2FoldChange = res_df$log2FoldChange
+  )
+
+  res_gr <- res_gr[overlapsAny(res_gr, distal_gr)]
+  res_gr$has_motif <- overlapsAny(res_gr, motifs_gr)
+
+  ## regions are 300bp summit-centred windows, so the midpoint IS the summit
+  centers_gr <- GRanges(
+    seqnames = seqnames(res_gr),
+    ranges   = IRanges(start = round((start(res_gr) + end(res_gr)) / 2), width = 1),
+    strand   = "*"
+  )
+  mcols(centers_gr) <- mcols(res_gr)
+
+  motif_centers_gr <- centers_gr[centers_gr$has_motif]
+  hits <- distanceToNearest(centers_gr, motif_centers_gr, ignore.strand = TRUE)
+
+  dist_to_motif <- rep(NA_integer_, length(centers_gr))
+  dist_to_motif[queryHits(hits)] <- mcols(hits)$distance
+  res_gr$dist_to_nearest_motif <- dist_to_motif
+
+  out <- as.data.frame(res_gr)
+  out[!is.na(out$dist_to_nearest_motif), ]   # summits on contigs with no motif+ region
+}
+
+## Mean log2FC +/- SEM per distance bin, with the bin labels used on the plot.
+bin_by_distance <- function(plot_df, breaks) {
+  plot_df %>%
+    dplyr::mutate(
+      bin_idx  = cut(dist_to_nearest_motif, breaks = breaks,
+                     include.lowest = TRUE, labels = FALSE),
+      dist_bin = cut(dist_to_nearest_motif, breaks = breaks, include.lowest = TRUE)
+    ) %>%
+    dplyr::group_by(dist_bin, bin_idx) %>%
+    dplyr::summarise(
+      mean_l2fc = mean(log2FoldChange),
+      sem       = sd(log2FoldChange) / sqrt(dplyr::n()),
+      mid       = median(dist_to_nearest_motif),
+      n         = dplyr::n(),
+      .groups   = "drop"
+    ) %>%
+    dplyr::mutate(
+      bin_low   = breaks[bin_idx],
+      bin_high  = breaks[bin_idx + 1],
+      bin_label = ifelse(is.infinite(bin_high),
+                         paste0(">", bin_low, "bp"),
+                         paste0(bin_low, "-", bin_high, "bp")),
+      label     = paste0(bin_label, "\nn=", n)
+    )
+}
+
+## The figure. `show_labels = FALSE` gives the clean panel version.
+plot_binned <- function(binned_df, colour, x_lab, y_lab,
+                        show_labels = TRUE, xmax = 3050) {
+  p <- ggplot(binned_df, aes(x = mid, y = mean_l2fc)) +
+    geom_ribbon(aes(ymin = mean_l2fc - sem, ymax = mean_l2fc + sem),
+                alpha = 0.3, fill = colour) +
+    geom_line(color = colour, linewidth = 1) +
+    geom_point(size = 2, color = colour)
+
+  if (show_labels) {
+    p <- p + geom_text_repel(aes(label = label), size = 3.6, lineheight = 0.85,
+                             min.segment.length = 0, segment.size = 0.3,
+                             box.padding = 0.3, max.overlaps = Inf)
+  }
+
+  p +
+    labs(x = x_lab, y = y_lab) +
+    ggtitle("ATAC-seq foldchange at distal ATAC summits") +
+    theme_bw() +
+    coord_cartesian(xlim = c(0, xmax))
+}
+```
+
+# Distal region annotation
+
+Shared by both analyses, so it is loaded once.
+
+```{r load-annotation}
+distal_gr <- load_distal_regions(annotation_rds, distal_classes)
+```
+
+# SNAI2 analysis
+
+Degron of SNAI2 in CNCC-like cells, two clones (`c5946b16`, `c5946b27`), two replicates,
+four time points → 16 libraries. `condition` cycles through the four time points every
+4 columns, `clone` splits the first 8 columns from the last 8, `replicate` alternates in
+blocks of 4 — which is exactly the column order set in `snai2_samples`.
+
+```{r snai2-deseq}
+snai2_counts <- read_summit_counts(snai2_counts_dir, snai2_samples)
+
+snai2_sample_table <- data.frame(
+  condition = factor(rep(c("DMSO", "3h", "1day", "3days"), 4),
+                     levels = c("DMSO", "3h", "1day", "3days")),
+  clone     = factor(rep(c("c5946b16", "c5946b27"), each = 8)),
+  replicate = factor(rep(rep(c("rep1", "rep2"), each = 4), 2))
+)
+
+snai2_res_3h <- deseq_3h_vs_dmso(
+  counts_tbl          = snai2_counts,
+  sample_order        = snai2_samples,
+  sample_table        = snai2_sample_table,
+  design              = ~ clone + replicate + condition,
+  smallest_group_size = 4,
+  min_count           = min_count
+)
+```
+
+```{r snai2-distance}
+snai2_motifs <- bound_motifs(snai2_peak_file, snai2_fimo_bed, flank = motif_flank)
+
+snai2_plot_df   <- distal_summits_with_distance(snai2_res_3h, distal_gr, snai2_motifs)
+snai2_binned_df <- bin_by_distance(snai2_plot_df, dist_breaks)
+```
+
+Motif-positive summits are in the query set as well, so they get distance 0 — that is what
+the leading `0–1 bp` bin isolates.
+
+```{r snai2-plot, fig.width=4, fig.height=3.5}
+snai2_xlab <- "Distance to nearest SNAI2-motif region (bp, bin midpoint)"
+snai2_ylab <- "Mean ATAC log2FC (dTag/DMSO) ± SEM"
+
+p_snai2 <- plot_binned(snai2_binned_df, "firebrick", snai2_xlab, snai2_ylab,
+                       show_labels = TRUE, xmax = x_max)
+p_snai2
+ggsave(fig_snai2, plot = p_snai2, width = fig_width, height = fig_height)
+
+p_snai2_nolabel <- plot_binned(snai2_binned_df, "firebrick", snai2_xlab, snai2_ylab,
+                               show_labels = FALSE, xmax = x_max)
+p_snai2_nolabel
+ggsave(fig_snai2_nolabel, plot = p_snai2_nolabel, width = fig_width, height = fig_height)
+```
+
+# TWIST1 analysis
+
+Same pipeline on the public TWIST1-FV degron ATAC data (GEO `GSM7213525/6/8/9`): two
+conditions, two replicates, no clone term, so the design is `~ replicate + condition` and
+the pre-filter group size drops to 2. Motifs here are coordinator FIMO hits restricted to
+TWIST1 ChIP peak summits.
+
+```{r twist1-deseq}
+twist1_counts <- read_summit_counts(twist1_counts_dir, twist1_samples)
+
+twist1_sample_table <- data.frame(
+  condition = factor(rep(c("DMSO", "3h"), each = 2), levels = c("DMSO", "3h")),
+  replicate = factor(rep(c("rep1", "rep2"), 2))
+)
+
+twist1_res_3h <- deseq_3h_vs_dmso(
+  counts_tbl          = twist1_counts,
+  sample_order        = twist1_samples,
+  sample_table        = twist1_sample_table,
+  design              = ~ replicate + condition,
+  smallest_group_size = 2,
+  min_count           = min_count
+)
+```
+
+```{r twist1-distance}
+twist1_motifs <- bound_motifs(twist1_peak_file, twist1_fimo_bed, flank = motif_flank)
+
+twist1_plot_df   <- distal_summits_with_distance(twist1_res_3h, distal_gr, twist1_motifs)
+twist1_binned_df <- bin_by_distance(twist1_plot_df, dist_breaks)
+```
+
+```{r twist1-plot, fig.width=4, fig.height=3.5}
+twist1_xlab <- "Distance to nearest TWIST1-motif region (bp, bin midpoint)"
+twist1_ylab <- "Mean ATAC log2FC (TWIST1-FV dTag/DMSO) ± SEM"
+
+p_twist1 <- plot_binned(twist1_binned_df, "steelblue", twist1_xlab, twist1_ylab,
+                        show_labels = TRUE, xmax = x_max)
+p_twist1
+ggsave(fig_twist1, plot = p_twist1, width = fig_width, height = fig_height)
+
+p_twist1_nolabel <- plot_binned(twist1_binned_df, "steelblue", twist1_xlab, twist1_ylab,
+                                show_labels = FALSE, xmax = x_max)
+p_twist1_nolabel
+ggsave(fig_twist1_nolabel, plot = p_twist1_nolabel, width = fig_width, height = fig_height)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
