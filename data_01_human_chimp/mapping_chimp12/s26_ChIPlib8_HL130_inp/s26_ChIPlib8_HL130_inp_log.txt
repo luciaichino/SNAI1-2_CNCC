@@ -1,0 +1,62 @@
+Running dna_se_map.sh v1.0 (12/18/2018):
+Run start on: Tue Feb 17 13:43:25 PST 2026
+-------------------------
+Working directory: /work/lucia/29534
+Forward reads file: s26_ChIPlib8_HL130_inp_merged_chimp_reads_unique_R1.fastq.gz
+Reverse reads file: s26_ChIPlib8_HL130_inp_merged_chimp_reads_unique_R2.fastq.gz
+Output directory: s26_ChIPlib8_HL130_inp
+-------------------------
+Mapping reads to: /storage/lucia/genomes/human_chimp_HL130/SNPsplit/C3649_hap1_hap2_genomeprep/C3649.hg38.hap1.bam_C3649.hg38.hap2.bam_dual_hybrid.based_on_hg38_N-masked/hg38_dual_masked_C3649_hap1_hap2
+-------------------------
+Additional settings:
+Stubname: s26_ChIPlib8_HL130_inp
+Helper scripts are in: /storage/lucia/scripts_and_pipelines/scripts
+Quality score encoding is: phred+64
+trim_galore settings:
+   # bases to trim at 5' end of forward and reverse reads: 0
+   Quality cutoff for trimming at 3' end: 25
+   Adapter sequence to trim from forward reads: AGATCGGAAGAG
+   Adapter sequence to trim from reverse reads: AGATCGGAAGAG
+   Reads shorter than 20 after trimming will be discarded
+bowtie2 settings:
+   Length of seed region: 22
+   Number of mismatches allowed in seed: 0
+   Max allowed distance between mates (PE only): 500
+   Number of alignment threads that will be launched: 4
+-------------------------
+
+Step 0: Checking that all inputs are ok
+455 chromosomes detected in genome
+
+Starting number of reads: 35202899
+Reads are 150x150bp
+-------------------------
+
+Step 1: running fastqc to assess initial read quality
+Done. Time elapsed: 7 minutes and 48 seconds
+
+Step 2: filtering and trimming reads using trim_galore
+Number of pairs analyzed: 35202899
+Number pairs removed (read < 20bp): 666 (0.0%)
+Number pairs remaining: 35202233 (99.9%)
+Done at Tue Feb 17 14:10:00 PST 2026. Time elapsed: 16 minutes and 45 seconds
+
+Step 3: aligning to provided reference genome using bowtie2
+Done mapping to provided genome with bowtie2
+ - Extracting reads that mapped uniquely to the genome
+Done at Tue Feb 17 15:40:24 PST 2026. Time elapsed: 1 hours 30 minutes and 24 seconds
+
+Step 4: creating files with PCR duplicates removed
+Note: all files with PCR duplicates removed will have suffix _dedup
+Done at Tue Feb 17 15:57:08 PST 2026. Time elapsed: 16 minutes and 44 seconds
+
+Step 5: summarizing mapping results
+
+Input file contained 35202899 pairs
+35202233 (99.9%) pairs passed quality filtering steps. Of these:
+	34319960 (97.4% of QC-filtered pairs) pairs mapped uniquely
+	34316759 (97.4% of QC-filtered pairs) pairs mapped uniquely after PCR dedup
+Done at Tue Feb 17 15:57:58 PST 2026. Time elapsed: 50 seconds
+
+Run ended Tue Feb 17 15:57:58 PST 2026
+Total time elapsed: 2 hours 14 minutes and 33 seconds
