@@ -76,6 +76,10 @@ nucleosome footprint size, TF metaplots)
 
 codependency analysis enhancers 2 and 3 DAF-seq data
 
+--- 14_ATAC_summit_distance_dependence_SNAI2_TWIST1.Rmd
+
+Plot of ATAC-seq fold-change as a function of distance between ATAC summit and TF motif (SNAI1/2 or TWIST1)
+
 
 ## ChromBPnet analysis (Figures 1, S1, 4, S3)
 
