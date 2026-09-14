@@ -13,6 +13,8 @@ Builds the SNP VCFs and N-masked,bowtie2-indexed dual-hybrid genomes needed for 
 
 After this, ChIP-seq reads were mapped to the two bowtie2 indices H20961.hap1.C3649.hap1 (masked for human and chimp hap1 SNPs) and H20961.hap2.C3649.hap2 (masked for human and chimp hap2 SNPs)
 
+The VCF files used as input are here: https://github.com/luciaichino/SNAI1-2_CNCC/releases/tag/data_01_vcf
+
 --- 02_snpsplit_run_and_merge.sh
 
 This script splits each sample's BAM into human and chimp reads, merges them by species, removes duplicates, converts to fastq.
