@@ -114,4 +114,7 @@ Plot of ATAC-seq fold-change as a function of distance between ATAC summit and T
 
 ## Evolutionary constraint (Figure S1)
 
+--- evolutionary_constraint_analysis folder: self-contained pipeline that produces figures S1A S1B
+Evolutionary constraint of SNAI2 distal peaks and motif occurrences
+
 
